@@ -1,0 +1,169 @@
+// Copyright 2024-2026 Sekops Sarl
+// Author: Bernard Gutermann <bernard.gutermann@sekops.ch>
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package kvfs
+
+import (
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+)
+
+var (
+	// CASRetries counts every CAS retry attempt, labeled by operation type.
+	CASRetries = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "kvfs_cas_retries_total",
+		Help: "Total number of CAS retry attempts in the kvfs driver",
+	}, []string{"operation"})
+
+	// CASExhausted counts CAS retry loops that exited without success.
+	CASExhausted = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "kvfs_cas_exhausted_total",
+		Help: "Total number of CAS retry loops that exhausted all attempts",
+	}, []string{"operation"})
+
+	// CASConflicts counts every ErrCASConflict or wrong-last-sequence error, labeled by bucket.
+	CASConflicts = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "kvfs_cas_conflicts_total",
+		Help: "Total number of CAS conflict errors detected",
+	}, []string{"bucket"})
+
+	// KVOperationDuration observes the duration of NATS KV operations.
+	KVOperationDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "kvfs_kv_operation_duration_seconds",
+		Help:    "Duration of NATS KV operations in seconds",
+		Buckets: []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0},
+	}, []string{"bucket", "op"})
+
+	// BlobOperationDuration observes the duration of S3 blob operations.
+	BlobOperationDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "kvfs_blob_operation_duration_seconds",
+		Help:    "Duration of S3 blob operations in seconds",
+		Buckets: []float64{0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0},
+	}, []string{"op"})
+
+	// UploadInFlight tracks the number of currently active uploads.
+	// Per-pod-lifetime counter — increments on TUS session create, decrements
+	// only on Finish/Terminate. Leaks on client-side aborts. Treat as a
+	// per-pod debugging hint; for authoritative state use OldestUploadAge or
+	// scan oc-uploads directly.
+	UploadInFlight = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "kvfs_upload_in_flight",
+		Help: "Number of uploads currently in progress (per-pod lifetime counter; may drift — see kvfs_oldest_upload_age_seconds)",
+	}, []string{"protocol"})
+
+	// OldestUploadAgeSeconds is the age of the oldest in-flight upload
+	// session, sampled at every GC tick. A growing value means TUS
+	// sessions are accumulating without being finished or reaped —
+	// usually a client-cancel leak.
+	OldestUploadAgeSeconds = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "kvfs_oldest_upload_age_seconds",
+		Help: "Age of the oldest in-flight TUS upload session in seconds (0 if none)",
+	})
+
+	// UploadSessionsTotal is the total number of TUS upload sessions
+	// currently in oc-uploads, sampled at every GC tick.
+	UploadSessionsTotal = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "kvfs_upload_sessions_total",
+		Help: "Total number of TUS upload sessions in oc-uploads (sampled at GC tick)",
+	})
+
+	// ChildrenValueBytes observes the msgpack-encoded byte size of the
+	// per-parent children map on every PutChildren. Alert at
+	// > 0.5 * MaxValueSize so fat directories surface before they hit the
+	// NATS KV ceiling (1 MiB default, raise via STORAGE_USERS_KVFS_CHILDREN_MAX_VALUE_SIZE).
+	ChildrenValueBytes = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "kvfs_children_value_bytes",
+		Help:    "Serialised size of a parent's children map in bytes (per PutChildren)",
+		Buckets: []float64{256, 1024, 4096, 16384, 65536, 262144, 524288, 1048576, 4194304, 16777216},
+	})
+
+	// UploadAbortedOnCancel counts uploads aborted because the client
+	// cancelled mid-PATCH. Each increment ties to one S3 multipart abort.
+	UploadAbortedOnCancel = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "kvfs_upload_aborted_on_cancel_total",
+		Help: "TUS uploads terminated because the request context was cancelled",
+	})
+
+	// EventQueueDropped counts events dropped because the async publish
+	// queue was full. Non-zero values mean we are losing observability
+	// events; raise the buffer or reduce event volume.
+	EventQueueDropped = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "kvfs_event_queue_dropped_total",
+		Help: "Events dropped because the async publish queue was full",
+	})
+
+	// EventQueueDepth gauges the current depth of the async publish queue.
+	EventQueueDepth = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "kvfs_event_queue_depth",
+		Help: "Current depth of the async event publish queue",
+	})
+
+	// TUSPhaseDuration is the per-phase latency histogram for TUS uploads.
+	// Phases: initiate (createTUSSession) / write_chunk / finish /
+	// blob_upload / commit_node. A `write_chunk` p99 above ~10 ms usually
+	// means the cache path regressed and chunks are hitting remote I/O.
+	TUSPhaseDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "kvfs_tus_phase_duration_seconds",
+		Help:    "TUS upload phase duration in seconds",
+		Buckets: []float64{0.0001, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 30.0},
+	}, []string{"phase"})
+
+	// TempFileBytesInFlight is the current total bytes held in the upload
+	// cache across all in-flight sessions on this pod. Read directly from
+	// the diskUploadCache via SetTempFileBytesInFlight() on each upload event.
+	// Alert at >80% of the volume sizeLimit to catch storage exhaustion
+	// before the next WriteChunk fails with ENOSPC.
+	TempFileBytesInFlight = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "kvfs_temp_file_bytes_in_flight",
+		Help: "Total bytes currently held in the upload cache (per-pod)",
+	})
+
+	// TreeSizeDrift counts ancestor CAS failures during tree-size propagation.
+	TreeSizeDrift = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "kvfs_tree_size_drift_total",
+		Help: "Total number of ancestor CAS failures during tree-size propagation",
+	})
+
+	// GCBlobsScanned counts the total number of S3 blobs scanned by GC.
+	GCBlobsScanned = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "kvfs_gc_blobs_scanned_total",
+		Help: "Total number of S3 blobs scanned by garbage collection",
+	})
+
+	// GCBlobsDeleted counts S3 blobs actually deleted by GC.
+	GCBlobsDeleted = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "kvfs_gc_blobs_deleted_total",
+		Help: "Total number of orphaned S3 blobs deleted by garbage collection",
+	})
+
+	// GCWouldDelete counts blobs that would be deleted in dry-run mode.
+	GCWouldDelete = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "kvfs_gc_would_delete_total",
+		Help: "Total number of orphaned S3 blobs that would be deleted (dry-run mode)",
+	})
+
+	// GCErrors counts errors encountered during GC runs.
+	GCErrors = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "kvfs_gc_errors_total",
+		Help: "Total number of errors during garbage collection runs",
+	})
+
+	// GCRunDuration observes the duration of each GC run.
+	GCRunDuration = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "kvfs_gc_run_duration_seconds",
+		Help:    "Duration of garbage collection runs in seconds",
+		Buckets: []float64{1, 5, 10, 30, 60, 120, 300, 600},
+	})
+)

@@ -1,0 +1,48 @@
+# This config file will start a reva service that:
+# - uses the kvfs driver to serve users (/users)
+# - serves the storage provider on grpc port 11000
+# - serves http dataprovider for this storage on port 11001
+#   - /data - dataprovider: file up and download
+
+[shared]
+jwt_secret = "Pive-Fumkiu4"
+gatewaysvc = "localhost:19000"
+
+[log]
+level = "error"
+
+[grpc]
+address = "0.0.0.0:11000"
+
+# This is a storage provider that grants direct access to the wrapped storage
+[grpc.services.storageprovider]
+driver = "kvfs"
+expose_data_server = true
+data_server_url = "http://revad-services:11001/data"
+mount_id = "1284d238-aa92-42ce-bdc4-0b0000009157"
+
+[grpc.services.storageprovider.drivers.kvfs]
+nats_nodes = ["nats://nats:4222"]
+bucket_prefix = "kvfs-ci"
+"s3.endpoint" = "http://ceph:8080"
+"s3.region" = "default"
+"s3.bucket" = "test"
+"s3.access_key" = "test"
+"s3.secret_key" = "test"
+
+# we have a locally running dataprovider
+[http]
+address = "0.0.0.0:11001"
+
+[http.services.dataprovider]
+driver = "kvfs"
+temp_folder = "/woodpecker/src/reva/tmp"
+
+[http.services.dataprovider.drivers.kvfs]
+nats_nodes = ["nats://nats:4222"]
+bucket_prefix = "kvfs-ci"
+"s3.endpoint" = "http://ceph:8080"
+"s3.region" = "default"
+"s3.bucket" = "test"
+"s3.access_key" = "test"
+"s3.secret_key" = "test"

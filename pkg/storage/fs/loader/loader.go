@@ -29,6 +29,7 @@ import (
 	_ "github.com/opencloud-eu/reva/v2/pkg/storage/fs/eosgrpchome"
 	_ "github.com/opencloud-eu/reva/v2/pkg/storage/fs/eoshome"
 	_ "github.com/opencloud-eu/reva/v2/pkg/storage/fs/hello"
+	_ "github.com/opencloud-eu/reva/v2/pkg/storage/fs/kvfs"
 	_ "github.com/opencloud-eu/reva/v2/pkg/storage/fs/local"
 	_ "github.com/opencloud-eu/reva/v2/pkg/storage/fs/localhome"
 	_ "github.com/opencloud-eu/reva/v2/pkg/storage/fs/nextcloud"
