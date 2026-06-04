@@ -77,6 +77,11 @@ type KVStore struct {
 	uploads  nats.KeyValue // bucket: "{prefix}-uploads"  — UploadSession per upload
 	versions nats.KeyValue // bucket: "{prefix}-versions" — VersionEntry per version
 	locks    nats.KeyValue // bucket: "{prefix}-locks"    — distributed locks
+
+	// maxCASRetries bounds the create-conflict merge-retry loop in
+	// PutChildren so every CAS path in the driver honours the same
+	// configured retry budget. Resolved from Options at construction.
+	maxCASRetries int
 }
 
 // NewKVStore connects to NATS JetStream and initializes KV buckets.
@@ -103,8 +108,9 @@ func NewKVStore(opts *Options) (*KVStore, error) {
 	}
 
 	store := &KVStore{
-		conn: nc,
-		js:   js,
+		conn:          nc,
+		js:            js,
+		maxCASRetries: resolveMaxCASRetries(opts),
 	}
 
 	// Create or bind to KV buckets. The children bucket may be created with a
@@ -194,6 +200,17 @@ func (s *KVStore) TryAcquireLock(key string, holder string, ttl time.Duration) (
 
 	kve, err := s.locks.Get(key)
 	if err != nil {
+		// Benign race: the previous holder released the lock between our Create
+		// and this Get (or the bucket was freshly created). A missing key means
+		// the lock is free, so retry Create once; if that loses to another
+		// contender, report "not acquired" with a nil error so the caller's GC
+		// cycle skips cleanly instead of logging a spurious "failed to acquire".
+		if err == nats.ErrKeyNotFound {
+			if _, cerr := s.locks.Create(key, data); cerr == nil {
+				return true, nil
+			}
+			return false, nil
+		}
 		return false, err
 	}
 
@@ -521,8 +538,7 @@ func (s *KVStore) PutChildren(spaceID, parentID string, children ChildMap, expec
 		KVOperationDuration.WithLabelValues("children", "create").Observe(time.Since(start).Seconds())
 		if err == nats.ErrKeyExists {
 			CASConflicts.WithLabelValues("children").Inc()
-			const maxRetries = 10
-			for retry := 0; retry < maxRetries; retry++ {
+			for retry := 0; retry < s.maxCASRetries; retry++ {
 				CASRetries.WithLabelValues("children").Inc()
 				entry, rerr := s.children.Get(key)
 				if rerr != nil {

@@ -63,6 +63,20 @@ const defaultMaxCASRetries = 10
 // full contract.
 const commitPhaseTimeout = 5 * time.Minute
 
+// uploadSessionTTL is the lifetime of a persisted TUS session. Single source
+// of truth for both the Expires stamp and the sampler's createdAt estimate
+// (createdAt = Expires - uploadSessionTTL), so the two cannot drift.
+const uploadSessionTTL = 24 * time.Hour
+
+// eventQueueSize bounds the async event-publish buffer. Events are small and
+// the worker drains fast under normal load; on overflow we drop and increment
+// EventQueueDropped rather than block the request (see publishEventAsync).
+const eventQueueSize = 1024
+
+// uploadAgeSampleInterval is how often the upload-staleness sampler walks
+// oc-uploads. A var, not a const, so tests can shrink it.
+var uploadAgeSampleInterval = 5 * time.Minute
+
 var errNoChange = fmt.Errorf("kvfs: no change needed")
 
 type commitFileParams struct {
@@ -102,9 +116,10 @@ type kvfsDriver struct {
 	parentLocks sync.Map // map[string]*sync.Mutex
 
 	// eventQueue + eventStop drive the async event-publish worker. See
-	// publishEvent / eventPublisher. Bounded buffer; on overflow we drop
-	// and increment EventQueueDropped — events are best-effort downstream.
-	eventQueue chan func() interface{}
+	// publishEvent / eventPublisher. Bounded buffer (eventQueueSize); on
+	// overflow we drop and increment EventQueueDropped — events are
+	// best-effort downstream.
+	eventQueue chan eventJob
 	eventStop  chan struct{}
 }
 
@@ -130,7 +145,7 @@ func New(m map[string]interface{}, stream events.Stream, log *zerolog.Logger) (s
 		return nil, err
 	}
 
-	blob, err := NewS3Blobstore(opts.S3Endpoint, opts.S3Region, opts.S3Bucket, opts.S3AccessKey, opts.S3SecretKey)
+	blob, err := NewS3Blobstore(opts.S3Endpoint, opts.S3Region, opts.S3Bucket, opts.S3AccessKey, opts.S3SecretKey, opts.BucketPrefix)
 	if err != nil {
 		store.Close()
 		return nil, err
@@ -141,6 +156,10 @@ func New(m map[string]interface{}, stream events.Stream, log *zerolog.Logger) (s
 		Str("s3_endpoint", opts.S3Endpoint).
 		Str("s3_bucket", opts.S3Bucket).
 		Msg("kvfs driver initialized")
+
+	// Export the effective CAS retry bound per instance so dead config
+	// (value diverging from the deployment setting) is observable.
+	MaxCASRetriesGauge.WithLabelValues(opts.BucketPrefix).Set(float64(opts.MaxCASRetries))
 
 	// Initialise the upload-staging cache. Disk-backed (default) requires
 	// the temp directory to exist; create it eagerly so the first
@@ -195,7 +214,7 @@ func New(m map[string]interface{}, stream events.Stream, log *zerolog.Logger) (s
 		log:         log,
 		stream:      stream,
 		uploadCache: uploadCache,
-		eventQueue:  make(chan func() interface{}, 1024),
+		eventQueue:  make(chan eventJob, eventQueueSize),
 		eventStop:   make(chan struct{}),
 	}
 	go d.eventPublisher()
@@ -236,14 +255,63 @@ func New(m map[string]interface{}, stream events.Stream, log *zerolog.Logger) (s
 		}()
 	}
 
+	// Upload-staleness sampler: refresh the oc-uploads gauges on every pod.
+	// Kept separate from the GC sweep, which is lock-gated and runs once a
+	// day — this read-only walk must run often and on every pod. Samples
+	// once immediately so the gauges are populated at startup.
+	go func() {
+		sampleUploadAge := func() {
+			uploads, err := d.store.ListAllUploads()
+			if err != nil {
+				d.log.Warn().Err(err).Msg("kvfs: upload-age sampler failed to list uploads")
+				return
+			}
+			updateUploadAgeMetrics(uploads)
+		}
+		sampleUploadAge()
+		t := time.NewTicker(uploadAgeSampleInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-d.eventStop:
+				return
+			case <-t.C:
+				sampleUploadAge()
+			}
+		}
+	}()
+
 	if opts.GCEnabled {
 		d.gc = newBlobGC(store, blob, opts, log)
-		d.gc.SetUploadAgeReporter(updateUploadAgeMetrics)
+
+		// Reuse the ONE crash-safe deletion path for GC space reaping:
+		// deleteSpaceContents (detached commit ctx) + DeleteSpace, identical
+		// to DeleteStorageSpace. The GC never re-implements deletion.
+		d.gc.reapSpace = func(ctx context.Context, spaceID, rootID string) error {
+			cctx, cancel := d.commitPhase(ctx)
+			defer cancel()
+			d.deleteSpaceContents(cctx, spaceID, rootID)
+			return d.store.DeleteSpace(spaceID)
+		}
+
+		// Identity-orphan reaping needs a live-user signal. Build a resolver
+		// from the service's gateway + service-account config. On any missing
+		// config or construction error, degrade gracefully to a nil resolver:
+		// identity reaping is disabled but the internal residue sweep still
+		// runs. storage-system leaves these unset (no personal spaces).
+		if resolver, rerr := newCS3UserResolver(opts.GatewayAddr, opts.ServiceAccountID, opts.ServiceAccountSecret, log); rerr != nil {
+			log.Warn().Err(rerr).Msg("kvfs: GC identity reaping disabled (resolver unavailable); residue sweep still active")
+		} else {
+			d.gc.resolver = resolver
+			log.Info().Str("gateway", opts.GatewayAddr).Msg("kvfs: GC identity reaping enabled")
+		}
+
 		d.gc.Start()
 		log.Info().
 			Bool("dry_run", opts.GCDryRun).
 			Str("interval", opts.GCInterval).
 			Str("min_age", opts.GCMinAge).
+			Bool("identity_reaping", d.gc.resolver != nil).
 			Msg("blob garbage collection enabled")
 	}
 
@@ -262,14 +330,9 @@ func (d *kvfsDriver) Shutdown(ctx context.Context) error {
 	return nil
 }
 
-// maxCASRetries returns the configured CAS retry bound, falling back to
-// defaultMaxCASRetries when the field is unset (zero) — defends against
-// test fixtures that build Options{} directly without invoking init().
+// maxCASRetries returns the driver's configured CAS retry bound.
 func (d *kvfsDriver) maxCASRetries() int {
-	if d.opts != nil && d.opts.MaxCASRetries > 0 {
-		return d.opts.MaxCASRetries
-	}
-	return defaultMaxCASRetries
+	return resolveMaxCASRetries(d.opts)
 }
 
 // commitPhase derives a detached, timeout-bounded context for the durable
@@ -333,15 +396,28 @@ func (d *kvfsDriver) applyChildIntent(spaceID, parentID string, add map[string]s
 	return nil, errors.New("kvfs: applyChildIntent failed after max CAS retries")
 }
 
-// publishEvent enqueues an event for the async publisher worker. If the
+// eventJob pairs the lazily-built event with a detached, value-preserving
+// copy of the originating request context. The async worker publishes with
+// that ctx so events.Publish can still derive traceParent + initiatorID
+// (trace correlation + downstream self-notification suppression) — values the
+// old synchronous path carried but a bare context.Background() would drop.
+type eventJob struct {
+	ctx context.Context
+	evf func() interface{}
+}
+
+// publishEventAsync enqueues an event for the async publisher worker. If the
 // queue is full (slow downstream consumer) the event is dropped and a
-// counter increments — events are best-effort.
-func (d *kvfsDriver) publishEventAsync(evf func() interface{}) {
+// counter increments — events are best-effort. The request ctx is detached
+// via context.WithoutCancel so its values survive the request's lifetime
+// without keeping it cancelable.
+func (d *kvfsDriver) publishEventAsync(ctx context.Context, evf func() interface{}) {
 	if d.stream == nil {
 		return
 	}
+	job := eventJob{ctx: context.WithoutCancel(ctx), evf: evf}
 	select {
-	case d.eventQueue <- evf:
+	case d.eventQueue <- job:
 		EventQueueDepth.Set(float64(len(d.eventQueue)))
 	default:
 		EventQueueDropped.Inc()
@@ -355,21 +431,28 @@ func (d *kvfsDriver) eventPublisher() {
 		select {
 		case <-d.eventStop:
 			return
-		case evf := <-d.eventQueue:
+		case job := <-d.eventQueue:
 			EventQueueDepth.Set(float64(len(d.eventQueue)))
-			ev := evf()
-			if ev == nil {
-				continue
-			}
-			if err := events.Publish(context.Background(), d.stream, ev); err != nil {
-				d.log.Error().Err(err).Msg("failed to publish event")
-			}
+			d.doPublish(job.ctx, job.evf)
 		}
 	}
 }
 
-// updateUploadAgeMetrics observes oldest upload age + total session count
-// once per GC tick, piggy-backing on the GC walker.
+// doPublish builds the event lazily and publishes it, logging on error. Shared
+// by the synchronous fallback (publishEvent) and the async worker so the
+// build-or-skip + publish-or-log logic lives in exactly one place.
+func (d *kvfsDriver) doPublish(ctx context.Context, evf func() interface{}) {
+	ev := evf()
+	if ev == nil {
+		return
+	}
+	if err := events.Publish(ctx, d.stream, ev); err != nil {
+		d.log.Error().Err(err).Msg("failed to publish event")
+	}
+}
+
+// updateUploadAgeMetrics sets the oldest-age and session-count gauges from a
+// snapshot of oc-uploads. Driven by the sampler goroutine in New.
 func updateUploadAgeMetrics(uploads []*UploadSession) {
 	UploadSessionsTotal.Set(float64(len(uploads)))
 	if len(uploads) == 0 {
@@ -379,10 +462,10 @@ func updateUploadAgeMetrics(uploads []*UploadSession) {
 	now := time.Now().Unix()
 	var oldest int64
 	for _, u := range uploads {
-		// createdAt is not tracked; approximate as Expires - 24h.
+		// createdAt is not tracked; approximate as Expires - uploadSessionTTL.
 		var createdAt int64
 		if u.Expires > 0 {
-			createdAt = u.Expires - int64((24 * time.Hour).Seconds())
+			createdAt = u.Expires - int64(uploadSessionTTL.Seconds())
 		}
 		if createdAt > 0 {
 			age := now - createdAt
@@ -3033,9 +3116,9 @@ func (d *kvfsDriver) spaceToCS3(space *SpaceEntry, rootNode *NodeEntry) *provide
 	spaceAlias := space.Type + "/" + strings.ReplaceAll(strings.ToLower(space.Name), " ", "-")
 
 	ss := &provider.StorageSpace{
-		Id:   &provider.StorageSpaceId{OpaqueId: space.ID},
-		Root: &provider.ResourceId{SpaceId: space.ID, OpaqueId: space.RootID},
-		Name: space.Name,
+		Id:        &provider.StorageSpaceId{OpaqueId: space.ID},
+		Root:      &provider.ResourceId{SpaceId: space.ID, OpaqueId: space.RootID},
+		Name:      space.Name,
 		SpaceType: space.Type,
 		Owner: &user.User{
 			Id: &user.UserId{OpaqueId: space.Owner},
@@ -3231,16 +3314,12 @@ func (d *kvfsDriver) publishEvent(ctx context.Context, evf func() interface{}) {
 		return
 	}
 	if d.eventQueue == nil {
-		ev := evf()
-		if ev == nil {
-			return
-		}
-		if err := events.Publish(ctx, d.stream, ev); err != nil {
-			d.log.Error().Err(err).Msg("failed to publish event")
-		}
+		// Synchronous fallback for test fixtures that build kvfsDriver via
+		// struct literal without going through New().
+		d.doPublish(ctx, evf)
 		return
 	}
-	d.publishEventAsync(evf)
+	d.publishEventAsync(ctx, evf)
 }
 
 func nowTimestamp() *types.Timestamp {

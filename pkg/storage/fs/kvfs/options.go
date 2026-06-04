@@ -127,6 +127,15 @@ type Options struct {
 	GCDryRun     bool   `mapstructure:"gc_dry_run"`
 	GCMinAge     string `mapstructure:"gc_min_age"`
 	GCRunOnStart bool   `mapstructure:"gc_run_on_start"`
+
+	// Identity-orphan reaping (GC). The driver resolves space-owner liveness
+	// through the CS3 gateway acting as the configured service account. When
+	// any of these is empty the resolver is disabled (GC still runs the
+	// internal residue sweep). The storage-system instance leaves them empty
+	// since it owns no personal spaces.
+	GatewayAddr          string `mapstructure:"gateway_addr"`
+	ServiceAccountID     string `mapstructure:"service_account_id"`
+	ServiceAccountSecret string `mapstructure:"service_account_secret"`
 }
 
 // parseConfig parses a raw config map into typed Options.
@@ -137,6 +146,17 @@ func parseConfig(m map[string]interface{}) (*Options, error) {
 	}
 	o.init()
 	return o, nil
+}
+
+// resolveMaxCASRetries returns the configured CAS retry bound, or the
+// package default when unset (<= 0). Single source of truth for the guard
+// used by both the driver and the KV store — defends against fixtures that
+// build Options{} directly without invoking init().
+func resolveMaxCASRetries(o *Options) int {
+	if o != nil && o.MaxCASRetries > 0 {
+		return o.MaxCASRetries
+	}
+	return defaultMaxCASRetries
 }
 
 // init sets defaults for missing config values.

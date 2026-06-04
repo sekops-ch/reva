@@ -63,7 +63,7 @@ func (u *kvfsUpload) WriteChunk(ctx context.Context, offset int64, src io.Reader
 	}
 	teeReader := io.TeeReader(src, u.hasher)
 
-	n, err := u.driver.uploadCache.Append(u.session.ID, teeReader)
+	n, err := u.driver.uploadCache.Append(u.session.ID, offset, teeReader)
 	if err != nil {
 		// Context cancellation isn't a hard error here — partial chunks
 		// stay on disk. The client retries (TUS resume) and finds the
@@ -156,7 +156,7 @@ func (u *kvfsUpload) FinishUpload(ctx context.Context) error {
 	// when the full commit succeeded. On any failure (including ctx
 	// timeout in the commit phase, S3 errors, commitNode CAS exhaustion)
 	// the session lives until either the next retry commits it or the
-	// 24h upload TTL reaps it.
+	// uploadSessionTTL reaper clears it.
 	var commitSucceeded bool
 	defer func() {
 		if !commitSucceeded {
@@ -342,8 +342,33 @@ func (d *kvfsDriver) NewUpload(ctx context.Context, info tusd.FileInfo) (tusd.Up
 // the offset from the staging cache's authoritative size in case the
 // persisted offset is stale (we don't checkpoint per chunk — see
 // WriteChunk).
+//
+// Bounded retry absorbs the NATS KV cross-replica read-your-write window.
+// With R=3 RAFT replication the leader acks a PutUpload as soon as it has
+// the entry; follower replicas converge over a 10-100 ms window. A PATCH
+// that arrives within that window can route to a follower that has not
+// yet seen the new key — kvfs would surface a 404 to tusd and the client
+// would see ERR_UPLOAD_NOT_FOUND despite the session being fully
+// persisted on the originating pod. Three attempts × 50 ms covers the
+// worst-case observed replication time without measurably penalising the
+// steady-state (cache-hit) path.
 func (d *kvfsDriver) GetUpload(ctx context.Context, id string) (tusd.Upload, error) {
-	session, err := d.store.GetUpload(id)
+	const getUploadRetries = 3
+	const getUploadBackoff = 50 * time.Millisecond
+	var session *UploadSession
+	var err error
+	for attempt := 0; attempt < getUploadRetries; attempt++ {
+		session, err = d.store.GetUpload(id)
+		if err == nil {
+			break
+		}
+		if err != ErrNotFound {
+			return nil, err
+		}
+		if attempt < getUploadRetries-1 {
+			time.Sleep(getUploadBackoff)
+		}
+	}
 	if err != nil {
 		if err == ErrNotFound {
 			return nil, tusd.ErrNotFound
@@ -387,7 +412,7 @@ func (d *kvfsDriver) createTUSSession(ctx context.Context, spaceID, parentID, na
 		Size:           size,
 		Offset:         0,
 		Storage:        map[string]string{},
-		Expires:        time.Now().Add(24 * time.Hour).Unix(),
+		Expires:        time.Now().Add(uploadSessionTTL).Unix(),
 		BlobID:         blobID,
 		S3MultipartID:  "", // populated only by legacy pre-disk-cache sessions
 		Parts:          nil,

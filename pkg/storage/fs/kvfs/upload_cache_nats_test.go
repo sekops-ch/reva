@@ -102,7 +102,7 @@ func TestNATSStreamUploadCache_AppendThenSize(t *testing.T) {
 	}
 
 	body := []byte("hello world chunk one")
-	n, err := cache.Append("sess-1", bytes.NewReader(body))
+	n, err := cache.Append("sess-1", 0, bytes.NewReader(body))
 	if err != nil {
 		t.Fatalf("Append: %v", err)
 	}
@@ -130,10 +130,10 @@ func TestNATSStreamUploadCache_MultipleAppends(t *testing.T) {
 
 	chunk1 := []byte("AAAA")
 	chunk2 := []byte("BBBB")
-	if _, err := cache.Append("sess", bytes.NewReader(chunk1)); err != nil {
+	if _, err := cache.Append("sess", 0, bytes.NewReader(chunk1)); err != nil {
 		t.Fatalf("Append1: %v", err)
 	}
-	if _, err := cache.Append("sess", bytes.NewReader(chunk2)); err != nil {
+	if _, err := cache.Append("sess", int64(len(chunk1)), bytes.NewReader(chunk2)); err != nil {
 		t.Fatalf("Append2: %v", err)
 	}
 
@@ -175,7 +175,7 @@ func TestNATSStreamUploadCache_SplitsLargeAppend(t *testing.T) {
 		t.Fatalf("rand.Read: %v", err)
 	}
 
-	n, err := cache.Append("big-session", bytes.NewReader(body))
+	n, err := cache.Append("big-session", 0, bytes.NewReader(body))
 	if err != nil {
 		t.Fatalf("Append: %v", err)
 	}
@@ -221,7 +221,7 @@ func TestNATSStreamUploadCache_CrossPod(t *testing.T) {
 	chunkB := []byte("from-pod-B-chunk-one")
 
 	// Pod A writes the first chunk.
-	if _, err := cacheA.Append("xpod", bytes.NewReader(chunkA)); err != nil {
+	if _, err := cacheA.Append("xpod", 0, bytes.NewReader(chunkA)); err != nil {
 		t.Fatalf("cacheA.Append: %v", err)
 	}
 
@@ -232,7 +232,7 @@ func TestNATSStreamUploadCache_CrossPod(t *testing.T) {
 	}
 
 	// Pod B writes the second chunk.
-	if _, err := cacheB.Append("xpod", bytes.NewReader(chunkB)); err != nil {
+	if _, err := cacheB.Append("xpod", 0, bytes.NewReader(chunkB)); err != nil {
 		t.Fatalf("cacheB.Append: %v", err)
 	}
 
@@ -263,7 +263,7 @@ func TestNATSStreamUploadCache_Drop(t *testing.T) {
 		t.Fatalf("new: %v", err)
 	}
 
-	if _, err := cache.Append("sess-x", bytes.NewReader([]byte("payload"))); err != nil {
+	if _, err := cache.Append("sess-x", 0, bytes.NewReader([]byte("payload"))); err != nil {
 		t.Fatalf("Append: %v", err)
 	}
 	size, _ := cache.Size("sess-x")
@@ -309,7 +309,7 @@ func TestNATSStreamUploadCache_OffsetHeaderEncoding(t *testing.T) {
 
 	// Append 30 bytes in one call — split into 4 messages (8+8+8+6).
 	body := bytes.Repeat([]byte("A"), 30)
-	if _, err := cache.Append("offset-test", bytes.NewReader(body)); err != nil {
+	if _, err := cache.Append("offset-test", 0, bytes.NewReader(body)); err != nil {
 		t.Fatalf("Append: %v", err)
 	}
 
@@ -343,5 +343,33 @@ func TestNATSStreamUploadCache_ReaderOnEmpty(t *testing.T) {
 	}
 	if len(got) != 0 {
 		t.Errorf("read %d bytes, want 0", len(got))
+	}
+}
+
+// TestNATSStreamUploadCache_AppendHonorsCallerOffset proves Append stamps the
+// Upload-Offset header from the caller-supplied offset rather than re-probing
+// Size() internally. Appending at a non-zero offset on a fresh session (where
+// a Size() re-probe would read 0) must make Size() report offset+len — only
+// possible if the passed offset drove the header. This guards the hot-path
+// optimisation that dropped the per-chunk GetLastMsg round-trip.
+func TestNATSStreamUploadCache_AppendHonorsCallerOffset(t *testing.T) {
+	js := embeddedNATS(t)
+	cache, err := newNATSStreamUploadCache(js, defaultNATSCacheOpts())
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+
+	const off = int64(100)
+	data := []byte("XY")
+	if _, err := cache.Append("sess-off", off, bytes.NewReader(data)); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+
+	size, err := cache.Size("sess-off")
+	if err != nil {
+		t.Fatalf("Size: %v", err)
+	}
+	if want := off + int64(len(data)); size != want {
+		t.Fatalf("Size=%d, want %d (caller offset not honoured — Append may be re-probing)", size, want)
 	}
 }

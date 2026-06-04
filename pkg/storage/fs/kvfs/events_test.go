@@ -23,6 +23,7 @@ import (
 	"reflect"
 	"sync"
 	"testing"
+	"time"
 
 	user "github.com/cs3org/go-cs3apis/cs3/identity/user/v1beta1"
 	provider "github.com/cs3org/go-cs3apis/cs3/storage/provider/v1beta1"
@@ -1052,5 +1053,143 @@ func TestTouchFile_NewFile_UpdatesParentETag(t *testing.T) {
 
 	if stream.eventCount() != 1 {
 		t.Errorf("expected 1 event, got %d", stream.eventCount())
+	}
+}
+
+// --- Async publish path (driver wired like New(), with a live worker) ---
+//
+// The fixtures above (testDriverWithStream) leave eventQueue nil, so they
+// exercise the synchronous fallback. The tests below build a driver WITH a
+// real eventQueue + a running eventPublisher goroutine, covering the
+// fire-and-forget path, queue-overflow drop, metadata fidelity, and shutdown.
+
+// testDriverWithAsyncStream mirrors the event-worker wiring New() performs so
+// the async dispatch path is under test, not just the sync fallback.
+func testDriverWithAsyncStream(store *mockMetadataStore, blob *mockBlobStore, stream revaevents.Stream, bufSize int) *kvfsDriver {
+	log := zerolog.Nop()
+	tmpDir, err := os.MkdirTemp("", "kvfs-test-*")
+	if err != nil {
+		panic(err)
+	}
+	d := &kvfsDriver{
+		store:       store,
+		blob:        blob,
+		opts:        &Options{},
+		log:         &log,
+		stream:      stream,
+		uploadCache: newDiskUploadCache(tmpDir),
+		eventQueue:  make(chan eventJob, bufSize),
+		eventStop:   make(chan struct{}),
+	}
+	go d.eventPublisher()
+	return d
+}
+
+// waitForEvents polls until the mock stream has recorded at least want events
+// or the deadline elapses — the deterministic way to assert on async delivery.
+func waitForEvents(t *testing.T, stream *mockStream, want int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if stream.eventCount() >= want {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %d event(s); got %d", want, stream.eventCount())
+}
+
+func TestPublishEventAsync_DrainsToStream(t *testing.T) {
+	stream := newMockStream()
+	d := testDriverWithAsyncStream(newMockMetadataStore(), newMockBlobStore(), stream, eventQueueSize)
+	defer d.Shutdown(context.Background())
+
+	d.publishEvent(eventTestContext(), func() interface{} {
+		return revaevents.FileUploaded{}
+	})
+
+	waitForEvents(t, stream, 1)
+}
+
+// TestPublishEventAsync_PreservesInitiator is the regression guard for the
+// metadata-fidelity fix: the worker must publish with the originating request
+// ctx (detached via WithoutCancel) so events.Publish still emits initiatorID.
+// A bare context.Background() in the worker would drop it, breaking downstream
+// self-notification suppression.
+func TestPublishEventAsync_PreservesInitiator(t *testing.T) {
+	stream := newMockStream()
+	d := testDriverWithAsyncStream(newMockMetadataStore(), newMockBlobStore(), stream, eventQueueSize)
+	defer d.Shutdown(context.Background())
+
+	ctx := ctxpkg.ContextSetInitiator(eventTestContext(), "init-123")
+	d.publishEvent(ctx, func() interface{} {
+		return revaevents.FileUploaded{}
+	})
+
+	waitForEvents(t, stream, 1)
+	if got := stream.lastEvent().metadata[revaevents.MetadatakeyInitiatorID]; got != "init-123" {
+		t.Errorf("async event lost initiatorID: got %q, want %q", got, "init-123")
+	}
+}
+
+// TestPublishEventAsync_QueueFull_Drops builds a 1-slot queue with NO worker so
+// nothing ever drains; the first enqueue fills the buffer and every subsequent
+// one must be dropped without ever blocking the caller. Reaching the assertions
+// proves enqueue is non-blocking; the buffer length proves exactly one was kept
+// and the rest dropped. (EventQueueDropped's wiring is covered live by
+// tests/integration/test_event_queue_metric.py — asserting the global counter
+// here would need prometheus/testutil, which isn't vendored.)
+func TestPublishEventAsync_QueueFull_Drops(t *testing.T) {
+	stream := newMockStream()
+	log := zerolog.Nop()
+	d := &kvfsDriver{
+		stream:     stream,
+		log:        &log,
+		eventQueue: make(chan eventJob, 1), // no eventPublisher started → never drains
+		eventStop:  make(chan struct{}),
+	}
+
+	mk := func() interface{} { return revaevents.FileUploaded{} }
+	ctx := eventTestContext()
+	d.publishEvent(ctx, mk) // fills the single buffer slot
+	d.publishEvent(ctx, mk) // full, dropped (must not block)
+	d.publishEvent(ctx, mk) // full, dropped (must not block)
+
+	if got := len(d.eventQueue); got != 1 {
+		t.Errorf("expected exactly 1 buffered job (the rest dropped), got %d", got)
+	}
+	// With no worker, nothing should ever reach the stream.
+	if stream.eventCount() != 0 {
+		t.Errorf("no worker running, expected 0 published, got %d", stream.eventCount())
+	}
+}
+
+// TestEventPublisher_ShutdownStopsWorker asserts Shutdown returns promptly and
+// the worker goroutine stops draining afterwards.
+func TestEventPublisher_ShutdownStopsWorker(t *testing.T) {
+	stream := newMockStream()
+	d := testDriverWithAsyncStream(newMockMetadataStore(), newMockBlobStore(), stream, eventQueueSize)
+
+	// Prove the worker is alive.
+	d.publishEvent(eventTestContext(), func() interface{} { return revaevents.FileUploaded{} })
+	waitForEvents(t, stream, 1)
+
+	done := make(chan error, 1)
+	go func() { done <- d.Shutdown(context.Background()) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Shutdown returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Shutdown did not return within 2s")
+	}
+
+	// After shutdown the worker is gone: a freshly enqueued event is buffered
+	// but never drained.
+	d.publishEvent(eventTestContext(), func() interface{} { return revaevents.FileUploaded{} })
+	time.Sleep(50 * time.Millisecond)
+	if stream.eventCount() != 1 {
+		t.Errorf("worker still draining after Shutdown: stream count=%d, want 1", stream.eventCount())
 	}
 }

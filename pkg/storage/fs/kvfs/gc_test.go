@@ -914,3 +914,161 @@ func TestReconcileChildren_DryRunDoesNotMutate(t *testing.T) {
 		t.Error("dry-run must not mutate; stale entry still expected on old-dir")
 	}
 }
+
+// --- runInitialSweepWithRetry tests ---
+
+// withShortGCTimings shrinks the GC retry/lock timings for the duration
+// of one unit test so the retry path is exercisable in seconds rather
+// than the production 30+5 min budget. Restores defaults on cleanup.
+func withShortGCTimings(t *testing.T, ttl, retry time.Duration) {
+	prevTTL := gcLockTTL
+	prevRetry := initialSweepRetryInterval
+	gcLockTTL = ttl
+	initialSweepRetryInterval = retry
+	t.Cleanup(func() {
+		gcLockTTL = prevTTL
+		initialSweepRetryInterval = prevRetry
+	})
+}
+
+// lockHolder safely reads the current holder of a lock via the mock's
+// own mutex so the race detector stays happy.
+func lockHolder(store *mockMetadataStore, key string) string {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if entry, ok := store.locks[key]; ok {
+		return entry.Holder
+	}
+	return ""
+}
+
+// TestRunInitialSweepWithRetry_LockBusyThenSucceeds — lock initially held
+// by a "stale prior-pod" entry, expires shortly, retry loop acquires it
+// on the next iteration and sweeps successfully.
+func TestRunInitialSweepWithRetry_LockBusyThenSucceeds(t *testing.T) {
+	store := newMockMetadataStore()
+	blob := newMockBlobStore()
+	withShortGCTimings(t, 200*time.Millisecond, 50*time.Millisecond)
+	gc := testGC(store, blob, false)
+	gc.holderID = "new-pod"
+
+	store.mu.Lock()
+	store.locks["gc-sweep"] = &kvLockEntry{
+		Holder:    "prior-pod",
+		ExpiresAt: time.Now().Add(100 * time.Millisecond).UnixNano(),
+	}
+	store.mu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		gc.runInitialSweepWithRetry()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		if h := lockHolder(store, "gc-sweep"); h != "" {
+			t.Errorf("lock entry still present after successful sweep; got holder=%q", h)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("runInitialSweepWithRetry did not return within 3 s")
+	}
+}
+
+// TestRunInitialSweepWithRetry_DeadlineExceeded — lock stays held for the
+// entire test window; retry loop gives up after 2 × gcLockTTL without
+// panicking or leaking the goroutine.
+func TestRunInitialSweepWithRetry_DeadlineExceeded(t *testing.T) {
+	store := newMockMetadataStore()
+	blob := newMockBlobStore()
+	// Tiny TTL + retry interval so the 2×TTL deadline fires quickly.
+	withShortGCTimings(t, 200*time.Millisecond, 100*time.Millisecond)
+	gc := testGC(store, blob, false)
+	gc.holderID = "new-pod"
+
+	store.mu.Lock()
+	store.locks["gc-sweep"] = &kvLockEntry{
+		Holder:    "stuck-pod",
+		ExpiresAt: time.Now().Add(1 * time.Hour).UnixNano(),
+	}
+	store.mu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		gc.runInitialSweepWithRetry()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		if h := lockHolder(store, "gc-sweep"); h != "stuck-pod" {
+			t.Errorf("stuck-pod's lock entry mangled: holder=%q", h)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("runInitialSweepWithRetry deadline path did not return")
+	}
+}
+
+// TestRunInitialSweepWithRetry_StopAbortsRetry — closing stopCh during the
+// retry wait returns promptly without finishing the sweep.
+func TestRunInitialSweepWithRetry_StopAbortsRetry(t *testing.T) {
+	store := newMockMetadataStore()
+	blob := newMockBlobStore()
+	withShortGCTimings(t, 5*time.Second, 5*time.Second)
+	gc := testGC(store, blob, false)
+	gc.holderID = "new-pod"
+
+	store.mu.Lock()
+	store.locks["gc-sweep"] = &kvLockEntry{
+		Holder:    "other-pod",
+		ExpiresAt: time.Now().Add(1 * time.Hour).UnixNano(),
+	}
+	store.mu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		gc.runInitialSweepWithRetry()
+		close(done)
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+	close(gc.stopCh)
+
+	select {
+	case <-done:
+		// returned via stopCh path
+	case <-time.After(2 * time.Second):
+		t.Fatal("runInitialSweepWithRetry did not honour stopCh")
+	}
+}
+
+// TestGCRunDoesNotWriteUploadAgeGauge guards the single-writer invariant: the
+// upload-staleness gauges belong to the sampler, never to gc.Run.
+func TestGCRunDoesNotWriteUploadAgeGauge(t *testing.T) {
+	// Sentinel that the helper would never produce for the snapshot below.
+	const sentinel = 123456.0
+	OldestUploadAgeSeconds.Set(sentinel)
+	UploadSessionsTotal.Set(sentinel)
+
+	store := newMockMetadataStore()
+	blob := newMockBlobStore()
+	gc := testGC(store, blob, false)
+
+	setupSpaceEmpty(store, "space-1", "root-1")
+	store.uploads["upload-1"] = &UploadSession{
+		ID: "upload-1", SpaceID: "space-1", BlobID: "blob-uploading",
+		Expires: time.Now().Add(uploadSessionTTL).Unix(),
+	}
+
+	gc.Run(context.Background())
+
+	if v := getGaugeValue(t, "kvfs_oldest_upload_age_seconds", nil); v != sentinel {
+		t.Errorf("gc.Run wrote kvfs_oldest_upload_age_seconds (=%v); the gauge must be owned by the sampler, not GC", v)
+	}
+	if v := getGaugeValue(t, "kvfs_upload_sessions_total", nil); v != sentinel {
+		t.Errorf("gc.Run wrote kvfs_upload_sessions_total (=%v); the gauge must be owned by the sampler, not GC", v)
+	}
+
+	// Reset so other tests see a clean gauge.
+	updateUploadAgeMetrics(nil)
+}

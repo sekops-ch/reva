@@ -24,20 +24,38 @@ import (
 	"github.com/rs/zerolog"
 )
 
-const gcLockTTL = 30 * time.Minute
+// gcLockTTL bounds how long one sweep can hold the cluster-wide lock
+// before another pod can steal it. Long enough to cover a real sweep on
+// a bucket the size of `oc-uploads`; not so long that a sweep stalled by
+// a recently-killed pod blocks everyone for hours. Exposed as a variable
+// so unit tests can override; production code never writes it.
+var gcLockTTL = 30 * time.Minute
 
 // GCResult holds the outcome of a single GC run.
 type GCResult struct {
-	BlobsScanned        int
-	BlobsDeleted        int
-	WouldDelete         int
-	ChildrenReconciled  int // stale or duplicate oc-children entries removed
-	Errors              int
-	Duration            time.Duration
+	BlobsScanned       int
+	BlobsDeleted       int
+	WouldDelete        int
+	ChildrenReconciled int // stale or duplicate oc-children entries removed
+	Errors             int
+	Duration           time.Duration
+
+	// Identity-orphan reaping (owner no longer a live user).
+	OrphanPersonalSpacesDeleted int // dead-owner personal spaces reaped
+	OrphanProjectSpaces         int // dead-owner project/virtual spaces SURFACED (not deleted)
+
+	// Internal residue sweep (data whose space no longer exists in oc-spaces).
+	ResidueKeysDeleted  int // KV entries of deleted spaces removed
+	ResidueBlobsDeleted int // S3 blobs of deleted spaces removed
 }
 
-// blobGC runs periodic garbage collection to find and remove orphaned S3 blobs
-// that are no longer referenced by any node, version, upload, or trash entry.
+// blobGC runs periodic garbage collection that reconciles a 1:1:1
+// correspondence between live spaces, their KV metadata, and their S3 blobs.
+// Beyond reaping unreferenced blobs within live spaces, it also (a) reaps
+// orphaned personal spaces whose owner is no longer a live user (via the
+// injected resolver, reusing the standard DeleteStorageSpace path), and
+// (b) sweeps residue — KV entries and S3 blobs whose owning space no longer
+// exists in oc-spaces (crash-mid-delete / best-effort delete failures).
 type blobGC struct {
 	store    MetadataStore
 	blob     BlobStore
@@ -46,19 +64,17 @@ type blobGC struct {
 	stopCh   chan struct{}
 	holderID string
 
-	// uploadAgeReporter, if set, is invoked once per GC tick with the
-	// current uploads slice so the kvfs driver can publish authoritative
-	// liveness metrics (oldest age, total session count) without spinning
-	// a dedicated walker goroutine.
-	uploadAgeReporter func(uploads []*UploadSession)
-}
+	// resolver answers which space owners are still live users. Nil disables
+	// identity reaping (e.g. the storage-system instance, which has no
+	// personal spaces); the residue sweep still runs. See resolver.go.
+	resolver UserResolver
 
-// SetUploadAgeReporter installs a callback invoked once per GC tick with
-// the current uploads slice. Used by the kvfs driver to keep the
-// kvfs_oldest_upload_age_seconds + kvfs_upload_sessions_total gauges
-// authoritative.
-func (gc *blobGC) SetUploadAgeReporter(fn func(uploads []*UploadSession)) {
-	gc.uploadAgeReporter = fn
+	// reapSpace deletes a space's contents + entry through the SAME crash-safe
+	// path as DeleteStorageSpace (deleteSpaceContents + DeleteSpace under a
+	// detached commit context). Injected by the driver in New() so the GC has
+	// exactly one deletion implementation to reuse. Nil in unit tests that do
+	// not exercise reaping.
+	reapSpace func(ctx context.Context, spaceID, rootID string) error
 }
 
 // newBlobGC creates a new GC instance.
@@ -80,13 +96,47 @@ func newBlobGC(store MetadataStore, blob BlobStore, opts *Options, log *zerolog.
 // Start begins the GC background loop. It returns immediately.
 func (gc *blobGC) Start() {
 	if gc.opts.GCRunOnStart {
-		go func() {
-			gc.log.Info().Msg("gc: running initial sweep on start")
-			gc.Run(context.Background())
-		}()
+		go gc.runInitialSweepWithRetry()
 	}
 
 	go gc.loop()
+}
+
+// initialSweepRetryInterval is how long the initial sweep waits between
+// attempts when the gc-sweep lock is held by another (possibly recently-
+// killed) pod. Smaller than gcLockTTL so a stale lock from a killed pod
+// can be reclaimed within minutes rather than the full sweep interval.
+// Exposed as a variable so unit tests can override without polluting
+// production behaviour.
+var initialSweepRetryInterval = 5 * time.Minute
+
+// runInitialSweepWithRetry executes the initial GC sweep, retrying with
+// a bounded backoff if another pod currently holds the sweep lock. Without
+// the retry, a stale lock left behind by a recently-killed pod would block
+// the initial sweep, and the next attempt would not happen until
+// GCIntervalDuration() (typically 24 h) later. Retries are capped at
+// 2 × gcLockTTL so this goroutine cannot leak indefinitely on a
+// genuinely contested lock.
+func (gc *blobGC) runInitialSweepWithRetry() {
+	gc.log.Info().Msg("gc: running initial sweep on start")
+	deadline := time.Now().Add(2 * gcLockTTL)
+	for {
+		result := gc.Run(context.Background())
+		if result.Duration > 0 {
+			return // sweep actually ran (lock acquired, sweep completed)
+		}
+		if time.Now().After(deadline) {
+			gc.log.Warn().
+				Dur("waited", 2*gcLockTTL).
+				Msg("gc: initial sweep retry deadline exceeded; deferring to the interval ticker")
+			return
+		}
+		select {
+		case <-gc.stopCh:
+			return
+		case <-time.After(initialSweepRetryInterval):
+		}
+	}
 }
 
 // Stop signals the GC loop to exit.
@@ -147,9 +197,6 @@ func (gc *blobGC) Run(ctx context.Context) GCResult {
 		finalize()
 		return result
 	}
-	if gc.uploadAgeReporter != nil {
-		gc.uploadAgeReporter(uploads)
-	}
 
 	spaces, err := gc.store.ListSpaces(nil)
 	if err != nil {
@@ -162,6 +209,33 @@ func (gc *blobGC) Run(ctx context.Context) GCResult {
 
 	minAge := gc.opts.GCMinAgeDuration()
 	cutoff := time.Now().Add(-minAge)
+
+	// (1) Identity reaping: delete orphaned personal spaces whose owner is no
+	// longer a live user; surface orphaned project/virtual spaces for manual
+	// review (never auto-deleted). This may remove entries from oc-spaces, so
+	// we re-list afterwards to keep the residue sweep and per-space blob loop
+	// operating on the post-reap live set.
+	gc.reapIdentityOrphans(ctx, spaces, &result)
+
+	spaces, err = gc.store.ListSpaces(nil)
+	if err != nil {
+		gc.log.Error().Err(err).Msg("gc: failed to re-list spaces after identity reaping")
+		GCErrors.Inc()
+		result.Errors++
+		finalize()
+		return result
+	}
+
+	liveSpaceIDs := make(map[string]struct{}, len(spaces))
+	for _, sp := range spaces {
+		liveSpaceIDs[sp.ID] = struct{}{}
+	}
+
+	// (2) Internal residue sweep: reap KV entries and S3 blobs whose owning
+	// space no longer exists in oc-spaces (crash-mid-delete / best-effort
+	// delete residue, including anything identity reaping above could not
+	// finish). Pure internal consistency — no identity signal needed.
+	gc.reconcileResidue(ctx, liveSpaceIDs, uploads, cutoff, &result)
 
 	for _, space := range spaces {
 		refs, err := gc.buildSpaceReferenceSet(space.ID, uploads)
@@ -235,11 +309,248 @@ func (gc *blobGC) Run(ctx context.Context) GCResult {
 		Int("would_delete", result.WouldDelete).
 		Int("expired_uploads_cleaned", expiredUploads).
 		Int("children_reconciled", result.ChildrenReconciled).
+		Int("orphan_personal_spaces_deleted", result.OrphanPersonalSpacesDeleted).
+		Int("orphan_project_spaces_surfaced", result.OrphanProjectSpaces).
+		Int("residue_keys_deleted", result.ResidueKeysDeleted).
+		Int("residue_blobs_deleted", result.ResidueBlobsDeleted).
 		Int("errors", result.Errors).
 		Dur("duration", result.Duration).
 		Msg("gc: sweep completed")
 
 	return result
+}
+
+// reapIdentityOrphans deletes spaces whose owner is no longer a live user.
+// Personal spaces are reaped through the standard DeleteStorageSpace path
+// (gc.reapSpace); orphaned project/virtual spaces are only SURFACED (logged +
+// counted on a gauge) for manual review, never auto-deleted — a shared space
+// outlives the deprovisioning of the single user who happened to create it.
+//
+// Safety: identity reaping is skipped entirely when the resolver is nil
+// (e.g. storage-system) or when the resolver cannot determine liveness for
+// the whole sweep (returns an error). Per-owner, only a *definitive* not-live
+// answer (present in the map as false) triggers a reap; an owner absent from
+// the map is "unknown" and is never reaped. This makes it impossible for a
+// degraded identity backend to delete a live user's space.
+func (gc *blobGC) reapIdentityOrphans(ctx context.Context, spaces []*SpaceEntry, result *GCResult) {
+	if gc.resolver == nil {
+		return // identity reaping disabled for this instance
+	}
+
+	owners := make([]string, 0, len(spaces))
+	seen := make(map[string]struct{}, len(spaces))
+	for _, sp := range spaces {
+		if sp.Owner == "" {
+			continue
+		}
+		if _, dup := seen[sp.Owner]; dup {
+			continue
+		}
+		seen[sp.Owner] = struct{}{}
+		owners = append(owners, sp.Owner)
+	}
+
+	liveness, err := gc.resolver.ResolveLiveness(ctx, owners)
+	if err != nil {
+		gc.log.Warn().Err(err).Msg("gc: identity reaping skipped (resolver unavailable) — no spaces reaped this cycle")
+		GCIdentityReapingSkipped.Inc()
+		return
+	}
+
+	projectOrphans := 0
+	for _, sp := range spaces {
+		live, determined := liveness[sp.Owner]
+		if !determined || live {
+			// Unknown owner (never reap) or live owner (keep).
+			continue
+		}
+
+		// Owner is definitively gone.
+		if sp.Type != "personal" {
+			projectOrphans++
+			gc.log.Warn().
+				Str("space_id", sp.ID).
+				Str("type", sp.Type).
+				Str("owner", sp.Owner).
+				Str("name", sp.Name).
+				Msg("gc: orphaned non-personal space requires MANUAL review (owner gone; NOT deleted)")
+			continue
+		}
+
+		if gc.opts.GCDryRun {
+			result.WouldDelete++
+			GCWouldDelete.Inc()
+			gc.log.Info().
+				Str("space_id", sp.ID).
+				Str("owner", sp.Owner).
+				Str("name", sp.Name).
+				Msg("gc: would reap orphaned personal space (dry-run)")
+			continue
+		}
+
+		if gc.reapSpace == nil {
+			// No deletion path wired (unit context); cannot reap.
+			continue
+		}
+		if err := gc.reapSpace(ctx, sp.ID, sp.RootID); err != nil {
+			gc.log.Error().Err(err).Str("space_id", sp.ID).Msg("gc: failed to reap orphaned personal space")
+			GCErrors.Inc()
+			result.Errors++
+			continue
+		}
+		result.OrphanPersonalSpacesDeleted++
+		GCOrphanPersonalSpacesDeleted.Inc()
+		gc.log.Info().
+			Str("space_id", sp.ID).
+			Str("owner", sp.Owner).
+			Str("name", sp.Name).
+			Msg("gc: reaped orphaned personal space (dead owner)")
+	}
+
+	result.OrphanProjectSpaces = projectOrphans
+	GCOrphanProjectSpaces.Set(float64(projectOrphans))
+}
+
+// reconcileResidue reaps data whose owning space no longer exists in
+// oc-spaces. This covers crash-mid-DeleteStorageSpace and best-effort delete
+// failures (deleteSpaceContents discards per-item errors), plus anything the
+// identity-reaping pass above could not finish. It needs NO identity signal —
+// a node/blob whose space is gone is unambiguously stale.
+//
+// Memory discipline mirrors the rest of GC: it never enumerates the whole
+// system. Ghost spaces are discovered cheaply — from the S3 top-level prefix
+// list and the already-loaded uploads slice — and each ghost is then cleaned
+// with per-space (bounded) reads, so peak memory stays proportional to the
+// largest single ghost space, not the total node count.
+func (gc *blobGC) reconcileResidue(ctx context.Context, liveSpaceIDs map[string]struct{}, uploads []*UploadSession, cutoff time.Time, result *GCResult) {
+	isLive := func(spaceID string) bool {
+		_, ok := liveSpaceIDs[spaceID]
+		return ok
+	}
+
+	// Discover ghost space IDs cheaply: S3 prefixes (one delimiter list) plus
+	// any in-flight upload whose space is gone (uploads are already in memory).
+	ghosts := map[string]struct{}{}
+	prefixes, err := gc.blob.ListSpacePrefixes(ctx)
+	if err != nil {
+		gc.log.Error().Err(err).Msg("gc: residue sweep failed to list S3 space prefixes")
+		GCErrors.Inc()
+		result.Errors++
+	}
+	for _, sid := range prefixes {
+		if sid != "" && !isLive(sid) {
+			ghosts[sid] = struct{}{}
+		}
+	}
+	for _, u := range uploads {
+		if u.SpaceID != "" && !isLive(u.SpaceID) {
+			ghosts[u.SpaceID] = struct{}{}
+		}
+	}
+
+	for sid := range ghosts {
+		gc.reapGhostSpace(ctx, sid, cutoff, result)
+	}
+}
+
+// reapGhostSpace removes all KV metadata and S3 blobs for a single space that
+// no longer exists in oc-spaces. All reads are per-space (bounded). Safe
+// without an age gate on KV entries because space creation writes the
+// oc-spaces entry FIRST (PutSpace rev=0, atomic create-or-fail), so a
+// missing space entry means the space was deleted, not mid-provision; the S3
+// blob delete still honours the age cutoff as a second belt.
+func (gc *blobGC) reapGhostSpace(ctx context.Context, spaceID string, cutoff time.Time, result *GCResult) {
+	dryRun := gc.opts.GCDryRun
+
+	delKey := func() {
+		if dryRun {
+			result.WouldDelete++
+			GCWouldDelete.Inc()
+			return
+		}
+		result.ResidueKeysDeleted++
+		GCResidueKeysDeleted.Inc()
+	}
+
+	if nodes, err := gc.store.ListNodesBySpace(spaceID); err == nil {
+		for _, n := range nodes {
+			if !dryRun {
+				gc.store.DeleteNode(n.SpaceID, n.ID)
+				if n.Type == NodeTypeDir {
+					gc.store.DeleteChildren(n.SpaceID, n.ID)
+				}
+			}
+			delKey()
+		}
+	} else {
+		gc.log.Warn().Err(err).Str("space_id", spaceID).Msg("gc: residue sweep failed to list nodes for ghost space")
+	}
+	if versions, err := gc.store.ListVersionsBySpace(spaceID); err == nil {
+		for _, v := range versions {
+			if !dryRun {
+				gc.store.DeleteVersion(v.SpaceID, v.NodeID, v.Key)
+			}
+			delKey()
+		}
+	} else {
+		gc.log.Warn().Err(err).Str("space_id", spaceID).Msg("gc: residue sweep failed to list versions for ghost space")
+	}
+	if trash, err := gc.store.ListTrash(spaceID); err == nil {
+		for _, t := range trash {
+			if !dryRun {
+				gc.store.DeleteTrash(t.SpaceID, t.Key)
+			}
+			delKey()
+		}
+	} else {
+		gc.log.Warn().Err(err).Str("space_id", spaceID).Msg("gc: residue sweep failed to list trash for ghost space")
+	}
+	if ups, err := gc.store.ListUploadsBySpace(spaceID); err == nil {
+		for _, u := range ups {
+			if !dryRun {
+				if u.S3MultipartID != "" {
+					gc.blob.AbortMultipartUpload(ctx, BlobKey(u.SpaceID, u.BlobID), u.S3MultipartID)
+				}
+				gc.store.DeleteUpload(u.ID)
+			}
+			delKey()
+		}
+	} else {
+		gc.log.Warn().Err(err).Str("space_id", spaceID).Msg("gc: residue sweep failed to list uploads for ghost space")
+	}
+
+	// Bulk-reap every S3 object under the ghost prefix (age-gated). This
+	// covers both node-referenced blobs and any blob whose node delete already
+	// succeeded — the whole prefix belongs to a space that no longer exists.
+	blobs, err := gc.blob.ListBlobs(ctx, spaceID+"/")
+	if err != nil {
+		gc.log.Error().Err(err).Str("space_id", spaceID).Msg("gc: residue sweep failed to list blobs for ghost space")
+		GCErrors.Inc()
+		result.Errors++
+		return
+	}
+	for _, b := range blobs {
+		if !b.LastModified.IsZero() && b.LastModified.After(cutoff) {
+			continue // too young — never reap an in-flight provision
+		}
+		if dryRun {
+			result.WouldDelete++
+			GCWouldDelete.Inc()
+			gc.log.Info().Str("key", b.Key).Msg("gc: would reap residual blob of deleted space (dry-run)")
+			continue
+		}
+		if err := gc.blob.Delete(ctx, b.Key); err != nil {
+			gc.log.Error().Err(err).Str("key", b.Key).Msg("gc: failed to delete residual blob")
+			GCErrors.Inc()
+			result.Errors++
+			continue
+		}
+		result.ResidueBlobsDeleted++
+		GCResidueBlobsDeleted.Inc()
+	}
+	if !dryRun && (result.ResidueKeysDeleted > 0 || result.ResidueBlobsDeleted > 0) {
+		gc.log.Info().Str("space_id", spaceID).Msg("gc: reaped residue of a deleted space")
+	}
 }
 
 // reconcileChildren walks oc-children for a single space and resolves any

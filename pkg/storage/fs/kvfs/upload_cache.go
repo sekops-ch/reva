@@ -39,17 +39,17 @@ import (
 // does: one local file per session, append-only writes via io.Copy, read
 // once at FinishUpload, deleted after. Microsecond latency per Append.
 //
-// An alternative `natsObjectUploadCache` writes via the NATS Object Store
-// (R=3 replication, multi-pod transparent at a bandwidth cost). It's
-// implemented but defaults off; operators flip to it via the
-// STORAGE_USERS_KVFS_UPLOAD_BACKEND env var when they need cross-pod
-// resume or pod-restart resilience and accept the ~3x bandwidth
-// amplification.
+// An alternative `natsStreamUploadCache` writes via a JetStream Stream
+// (one append-only message per PATCH on a per-session subject; file-backed
+// by default, R=1). Multi-pod transparent at a ~5-15 ms/chunk cost vs
+// disk's ~1 ms. Operators flip to it via the STORAGE_USERS_KVFS_UPLOAD_BACKEND
+// env var when they need cross-pod resume or pod-restart resilience.
 type UploadCache interface {
-	// Append writes data at the end of the session's staged body.
-	// Implementations must be append-only — random-offset writes are not
-	// supported. The TUS handler always calls with offset == current size.
-	Append(sessionID string, src io.Reader) (n int64, err error)
+	// Append writes data at the end of the session's staged body. offset is
+	// the authoritative current size, supplied by the TUS handler (which
+	// always calls with offset == current size); implementations must be
+	// append-only and may use offset instead of re-probing Size().
+	Append(sessionID string, offset int64, src io.Reader) (n int64, err error)
 	// Size returns the current staged byte count for the session.
 	// Used by GetUpload to authoritatively report the resumable offset
 	// (the persisted UploadSession.Offset may be slightly stale because we
@@ -79,7 +79,7 @@ type UploadCache interface {
 //   - Sized for max concurrent upload bytes. With 50 GiB emptyDir per pod
 //     we accommodate ~50 simultaneous multi-GB uploads.
 type diskUploadCache struct {
-	dir          string
+	dir           string
 	bytesInFlight atomic.Int64 // updated on Append / Drop so a Prom gauge can read it
 }
 
@@ -93,7 +93,9 @@ func (c *diskUploadCache) binPath(sessionID string) string {
 	return filepath.Join(c.dir, sessionID+".bin")
 }
 
-func (c *diskUploadCache) Append(sessionID string, src io.Reader) (int64, error) {
+// Append ignores offset: the O_APPEND open is the authoritative end-of-file
+// position, so the caller's offset is redundant for the disk backend.
+func (c *diskUploadCache) Append(sessionID string, _ int64, src io.Reader) (int64, error) {
 	f, err := os.OpenFile(c.binPath(sessionID), os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o600)
 	if err != nil {
 		return 0, errors.Wrap(err, "diskUploadCache: open temp file")
@@ -283,12 +285,10 @@ func (c *natsStreamUploadCache) Size(sessionID string) (int64, error) {
 // session's subject. Splits into MaxChunkBytes-sized sub-messages to stay
 // under NATS `max_payload`. Each sub-message carries the `Upload-Offset`
 // header for the data it contains, so Size() is O(1).
-func (c *natsStreamUploadCache) Append(sessionID string, src io.Reader) (int64, error) {
-	startOffset, err := c.Size(sessionID)
-	if err != nil {
-		return 0, errors.Wrap(err, "natsStreamUploadCache: probe size")
-	}
-
+//
+// startOffset comes from the caller (the TUS handler's authoritative offset),
+// avoiding a per-chunk GetLastMsg round-trip on the hot path.
+func (c *natsStreamUploadCache) Append(sessionID string, startOffset int64, src io.Reader) (int64, error) {
 	subj := c.subject(sessionID)
 	buf := make([]byte, c.opts.MaxChunkBytes)
 	var totalWritten int64

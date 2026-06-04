@@ -38,17 +38,17 @@ import (
 // --- Mock BlobStore ---
 
 type mockBlobStore struct {
-	mu              sync.Mutex
-	blobs           map[string][]byte
-	blobTimes       map[string]time.Time // key -> lastModified
-	multiparts      map[string]map[int][]byte // uploadID -> partNum -> data
-	nextUploadID    string
-	uploadPartErr   error
-	completeErr     error
-	initErr         error
-	abortCalled     []string
-	completeCalled  []string
-	deleteCalled    []string
+	mu             sync.Mutex
+	blobs          map[string][]byte
+	blobTimes      map[string]time.Time      // key -> lastModified
+	multiparts     map[string]map[int][]byte // uploadID -> partNum -> data
+	nextUploadID   string
+	uploadPartErr  error
+	completeErr    error
+	initErr        error
+	abortCalled    []string
+	completeCalled []string
+	deleteCalled   []string
 }
 
 func newMockBlobStore() *mockBlobStore {
@@ -165,23 +165,42 @@ func (m *mockBlobStore) ListBlobs(ctx context.Context, prefix string) ([]BlobInf
 	return result, nil
 }
 
+// ListSpacePrefixes returns the distinct top-level "<spaceID>" segments of all
+// stored blob keys, mirroring the delimiter-list semantics of the S3 backend.
+func (m *mockBlobStore) ListSpacePrefixes(ctx context.Context) ([]string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	seen := map[string]struct{}{}
+	var prefixes []string
+	for key := range m.blobs {
+		if i := strings.IndexByte(key, '/'); i > 0 {
+			id := key[:i]
+			if _, ok := seen[id]; !ok {
+				seen[id] = struct{}{}
+				prefixes = append(prefixes, id)
+			}
+		}
+	}
+	return prefixes, nil
+}
+
 // --- Mock MetadataStore ---
 
 type mockMetadataStore struct {
-	mu             sync.Mutex
-	nodes          map[string]*NodeEntry  // "spaceID.nodeID" -> node
-	nodeRevs       map[string]uint64
-	children       map[string]ChildMap    // "spaceID.parentID" -> children
-	childRevs      map[string]uint64
-	spaces         map[string]*SpaceEntry
-	spaceRevs      map[string]uint64
-	uploads        map[string]*UploadSession
-	versions       []*VersionEntry
-	trash          map[string]*TrashEntry
-	locks          map[string]*kvLockEntry
-	nextRev        uint64
-	putNodeErr     error
-	putChildrenErr error
+	mu                sync.Mutex
+	nodes             map[string]*NodeEntry // "spaceID.nodeID" -> node
+	nodeRevs          map[string]uint64
+	children          map[string]ChildMap // "spaceID.parentID" -> children
+	childRevs         map[string]uint64
+	spaces            map[string]*SpaceEntry
+	spaceRevs         map[string]uint64
+	uploads           map[string]*UploadSession
+	versions          []*VersionEntry
+	trash             map[string]*TrashEntry
+	locks             map[string]*kvLockEntry
+	nextRev           uint64
+	putNodeErr        error
+	putChildrenErr    error
 	casFailsLeft      int
 	childCASFailsLeft int
 }
@@ -1476,8 +1495,8 @@ func TestInitiateUploadMissingSpaceID(t *testing.T) {
 // --- Interface compliance compile-time checks ---
 
 var (
-	_ tusd.Upload                = (*kvfsUpload)(nil)
-	_ tusd.TerminatableUpload    = (*kvfsUpload)(nil)
+	_ tusd.Upload                 = (*kvfsUpload)(nil)
+	_ tusd.TerminatableUpload     = (*kvfsUpload)(nil)
 	_ tusd.LengthDeclarableUpload = (*kvfsUpload)(nil)
 )
 
@@ -1673,7 +1692,7 @@ func TestFinishUploadDetachedCtxSurvivesCancellation(t *testing.T) {
 	session.Offset = 5
 	store.uploads[session.ID] = session
 
-	if _, err := d.uploadCache.Append(session.ID, bytes.NewReader([]byte("hello"))); err != nil {
+	if _, err := d.uploadCache.Append(session.ID, 0, bytes.NewReader([]byte("hello"))); err != nil {
 		t.Fatalf("uploadCache.Append: %v", err)
 	}
 
@@ -1735,7 +1754,7 @@ func TestFinishUploadIdempotentReCommit(t *testing.T) {
 	session.S3MultipartID = ""
 	session.Offset = 5
 	store.uploads[session.ID] = session
-	if _, err := d.uploadCache.Append(session.ID, bytes.NewReader([]byte("hello"))); err != nil {
+	if _, err := d.uploadCache.Append(session.ID, 0, bytes.NewReader([]byte("hello"))); err != nil {
 		t.Fatalf("uploadCache.Append: %v", err)
 	}
 	UploadInFlight.WithLabelValues("tus").Add(1)
@@ -1771,7 +1790,7 @@ func TestFinishUploadIdempotentReCommit(t *testing.T) {
 	// for a resumed upload that happens to land on an already-committed
 	// file (the idempotent path).
 	store.uploads[session.ID] = session
-	if _, err := d.uploadCache.Append(session.ID, bytes.NewReader([]byte("hello"))); err != nil {
+	if _, err := d.uploadCache.Append(session.ID, 0, bytes.NewReader([]byte("hello"))); err != nil {
 		t.Fatalf("uploadCache.Append (retry): %v", err)
 	}
 	UploadInFlight.WithLabelValues("tus").Add(1)
@@ -1823,7 +1842,7 @@ func TestFinishUploadConcurrentSameSession(t *testing.T) {
 	session.S3MultipartID = ""
 	session.Offset = 5
 	store.uploads[session.ID] = session
-	if _, err := d.uploadCache.Append(session.ID, bytes.NewReader([]byte("hello"))); err != nil {
+	if _, err := d.uploadCache.Append(session.ID, 0, bytes.NewReader([]byte("hello"))); err != nil {
 		t.Fatalf("uploadCache.Append: %v", err)
 	}
 	// Two "in flight" markers — one per concurrent FinishUpload caller.
@@ -1867,4 +1886,3 @@ func TestFinishUploadConcurrentSameSession(t *testing.T) {
 		t.Error("file node not created after concurrent FinishUploads")
 	}
 }
-

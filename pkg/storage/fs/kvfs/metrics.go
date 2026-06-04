@@ -39,6 +39,14 @@ var (
 		Help: "Total number of CAS conflict errors detected",
 	}, []string{"bucket"})
 
+	// MaxCASRetriesGauge exports the effective CAS retry bound per kvfs
+	// instance. The prefix label keeps the two instances distinct, since
+	// both register into the same in-process registry.
+	MaxCASRetriesGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "kvfs_max_cas_retries",
+		Help: "Effective MaxCASRetries bound per kvfs instance (labeled by bucket prefix)",
+	}, []string{"prefix"})
+
 	// KVOperationDuration observes the duration of NATS KV operations.
 	KVOperationDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "kvfs_kv_operation_duration_seconds",
@@ -115,9 +123,12 @@ var (
 	// blob_upload / commit_node. A `write_chunk` p99 above ~10 ms usually
 	// means the cache path regressed and chunks are hitting remote I/O.
 	TUSPhaseDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
-		Name:    "kvfs_tus_phase_duration_seconds",
-		Help:    "TUS upload phase duration in seconds",
-		Buckets: []float64{0.0001, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 30.0},
+		Name: "kvfs_tus_phase_duration_seconds",
+		Help: "TUS upload phase duration in seconds",
+		// Extra resolution between 50 ms and 500 ms: the NATS-backed
+		// write_chunk floor lives there, and the old 0.1→0.5 gap reported
+		// any 100-500 ms p99 as a flat 500 ms.
+		Buckets: []float64{0.0001, 0.001, 0.005, 0.01, 0.05, 0.1, 0.2, 0.3, 0.5, 1.0, 5.0, 30.0},
 	}, []string{"phase"})
 
 	// TempFileBytesInFlight is the current total bytes held in the upload
@@ -165,5 +176,46 @@ var (
 		Name:    "kvfs_gc_run_duration_seconds",
 		Help:    "Duration of garbage collection runs in seconds",
 		Buckets: []float64{1, 5, 10, 30, 60, 120, 300, 600},
+	})
+
+	// GCOrphanPersonalSpacesDeleted counts orphaned personal spaces (owner
+	// no longer a live user) reaped by GC via the standard DeleteStorageSpace
+	// path. This is the identity-orphan half of the 1:1:1 guarantee.
+	GCOrphanPersonalSpacesDeleted = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "kvfs_gc_orphan_personal_spaces_deleted_total",
+		Help: "Total number of orphaned personal spaces (dead owner) reaped by GC",
+	})
+
+	// GCOrphanProjectSpaces is the number of orphaned project/virtual spaces
+	// (dead owner) observed on the most recent sweep. These are SURFACED for
+	// manual review, never auto-deleted — deleting a shared space because its
+	// owner was deprovisioned would destroy data the team still wants.
+	GCOrphanProjectSpaces = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "kvfs_gc_orphan_project_spaces",
+		Help: "Orphaned project/virtual spaces (dead owner) needing manual review (last sweep)",
+	})
+
+	// GCIdentityReapingSkipped counts sweeps that skipped identity reaping
+	// because the user resolver was unavailable or returned an empty set.
+	// A non-zero rate means the safety guard fired (never delete on a
+	// transient/empty live-user list) — investigate the user API, not the GC.
+	GCIdentityReapingSkipped = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "kvfs_gc_identity_reaping_skipped_total",
+		Help: "Total number of GC sweeps that skipped identity reaping (resolver error/empty)",
+	})
+
+	// GCResidueKeysDeleted counts KV entries (nodes/versions/trash/uploads)
+	// reaped by the internal-consistency sweep because their owning space no
+	// longer exists in oc-spaces (crash-mid-delete / best-effort residue).
+	GCResidueKeysDeleted = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "kvfs_gc_residue_keys_deleted_total",
+		Help: "Total number of KV entries of deleted spaces reaped by the GC residue sweep",
+	})
+
+	// GCResidueBlobsDeleted counts S3 blobs reaped by the internal-consistency
+	// sweep because their owning space no longer exists in oc-spaces.
+	GCResidueBlobsDeleted = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "kvfs_gc_residue_blobs_deleted_total",
+		Help: "Total number of S3 blobs of deleted spaces reaped by the GC residue sweep",
 	})
 )
