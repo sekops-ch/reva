@@ -29,9 +29,10 @@ import (
 // mockUserResolver answers liveness from a fixed map. An owner absent from the
 // map is "unknown" (never reaped). A non-nil err fails the whole lookup.
 type mockUserResolver struct {
-	live map[string]bool // ownerID -> determined liveness
-	err  error
-	seen []string // owner IDs the GC asked about (for assertions)
+	live              map[string]bool // ownerID -> determined liveness (LDAP result)
+	serviceAccountIDs map[string]bool // service account IDs always treated as alive
+	err               error
+	seen              []string // owner IDs the GC asked about (for assertions)
 }
 
 func (m *mockUserResolver) ResolveLiveness(ctx context.Context, ownerIDs []string) (map[string]bool, error) {
@@ -41,6 +42,10 @@ func (m *mockUserResolver) ResolveLiveness(ctx context.Context, ownerIDs []strin
 	}
 	out := make(map[string]bool, len(ownerIDs))
 	for _, id := range ownerIDs {
+		if m.serviceAccountIDs[id] {
+			out[id] = true
+			continue
+		}
 		if v, ok := m.live[id]; ok {
 			out[id] = v
 		}
@@ -397,17 +402,51 @@ func TestDeleteStorageSpace_LeavesNoResidue(t *testing.T) {
 
 func TestNewCS3UserResolver_RequiresFullConfig(t *testing.T) {
 	log := zerolog.Nop()
-	if _, err := newCS3UserResolver("", "id", "secret", &log); err == nil {
+	if _, err := newCS3UserResolver("", "id", "secret", nil, &log); err == nil {
 		t.Error("missing gateway addr must error (→ nil resolver, reaping disabled)")
 	}
-	if _, err := newCS3UserResolver("addr", "", "secret", &log); err == nil {
+	if _, err := newCS3UserResolver("addr", "", "secret", nil, &log); err == nil {
 		t.Error("missing service account id must error")
 	}
-	if _, err := newCS3UserResolver("addr", "id", "", &log); err == nil {
+	if _, err := newCS3UserResolver("addr", "id", "", nil, &log); err == nil {
 		t.Error("missing service account secret must error")
 	}
-	r, err := newCS3UserResolver("127.0.0.1:9142", "id", "secret", &log)
+	r, err := newCS3UserResolver("127.0.0.1:9142", "id", "secret", []string{"sa-1", "sa-2"}, &log)
 	if err != nil || r == nil {
 		t.Errorf("full config should build a resolver; got r=%v err=%v", r, err)
+	}
+	csr := r.(*cs3UserResolver)
+	if !csr.serviceAccountIDs["sa-1"] || !csr.serviceAccountIDs["sa-2"] {
+		t.Errorf("service account IDs not populated: %v", csr.serviceAccountIDs)
+	}
+}
+
+func TestGCReapIdentityOrphans_ServiceAccountSpaceNeverReaped(t *testing.T) {
+	store := newMockMetadataStore()
+	blob := newMockBlobStore()
+	gc := testGC(store, blob, false)
+
+	gc.resolver = &mockUserResolver{live: map[string]bool{
+		"alice":  true,
+		"sa-bot": false, // LDAP says NOT_FOUND, but it's a service account
+		"ghost":  false, // genuinely dead
+	}, serviceAccountIDs: map[string]bool{"sa-bot": true}}
+	var reaped []string
+	gc.reapSpace = recordingReaper(store, &reaped)
+
+	spaces := []*SpaceEntry{
+		{ID: "live-p", Type: "personal", Owner: "alice", RootID: "r1", Name: "Alice"},
+		{ID: "sa-p", Type: "personal", Owner: "sa-bot", RootID: "r2", Name: "ServiceBot"},
+		{ID: "dead-p", Type: "personal", Owner: "ghost", RootID: "r3", Name: "Ghost"},
+	}
+
+	var result GCResult
+	gc.reapIdentityOrphans(context.Background(), spaces, &result)
+
+	if got := strings.Join(reaped, ","); got != "dead-p" {
+		t.Fatalf("reaped = %q, want only \"dead-p\" (service account space must survive)", got)
+	}
+	if result.OrphanPersonalSpacesDeleted != 1 {
+		t.Errorf("OrphanPersonalSpacesDeleted = %d, want 1", result.OrphanPersonalSpacesDeleted)
 	}
 }

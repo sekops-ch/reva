@@ -606,6 +606,8 @@ func TestGCMetricsRegistered(t *testing.T) {
 	GCWouldDelete.Inc()
 	GCErrors.Inc()
 	GCRunDuration.Observe(1.0)
+	GCExpiredUploadsCleaned.Inc()
+	GCCorruptUploadsReaped.Inc()
 
 	metrics := gatherKVFSMetrics(t)
 
@@ -615,6 +617,8 @@ func TestGCMetricsRegistered(t *testing.T) {
 		"kvfs_gc_would_delete_total",
 		"kvfs_gc_errors_total",
 		"kvfs_gc_run_duration_seconds",
+		"kvfs_gc_expired_uploads_cleaned_total",
+		"kvfs_gc_corrupt_uploads_reaped_total",
 	}
 	for _, name := range expectedMetrics {
 		if _, ok := metrics[name]; !ok {
@@ -915,6 +919,109 @@ func TestReconcileChildren_DryRunDoesNotMutate(t *testing.T) {
 	}
 }
 
+// --- reconcileTrash tests ---
+
+func TestReconcileTrash_StaleEntryFromAbortedRestore(t *testing.T) {
+	// A file was successfully restored (live in oc-nodes + listed in its
+	// parent's children) but the DeleteTrash call never completed.
+	// Expected: GC removes the stale trash entry; node remains live.
+	store := newMockMetadataStore()
+	blob := newMockBlobStore()
+	gc := testGC(store, blob, false)
+
+	store.nodes["s1.dir"] = &NodeEntry{ID: "dir", SpaceID: "s1", Type: NodeTypeDir}
+	store.nodes["s1.victim"] = &NodeEntry{ID: "victim", SpaceID: "s1", ParentID: "dir", Name: "file.txt", Type: NodeTypeFile}
+	store.nodeRevs["s1.dir"] = 1
+	store.nodeRevs["s1.victim"] = 1
+	store.children["s1.dir"] = ChildMap{"file.txt": "victim"}
+	store.childRevs["s1.dir"] = 1
+	store.trash["s1.t1"] = &TrashEntry{Key: "t1", NodeID: "victim", SpaceID: "s1"}
+
+	reconciled := gc.reconcileTrash(context.Background(), "s1")
+
+	if reconciled != 1 {
+		t.Errorf("reconciled = %d, want 1", reconciled)
+	}
+	if _, err := store.GetTrash("s1", "t1"); err == nil {
+		t.Error("stale trash entry should have been deleted")
+	}
+	node, _, _ := store.GetNode("s1", "victim")
+	if node == nil {
+		t.Error("live node must not be deleted by trash reconciler")
+	}
+}
+
+func TestReconcileTrash_LegitimateTrashUntouched(t *testing.T) {
+	// A trash entry whose node does NOT exist in oc-nodes (normal trash).
+	store := newMockMetadataStore()
+	blob := newMockBlobStore()
+	gc := testGC(store, blob, false)
+
+	store.nodes["s1.dir"] = &NodeEntry{ID: "dir", SpaceID: "s1", Type: NodeTypeDir}
+	store.nodeRevs["s1.dir"] = 1
+	store.children["s1.dir"] = ChildMap{}
+	store.childRevs["s1.dir"] = 1
+	store.trash["s1.t1"] = &TrashEntry{Key: "t1", NodeID: "deleted-node", SpaceID: "s1"}
+
+	reconciled := gc.reconcileTrash(context.Background(), "s1")
+	if reconciled != 0 {
+		t.Errorf("reconciled = %d, want 0 for legitimate trash", reconciled)
+	}
+	if _, err := store.GetTrash("s1", "t1"); err != nil {
+		t.Error("legitimate trash entry must be preserved")
+	}
+}
+
+func TestReconcileTrash_TrashedDirectoryUntouched(t *testing.T) {
+	// A directory node exists in oc-nodes (KVFS keeps dir nodes alive
+	// during trash) but is NOT listed in any parent's children map.
+	// The trash entry should be preserved — the directory is still trashed.
+	store := newMockMetadataStore()
+	blob := newMockBlobStore()
+	gc := testGC(store, blob, false)
+
+	store.nodes["s1.root"] = &NodeEntry{ID: "root", SpaceID: "s1", Type: NodeTypeDir}
+	store.nodes["s1.trashed-dir"] = &NodeEntry{ID: "trashed-dir", SpaceID: "s1", ParentID: "root", Type: NodeTypeDir}
+	store.nodeRevs["s1.root"] = 1
+	store.nodeRevs["s1.trashed-dir"] = 1
+	store.children["s1.root"] = ChildMap{} // trashed-dir NOT listed
+	store.childRevs["s1.root"] = 1
+	store.children["s1.trashed-dir"] = ChildMap{} // empty subtree
+	store.childRevs["s1.trashed-dir"] = 1
+	store.trash["s1.t1"] = &TrashEntry{Key: "t1", NodeID: "trashed-dir", SpaceID: "s1"}
+
+	reconciled := gc.reconcileTrash(context.Background(), "s1")
+	if reconciled != 0 {
+		t.Errorf("reconciled = %d, want 0 for trashed directory", reconciled)
+	}
+	if _, err := store.GetTrash("s1", "t1"); err != nil {
+		t.Error("trash entry for unreachable directory must be preserved")
+	}
+}
+
+func TestReconcileTrash_DryRunDoesNotMutate(t *testing.T) {
+	// Same setup as StaleEntryFromAbortedRestore but with dry-run.
+	store := newMockMetadataStore()
+	blob := newMockBlobStore()
+	gc := testGC(store, blob, true) // dry-run
+
+	store.nodes["s1.dir"] = &NodeEntry{ID: "dir", SpaceID: "s1", Type: NodeTypeDir}
+	store.nodes["s1.victim"] = &NodeEntry{ID: "victim", SpaceID: "s1", ParentID: "dir", Name: "file.txt", Type: NodeTypeFile}
+	store.nodeRevs["s1.dir"] = 1
+	store.nodeRevs["s1.victim"] = 1
+	store.children["s1.dir"] = ChildMap{"file.txt": "victim"}
+	store.childRevs["s1.dir"] = 1
+	store.trash["s1.t1"] = &TrashEntry{Key: "t1", NodeID: "victim", SpaceID: "s1"}
+
+	reconciled := gc.reconcileTrash(context.Background(), "s1")
+	if reconciled != 1 {
+		t.Errorf("reconciled (counter) = %d, want 1 even in dry-run", reconciled)
+	}
+	if _, err := store.GetTrash("s1", "t1"); err != nil {
+		t.Error("dry-run must not delete; stale trash entry still expected")
+	}
+}
+
 // --- runInitialSweepWithRetry tests ---
 
 // withShortGCTimings shrinks the GC retry/lock timings for the duration
@@ -1047,8 +1154,8 @@ func TestRunInitialSweepWithRetry_StopAbortsRetry(t *testing.T) {
 func TestGCRunDoesNotWriteUploadAgeGauge(t *testing.T) {
 	// Sentinel that the helper would never produce for the snapshot below.
 	const sentinel = 123456.0
-	OldestUploadAgeSeconds.Set(sentinel)
-	UploadSessionsTotal.Set(sentinel)
+	OldestUploadAgeSeconds.WithLabelValues("oc").Set(sentinel)
+	UploadSessionsTotal.WithLabelValues("oc").Set(sentinel)
 
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
@@ -1062,13 +1169,263 @@ func TestGCRunDoesNotWriteUploadAgeGauge(t *testing.T) {
 
 	gc.Run(context.Background())
 
-	if v := getGaugeValue(t, "kvfs_oldest_upload_age_seconds", nil); v != sentinel {
+	oc := map[string]string{"prefix": "oc"}
+	if v := getGaugeValue(t, "kvfs_oldest_upload_age_seconds", oc); v != sentinel {
 		t.Errorf("gc.Run wrote kvfs_oldest_upload_age_seconds (=%v); the gauge must be owned by the sampler, not GC", v)
 	}
-	if v := getGaugeValue(t, "kvfs_upload_sessions_total", nil); v != sentinel {
+	if v := getGaugeValue(t, "kvfs_upload_sessions_total", oc); v != sentinel {
 		t.Errorf("gc.Run wrote kvfs_upload_sessions_total (=%v); the gauge must be owned by the sampler, not GC", v)
 	}
 
 	// Reset so other tests see a clean gauge.
-	updateUploadAgeMetrics(nil)
+	updateUploadAgeMetrics("oc", nil)
+}
+
+// --- Upload-session reap policy tests ---
+
+// reapEntries runs cleanExpiredUploads over the store's current uploads
+// bucket and returns the result. Shared by the reap-policy tests below.
+func reapEntries(t *testing.T, gc *blobGC, store *mockMetadataStore) GCResult {
+	t.Helper()
+	entries, err := store.ListAllUploadEntries()
+	if err != nil {
+		t.Fatalf("ListAllUploadEntries: %v", err)
+	}
+	var result GCResult
+	gc.cleanExpiredUploads(context.Background(), entries, &result)
+	return result
+}
+
+func TestCleanExpiredUploadsReapsExpired(t *testing.T) {
+	store := newMockMetadataStore()
+	blob := newMockBlobStore()
+	gc := testGC(store, blob, false)
+
+	store.uploads["expired-1"] = &UploadSession{
+		ID: "expired-1", SpaceID: "s1", BlobID: "b1",
+		Expires: time.Now().Add(-time.Hour).Unix(),
+	}
+	store.uploads["live-1"] = &UploadSession{
+		ID: "live-1", SpaceID: "s1", BlobID: "b2",
+		Expires: time.Now().Add(uploadSessionTTL).Unix(),
+	}
+
+	result := reapEntries(t, gc, store)
+
+	if _, ok := store.uploads["expired-1"]; ok {
+		t.Error("expired session not reaped")
+	}
+	if _, ok := store.uploads["live-1"]; !ok {
+		t.Error("live session reaped")
+	}
+	if result.ExpiredUploadsCleaned != 1 {
+		t.Errorf("ExpiredUploadsCleaned = %d, want 1", result.ExpiredUploadsCleaned)
+	}
+	if result.CorruptUploadsReaped != 0 {
+		t.Errorf("CorruptUploadsReaped = %d, want 0", result.CorruptUploadsReaped)
+	}
+}
+
+func TestCleanExpiredUploadsReapsNoExpiryAfterTTL(t *testing.T) {
+	store := newMockMetadataStore()
+	blob := newMockBlobStore()
+	gc := testGC(store, blob, false)
+
+	// Expires==0 was previously immortal: the reaper only matched
+	// Expires>0, so a legacy/partial-write session lived forever.
+	store.uploads["no-expiry"] = &UploadSession{ID: "no-expiry", SpaceID: "s1"}
+	store.uploadCreated["no-expiry"] = time.Now().Add(-uploadSessionTTL - time.Hour)
+
+	result := reapEntries(t, gc, store)
+
+	if _, ok := store.uploads["no-expiry"]; ok {
+		t.Error("over-TTL no-expiry session not reaped")
+	}
+	if result.ExpiredUploadsCleaned != 1 {
+		t.Errorf("ExpiredUploadsCleaned = %d, want 1", result.ExpiredUploadsCleaned)
+	}
+}
+
+func TestCleanExpiredUploadsKeepsYoungNoExpiry(t *testing.T) {
+	store := newMockMetadataStore()
+	blob := newMockBlobStore()
+	gc := testGC(store, blob, false)
+
+	store.uploads["young"] = &UploadSession{ID: "young", SpaceID: "s1"}
+	store.uploadCreated["young"] = time.Now().Add(-time.Hour)
+
+	result := reapEntries(t, gc, store)
+
+	if _, ok := store.uploads["young"]; !ok {
+		t.Error("young no-expiry session reaped before TTL")
+	}
+	if result.ExpiredUploadsCleaned != 0 {
+		t.Errorf("ExpiredUploadsCleaned = %d, want 0", result.ExpiredUploadsCleaned)
+	}
+}
+
+func TestCleanExpiredUploadsReapsCorruptAfterTTL(t *testing.T) {
+	store := newMockMetadataStore()
+	blob := newMockBlobStore()
+	gc := testGC(store, blob, false)
+
+	// Corrupt entries are invisible to typed listings (listAll skips
+	// unmarshal failures) and were therefore immortal too.
+	store.corruptUploads["corrupt-1"] = time.Now().Add(-uploadSessionTTL - time.Hour)
+
+	result := reapEntries(t, gc, store)
+
+	if _, ok := store.corruptUploads["corrupt-1"]; ok {
+		t.Error("over-TTL corrupt entry not reaped")
+	}
+	if result.CorruptUploadsReaped != 1 {
+		t.Errorf("CorruptUploadsReaped = %d, want 1", result.CorruptUploadsReaped)
+	}
+	if result.ExpiredUploadsCleaned != 0 {
+		t.Errorf("ExpiredUploadsCleaned = %d, want 0", result.ExpiredUploadsCleaned)
+	}
+}
+
+func TestCleanExpiredUploadsKeepsYoungCorrupt(t *testing.T) {
+	store := newMockMetadataStore()
+	blob := newMockBlobStore()
+	gc := testGC(store, blob, false)
+
+	store.corruptUploads["corrupt-young"] = time.Now().Add(-time.Hour)
+
+	result := reapEntries(t, gc, store)
+
+	if _, ok := store.corruptUploads["corrupt-young"]; !ok {
+		t.Error("young corrupt entry reaped before TTL")
+	}
+	if result.CorruptUploadsReaped != 0 {
+		t.Errorf("CorruptUploadsReaped = %d, want 0", result.CorruptUploadsReaped)
+	}
+}
+
+func TestCleanExpiredUploadsZeroCreatedNeverReaped(t *testing.T) {
+	store := newMockMetadataStore()
+	blob := newMockBlobStore()
+	gc := testGC(store, blob, false)
+
+	// Safety guard: a missing server timestamp must never cause a reap.
+	store.uploads["no-ts"] = &UploadSession{ID: "no-ts", SpaceID: "s1"}
+	store.uploadCreated["no-ts"] = time.Time{}
+	store.corruptUploads["corrupt-no-ts"] = time.Time{}
+
+	result := reapEntries(t, gc, store)
+
+	if _, ok := store.uploads["no-ts"]; !ok {
+		t.Error("zero-Created no-expiry session reaped")
+	}
+	if _, ok := store.corruptUploads["corrupt-no-ts"]; !ok {
+		t.Error("zero-Created corrupt entry reaped")
+	}
+	if result.ExpiredUploadsCleaned != 0 || result.CorruptUploadsReaped != 0 {
+		t.Errorf("result = %+v, want no reaps", result)
+	}
+}
+
+func TestCleanExpiredUploadsDryRunDoesNotDelete(t *testing.T) {
+	store := newMockMetadataStore()
+	blob := newMockBlobStore()
+	gc := testGC(store, blob, true)
+
+	store.uploads["expired-mp"] = &UploadSession{
+		ID: "expired-mp", SpaceID: "s1", BlobID: "b1", S3MultipartID: "mp-1",
+		Expires: time.Now().Add(-time.Hour).Unix(),
+	}
+	store.corruptUploads["corrupt-old"] = time.Now().Add(-uploadSessionTTL - time.Hour)
+
+	result := reapEntries(t, gc, store)
+
+	if _, ok := store.uploads["expired-mp"]; !ok {
+		t.Error("dry-run deleted an upload session")
+	}
+	if _, ok := store.corruptUploads["corrupt-old"]; !ok {
+		t.Error("dry-run deleted a corrupt entry")
+	}
+	if len(blob.abortCalled) != 0 {
+		t.Errorf("dry-run aborted multipart uploads: %v", blob.abortCalled)
+	}
+	if result.WouldDelete != 2 {
+		t.Errorf("WouldDelete = %d, want 2", result.WouldDelete)
+	}
+	if result.ExpiredUploadsCleaned != 0 || result.CorruptUploadsReaped != 0 {
+		t.Errorf("result = %+v, want no reap counts in dry-run", result)
+	}
+}
+
+func TestCleanExpiredUploadsAbortsMultipartOnReap(t *testing.T) {
+	store := newMockMetadataStore()
+	blob := newMockBlobStore()
+	gc := testGC(store, blob, false)
+
+	store.uploads["expired-mp"] = &UploadSession{
+		ID: "expired-mp", SpaceID: "s1", BlobID: "b1", S3MultipartID: "mp-1",
+		Expires: time.Now().Add(-time.Hour).Unix(),
+	}
+
+	reapEntries(t, gc, store)
+
+	if len(blob.abortCalled) != 1 || blob.abortCalled[0] != "mp-1" {
+		t.Errorf("AbortMultipartUpload calls = %v, want [mp-1]", blob.abortCalled)
+	}
+}
+
+func TestGCRunPurgesUploadTombstones(t *testing.T) {
+	store := newMockMetadataStore()
+	blob := newMockBlobStore()
+	gc := testGC(store, blob, false)
+
+	setupSpaceEmpty(store, "space-1", "root-1")
+	gc.Run(context.Background())
+
+	if store.purgeDeletedUploadsCalls != 1 {
+		t.Errorf("PurgeDeletedUploads calls = %d, want 1", store.purgeDeletedUploadsCalls)
+	}
+}
+
+func TestGCRunDryRunSkipsTombstonePurge(t *testing.T) {
+	store := newMockMetadataStore()
+	blob := newMockBlobStore()
+	gc := testGC(store, blob, true)
+
+	setupSpaceEmpty(store, "space-1", "root-1")
+	gc.Run(context.Background())
+
+	if store.purgeDeletedUploadsCalls != 0 {
+		t.Errorf("PurgeDeletedUploads calls = %d, want 0 in dry-run", store.purgeDeletedUploadsCalls)
+	}
+}
+
+func TestGCRunReapsUploadsAndCountsMetrics(t *testing.T) {
+	store := newMockMetadataStore()
+	blob := newMockBlobStore()
+	gc := testGC(store, blob, false)
+
+	setupSpaceEmpty(store, "space-1", "root-1")
+	store.uploads["expired-1"] = &UploadSession{
+		ID: "expired-1", SpaceID: "space-1", BlobID: "b1",
+		Expires: time.Now().Add(-time.Hour).Unix(),
+	}
+	store.corruptUploads["corrupt-1"] = time.Now().Add(-uploadSessionTTL - time.Hour)
+
+	expiredBefore := getCounterValue(t, "kvfs_gc_expired_uploads_cleaned_total", nil)
+	corruptBefore := getCounterValue(t, "kvfs_gc_corrupt_uploads_reaped_total", nil)
+
+	result := gc.Run(context.Background())
+
+	if result.ExpiredUploadsCleaned != 1 {
+		t.Errorf("ExpiredUploadsCleaned = %d, want 1", result.ExpiredUploadsCleaned)
+	}
+	if result.CorruptUploadsReaped != 1 {
+		t.Errorf("CorruptUploadsReaped = %d, want 1", result.CorruptUploadsReaped)
+	}
+	if d := getCounterValue(t, "kvfs_gc_expired_uploads_cleaned_total", nil) - expiredBefore; d != 1 {
+		t.Errorf("kvfs_gc_expired_uploads_cleaned_total delta = %v, want 1", d)
+	}
+	if d := getCounterValue(t, "kvfs_gc_corrupt_uploads_reaped_total", nil) - corruptBefore; d != 1 {
+		t.Errorf("kvfs_gc_corrupt_uploads_reaped_total delta = %v, want 1", d)
+	}
 }

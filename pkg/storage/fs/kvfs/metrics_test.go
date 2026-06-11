@@ -76,6 +76,8 @@ func TestMetricsRegistration(t *testing.T) {
 		"kvfs_upload_in_flight",
 		"kvfs_max_cas_retries",
 		"kvfs_tree_size_drift_total",
+		"kvfs_gc_children_reconciled_total",
+		"kvfs_gc_trash_reconciled_total",
 	}
 
 	// promauto registers metrics at init time, but counter/gauge/histogram vecs
@@ -89,6 +91,8 @@ func TestMetricsRegistration(t *testing.T) {
 	UploadInFlight.WithLabelValues("simple")
 	MaxCASRetriesGauge.WithLabelValues("oc")
 	TreeSizeDrift.Inc()
+	GCChildrenReconciled.Inc()
+	GCTrashReconciled.Inc()
 
 	metrics = gatherKVFSMetrics(t)
 
@@ -306,6 +310,8 @@ func TestMetricDescriptions(t *testing.T) {
 		{"kvfs_upload_in_flight", "Number of uploads currently in progress (per-pod lifetime counter; may drift — see kvfs_oldest_upload_age_seconds)"},
 		{"kvfs_max_cas_retries", "Effective MaxCASRetries bound per kvfs instance (labeled by bucket prefix)"},
 		{"kvfs_tree_size_drift_total", "Total number of ancestor CAS failures during tree-size propagation"},
+		{"kvfs_gc_children_reconciled_total", "Total number of stale oc-children entries removed by the GC reconciler"},
+		{"kvfs_gc_trash_reconciled_total", "Total number of stale oc-trash entries removed by the GC consistency sweep"},
 	}
 
 	metrics := gatherKVFSMetrics(t)
@@ -329,6 +335,8 @@ func TestMetricTypes(t *testing.T) {
 		"kvfs_cas_exhausted_total",
 		"kvfs_cas_conflicts_total",
 		"kvfs_tree_size_drift_total",
+		"kvfs_gc_children_reconciled_total",
+		"kvfs_gc_trash_reconciled_total",
 	}
 	for _, name := range counterMetrics {
 		mf, ok := metrics[name]
@@ -446,18 +454,19 @@ func getGaugeValue(t *testing.T, name string, labels map[string]string) float64 
 	return m.GetGauge().GetValue()
 }
 
-// TestUpdateUploadAgeMetrics: count, oldest-session age, Expires==0 skip, and
-// negative-age clamp.
+// TestUpdateUploadAgeMetrics: count, oldest-session age, Expires==0 skip,
+// negative-age clamp, and per-prefix isolation.
 func TestUpdateUploadAgeMetrics(t *testing.T) {
 	now := time.Now().Unix()
 	ttl := int64(uploadSessionTTL.Seconds())
+	oc := map[string]string{"prefix": "oc"}
 
 	// Empty snapshot → both gauges 0.
-	updateUploadAgeMetrics(nil)
-	if v := getGaugeValue(t, "kvfs_upload_sessions_total", nil); v != 0 {
+	updateUploadAgeMetrics("oc", nil)
+	if v := getGaugeValue(t, "kvfs_upload_sessions_total", oc); v != 0 {
 		t.Errorf("empty: sessions_total = %v, want 0", v)
 	}
-	if v := getGaugeValue(t, "kvfs_oldest_upload_age_seconds", nil); v != 0 {
+	if v := getGaugeValue(t, "kvfs_oldest_upload_age_seconds", oc); v != 0 {
 		t.Errorf("empty: oldest_age = %v, want 0", v)
 	}
 
@@ -467,30 +476,41 @@ func TestUpdateUploadAgeMetrics(t *testing.T) {
 		{ID: "oldest", Expires: now + ttl - 10800}, // ~3h old
 		{ID: "untracked", Expires: 0},              // skipped
 	}
-	updateUploadAgeMetrics(uploads)
-	if v := getGaugeValue(t, "kvfs_upload_sessions_total", nil); v != 3 {
+	updateUploadAgeMetrics("oc", uploads)
+	if v := getGaugeValue(t, "kvfs_upload_sessions_total", oc); v != 3 {
 		t.Errorf("sessions_total = %v, want 3", v)
 	}
-	age := getGaugeValue(t, "kvfs_oldest_upload_age_seconds", nil)
+	age := getGaugeValue(t, "kvfs_oldest_upload_age_seconds", oc)
 	if age < 10700 || age > 10900 { // ~3h ± a couple seconds of clock skew
 		t.Errorf("oldest_age = %v, want ~10800 (the 3h session)", age)
 	}
 
+	// Per-prefix isolation: another instance's sampler must not clobber
+	// this one — that exact overwrite hid a second instance's backlog
+	// when the gauges were unlabeled.
+	updateUploadAgeMetrics("sys-", nil)
+	if v := getGaugeValue(t, "kvfs_upload_sessions_total", oc); v != 3 {
+		t.Errorf("sessions_total{prefix=oc} = %v after sys- sample, want 3 (prefixes must not clobber)", v)
+	}
+	if v := getGaugeValue(t, "kvfs_upload_sessions_total", map[string]string{"prefix": "sys-"}); v != 0 {
+		t.Errorf("sessions_total{prefix=sys-} = %v, want 0", v)
+	}
+
 	// Future Expires → negative raw age, must clamp to 0.
-	updateUploadAgeMetrics([]*UploadSession{{ID: "future", Expires: now + 2*ttl}})
-	if v := getGaugeValue(t, "kvfs_oldest_upload_age_seconds", nil); v != 0 {
+	updateUploadAgeMetrics("oc", []*UploadSession{{ID: "future", Expires: now + 2*ttl}})
+	if v := getGaugeValue(t, "kvfs_oldest_upload_age_seconds", oc); v != 0 {
 		t.Errorf("future-Expires: oldest_age = %v, want 0 (clamped)", v)
 	}
 
 	// TTL round-trip: a just-created session (Expires = now + TTL) reads back
 	// as age ≈ 0, pinning the two uploadSessionTTL usages against drift.
-	updateUploadAgeMetrics([]*UploadSession{{ID: "just-created", Expires: now + ttl}})
-	if v := getGaugeValue(t, "kvfs_oldest_upload_age_seconds", nil); v < 0 || v > 2 {
+	updateUploadAgeMetrics("oc", []*UploadSession{{ID: "just-created", Expires: now + ttl}})
+	if v := getGaugeValue(t, "kvfs_oldest_upload_age_seconds", oc); v < 0 || v > 2 {
 		t.Errorf("just-created: oldest_age = %v, want ≈0", v)
 	}
 
 	// Reset so other tests see a clean gauge.
-	updateUploadAgeMetrics(nil)
+	updateUploadAgeMetrics("oc", nil)
 }
 
 func getHistogramCount(t *testing.T, name string, labels map[string]string) uint64 {

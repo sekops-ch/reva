@@ -29,6 +29,7 @@ import (
 
 	user "github.com/cs3org/go-cs3apis/cs3/identity/user/v1beta1"
 	provider "github.com/cs3org/go-cs3apis/cs3/storage/provider/v1beta1"
+	"github.com/opencloud-eu/reva/v2/pkg/storage"
 	"github.com/rs/zerolog"
 
 	ctxpkg "github.com/opencloud-eu/reva/v2/pkg/ctx"
@@ -203,6 +204,15 @@ type mockMetadataStore struct {
 	putChildrenErr    error
 	casFailsLeft      int
 	childCASFailsLeft int
+
+	// uploadCreated optionally overrides the KV created-timestamp per
+	// session ID for ListAllUploadEntries; unset IDs default to now so
+	// existing tests never trip the age-gated reap paths.
+	uploadCreated map[string]time.Time
+	// corruptUploads simulates entries whose value no longer unmarshals:
+	// key -> created timestamp. Visible only via ListAllUploadEntries.
+	corruptUploads           map[string]time.Time
+	purgeDeletedUploadsCalls int
 }
 
 func newMockMetadataStore() *mockMetadataStore {
@@ -217,6 +227,9 @@ func newMockMetadataStore() *mockMetadataStore {
 		trash:     make(map[string]*TrashEntry),
 		locks:     make(map[string]*kvLockEntry),
 		nextRev:   1,
+
+		uploadCreated:  make(map[string]time.Time),
+		corruptUploads: make(map[string]time.Time),
 	}
 }
 
@@ -486,6 +499,8 @@ func (m *mockMetadataStore) DeleteUpload(uploadID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.uploads, uploadID)
+	delete(m.uploadCreated, uploadID)
+	delete(m.corruptUploads, uploadID)
 	return nil
 }
 
@@ -560,6 +575,31 @@ func (m *mockMetadataStore) ListAllUploads() ([]*UploadSession, error) {
 		result = append(result, &cp)
 	}
 	return result, nil
+}
+
+func (m *mockMetadataStore) ListAllUploadEntries() ([]*UploadEntry, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var result []*UploadEntry
+	for id, u := range m.uploads {
+		cp := *u
+		created, ok := m.uploadCreated[id]
+		if !ok {
+			created = time.Now()
+		}
+		result = append(result, &UploadEntry{Key: id, Created: created, Session: &cp})
+	}
+	for key, created := range m.corruptUploads {
+		result = append(result, &UploadEntry{Key: key, Created: created})
+	}
+	return result, nil
+}
+
+func (m *mockMetadataStore) PurgeDeletedUploads() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.purgeDeletedUploadsCalls++
+	return nil
 }
 
 func (m *mockMetadataStore) ListUploadsBySpace(spaceID string) ([]*UploadSession, error) {
@@ -1676,6 +1716,70 @@ func TestFinishUploadCommitFailurePreservesSession(t *testing.T) {
 	UploadInFlight.WithLabelValues("tus").Add(-1)
 }
 
+func TestFinishUploadInjectedCommitFailurePreservesSession(t *testing.T) {
+	store := newMockMetadataStore()
+	blob := newMockBlobStore()
+	d := testDriver(store, blob)
+	d.commitFailHook = func() error { return errors.New("injected commit failure (test seam)") }
+	ctx := testContext()
+
+	setupSpaceEmpty(store, "space-1", "parent-1")
+
+	session := makeSession("space-1", "parent-1", "injected.txt")
+	session.S3MultipartID = ""
+	session.Offset = 5
+	store.uploads[session.ID] = session
+	if _, err := d.uploadCache.Append(session.ID, 0, bytes.NewReader([]byte("hello"))); err != nil {
+		t.Fatalf("uploadCache.Append: %v", err)
+	}
+
+	UploadInFlight.WithLabelValues("tus")
+	beforeInFlight := getGaugeValue(t, "kvfs_upload_in_flight", map[string]string{"protocol": "tus"})
+	UploadInFlight.WithLabelValues("tus").Add(1)
+
+	u := &kvfsUpload{session: session, driver: d}
+	err := u.FinishUpload(ctx)
+	if err == nil {
+		t.Fatal("FinishUpload should fail when the commit-fail seam is set")
+	}
+	if !strings.Contains(err.Error(), "injected commit failure") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Blob was uploaded (injection fires AFTER blob.Upload).
+	if len(blob.blobs) == 0 {
+		t.Error("blob.Upload was never called — injection should fire after blob upload")
+	}
+
+	// Session row must survive (conditional-cleanup contract).
+	if _, err := store.GetUpload(session.ID); err == ErrNotFound {
+		t.Error("session was deleted on injected failure — conditional-cleanup contract broken")
+	}
+
+	// Gauge must not be decremented.
+	if got := getGaugeValue(t, "kvfs_upload_in_flight", map[string]string{"protocol": "tus"}); got != beforeInFlight+1 {
+		t.Errorf("UploadInFlight: got %v, want %v", got, beforeInFlight+1)
+	}
+
+	// Clear the knob and retry — should commit successfully.
+	d.commitFailHook = nil
+	if _, err := d.uploadCache.Append(session.ID, 0, bytes.NewReader([]byte("hello"))); err != nil {
+		t.Fatalf("re-stage uploadCache.Append: %v", err)
+	}
+	store.uploads[session.ID] = session
+	u2 := &kvfsUpload{session: session, driver: d}
+	if err := u2.FinishUpload(ctx); err != nil {
+		t.Fatalf("FinishUpload after clearing inject should succeed: %v", err)
+	}
+
+	// Session cleaned up after successful commit.
+	if _, err := store.GetUpload(session.ID); err != ErrNotFound {
+		t.Error("session should be cleaned up after successful commit")
+	}
+
+	UploadInFlight.WithLabelValues("tus").Add(-1)
+}
+
 // TestFinishUploadDetachedCtxSurvivesCancellation: a request ctx that is
 // already canceled at FinishUpload entry must NOT prevent the commit from
 // completing — the canceled ctx came from the data-gateway forwarder
@@ -1884,5 +1988,160 @@ func TestFinishUploadConcurrentSameSession(t *testing.T) {
 	}
 	if _, exists := children["concurrent.txt"]; !exists {
 		t.Error("file node not created after concurrent FinishUploads")
+	}
+}
+
+// --- Simple-upload sibling-session cleanup tests ---
+//
+// InitiateUpload offers both protocols and persists a TUS session up
+// front; a caller that commits via the simple protocol would otherwise
+// strand that session until the TTL reaper runs. The simple ID therefore
+// carries the sibling session's ID, and Upload reaps it on commit.
+
+func TestInitiateUploadSimpleIDCarriesTUSSibling(t *testing.T) {
+	store := newMockMetadataStore()
+	blob := newMockBlobStore()
+	d := testDriver(store, blob)
+	setupSpaceEmpty(store, "s1", "root")
+
+	result, err := d.InitiateUpload(testContext(), &provider.Reference{
+		ResourceId: &provider.ResourceId{SpaceId: "s1", OpaqueId: "root"},
+		Path:       "./newfile.txt",
+	}, 100, map[string]string{})
+	if err != nil {
+		t.Fatalf("InitiateUpload: %v", err)
+	}
+
+	tusID, ok := result["tus"]
+	if !ok || tusID == "" {
+		t.Fatal("result should contain 'tus' protocol")
+	}
+	simpleID, ok := result["simple"]
+	if !ok {
+		t.Fatal("result should contain 'simple' protocol")
+	}
+	if !strings.Contains(simpleID, "tus-sibling="+tusID) {
+		t.Errorf("simple ID %q does not carry tus-sibling=%s", simpleID, tusID)
+	}
+	if _, err := store.GetUpload(tusID); err != nil {
+		t.Errorf("TUS session %s not persisted: %v", tusID, err)
+	}
+}
+
+func TestUploadSimpleCommitReapsSiblingSession(t *testing.T) {
+	store := newMockMetadataStore()
+	blob := newMockBlobStore()
+	d := testDriver(store, blob)
+	setupSpaceEmpty(store, "s1", "root")
+
+	ctx := testContext()
+	result, err := d.InitiateUpload(ctx, &provider.Reference{
+		ResourceId: &provider.ResourceId{SpaceId: "s1", OpaqueId: "root"},
+		Path:       "./newfile.txt",
+	}, 5, map[string]string{})
+	if err != nil {
+		t.Fatalf("InitiateUpload: %v", err)
+	}
+	tusID := result["tus"]
+
+	// The dataprovider's simple handler passes the simple ID back as a
+	// "/"-prefixed path-only reference.
+	content := []byte("hello")
+	ri, err := d.Upload(ctx, storage.UploadRequest{
+		Ref:    &provider.Reference{Path: "/" + result["simple"]},
+		Body:   io.NopCloser(bytes.NewReader(content)),
+		Length: int64(len(content)),
+	}, nil)
+	if err != nil {
+		t.Fatalf("Upload via simple ID: %v", err)
+	}
+	if ri == nil || ri.Name != "newfile.txt" {
+		t.Fatalf("unexpected resource info: %+v", ri)
+	}
+
+	if _, err := store.GetUpload(tusID); err != ErrNotFound {
+		t.Errorf("sibling TUS session %s should be reaped after simple commit, GetUpload err = %v", tusID, err)
+	}
+}
+
+func TestUploadSimpleCommitWithIfMatchParsesBothParams(t *testing.T) {
+	store := newMockMetadataStore()
+	blob := newMockBlobStore()
+	d := testDriver(store, blob)
+	setupSpaceWithFile(store, "s1", "root", "file-1", "existing.txt")
+
+	ctx := testContext()
+	result, err := d.InitiateUpload(ctx, &provider.Reference{
+		ResourceId: &provider.ResourceId{SpaceId: "s1", OpaqueId: "root"},
+		Path:       "./existing.txt",
+	}, 3, map[string]string{"if-match": "old-etag"})
+	if err != nil {
+		t.Fatalf("InitiateUpload: %v", err)
+	}
+	tusID := result["tus"]
+	if !strings.Contains(result["simple"], "if-match=") || !strings.Contains(result["simple"], "tus-sibling=") {
+		t.Fatalf("simple ID %q should carry both if-match and tus-sibling", result["simple"])
+	}
+
+	content := []byte("new")
+	if _, err := d.Upload(ctx, storage.UploadRequest{
+		Ref:    &provider.Reference{Path: "/" + result["simple"]},
+		Body:   io.NopCloser(bytes.NewReader(content)),
+		Length: int64(len(content)),
+	}, nil); err != nil {
+		t.Fatalf("Upload with if-match + sibling: %v", err)
+	}
+
+	if _, err := store.GetUpload(tusID); err != ErrNotFound {
+		t.Errorf("sibling session should be reaped on overwrite commit, err = %v", err)
+	}
+
+	// Stale etag must still be rejected (if-match parsing intact).
+	result2, err := d.InitiateUpload(ctx, &provider.Reference{
+		ResourceId: &provider.ResourceId{SpaceId: "s1", OpaqueId: "root"},
+		Path:       "./existing.txt",
+	}, 3, map[string]string{"if-match": "stale-etag"})
+	if err != nil {
+		t.Fatalf("second InitiateUpload: %v", err)
+	}
+	if _, err := d.Upload(ctx, storage.UploadRequest{
+		Ref:    &provider.Reference{Path: "/" + result2["simple"]},
+		Body:   io.NopCloser(bytes.NewReader(content)),
+		Length: int64(len(content)),
+	}, nil); err == nil {
+		t.Error("Upload with stale if-match should fail")
+	}
+}
+
+func TestUploadSimpleCommitFailureKeepsSibling(t *testing.T) {
+	store := newMockMetadataStore()
+	blob := newMockBlobStore()
+	d := testDriver(store, blob)
+	setupSpaceEmpty(store, "s1", "root")
+
+	ctx := testContext()
+	result, err := d.InitiateUpload(ctx, &provider.Reference{
+		ResourceId: &provider.ResourceId{SpaceId: "s1", OpaqueId: "root"},
+		Path:       "./newfile.txt",
+	}, 5, map[string]string{})
+	if err != nil {
+		t.Fatalf("InitiateUpload: %v", err)
+	}
+	tusID := result["tus"]
+
+	// Force the commit to fail after the blob upload.
+	store.putNodeErr = errors.New("synthetic commit failure")
+	if _, err := d.Upload(ctx, storage.UploadRequest{
+		Ref:    &provider.Reference{Path: "/" + result["simple"]},
+		Body:   io.NopCloser(bytes.NewReader([]byte("hello"))),
+		Length: 5,
+	}, nil); err == nil {
+		t.Fatal("Upload should fail when commit fails")
+	}
+
+	// The sibling stays put: the client may retry via TUS, and the TTL
+	// reaper collects it otherwise.
+	if _, err := store.GetUpload(tusID); err != nil {
+		t.Errorf("sibling session should survive a failed simple commit, err = %v", err)
 	}
 }

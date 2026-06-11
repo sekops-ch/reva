@@ -33,12 +33,15 @@ var gcLockTTL = 30 * time.Minute
 
 // GCResult holds the outcome of a single GC run.
 type GCResult struct {
-	BlobsScanned       int
-	BlobsDeleted       int
-	WouldDelete        int
-	ChildrenReconciled int // stale or duplicate oc-children entries removed
-	Errors             int
-	Duration           time.Duration
+	BlobsScanned          int
+	BlobsDeleted          int
+	WouldDelete           int
+	ChildrenReconciled    int // stale or duplicate oc-children entries removed
+	TrashReconciled       int // stale oc-trash entries removed (node already restored)
+	ExpiredUploadsCleaned int // sessions past expiry, or with no expiry and older than the session TTL
+	CorruptUploadsReaped  int // unparseable upload entries older than the session TTL
+	Errors                int
+	Duration              time.Duration
 
 	// Identity-orphan reaping (owner no longer a live user).
 	OrphanPersonalSpacesDeleted int // dead-owner personal spaces reaped
@@ -189,13 +192,22 @@ func (gc *blobGC) Run(ctx context.Context) GCResult {
 		GCRunDuration.Observe(result.Duration.Seconds())
 	}
 
-	uploads, err := gc.store.ListAllUploads()
+	// One raw walk serves the whole sweep: the reference set and residue
+	// sweep use the parsed sessions, the upload reaper additionally needs
+	// each entry's age and unparseable entries (which typed listings hide).
+	uploadEntries, err := gc.store.ListAllUploadEntries()
 	if err != nil {
 		gc.log.Error().Err(err).Msg("gc: failed to list uploads, aborting sweep")
 		GCErrors.Inc()
 		result.Errors++
 		finalize()
 		return result
+	}
+	uploads := make([]*UploadSession, 0, len(uploadEntries))
+	for _, e := range uploadEntries {
+		if e.Session != nil {
+			uploads = append(uploads, e.Session)
+		}
 	}
 
 	spaces, err := gc.store.ListSpaces(nil)
@@ -297,9 +309,22 @@ func (gc *blobGC) Run(ctx context.Context) GCResult {
 		}
 
 		result.ChildrenReconciled += gc.reconcileChildren(ctx, space.ID)
+		result.TrashReconciled += gc.reconcileTrash(ctx, space.ID)
 	}
 
-	expiredUploads := gc.cleanExpiredUploads(ctx, uploads)
+	gc.cleanExpiredUploads(ctx, uploadEntries, &result)
+
+	// Compact upload tombstones once per sweep. DeleteUpload leaves a
+	// marker per key; uploads churn orders of magnitude faster than any
+	// other bucket, so without compaction the markers come to dominate
+	// every WatchAll-based uploads listing (sampler, GC, per-space scans).
+	if !gc.opts.GCDryRun {
+		if err := gc.store.PurgeDeletedUploads(); err != nil {
+			gc.log.Warn().Err(err).Msg("gc: failed to purge upload tombstones")
+			GCErrors.Inc()
+			result.Errors++
+		}
+	}
 
 	finalize()
 
@@ -307,8 +332,10 @@ func (gc *blobGC) Run(ctx context.Context) GCResult {
 		Int("scanned", result.BlobsScanned).
 		Int("deleted", result.BlobsDeleted).
 		Int("would_delete", result.WouldDelete).
-		Int("expired_uploads_cleaned", expiredUploads).
+		Int("expired_uploads_cleaned", result.ExpiredUploadsCleaned).
+		Int("corrupt_uploads_reaped", result.CorruptUploadsReaped).
 		Int("children_reconciled", result.ChildrenReconciled).
+		Int("trash_reconciled", result.TrashReconciled).
 		Int("orphan_personal_spaces_deleted", result.OrphanPersonalSpacesDeleted).
 		Int("orphan_project_spaces_surfaced", result.OrphanProjectSpaces).
 		Int("residue_keys_deleted", result.ResidueKeysDeleted).
@@ -614,11 +641,13 @@ func (gc *blobGC) reconcileChildren(ctx context.Context, spaceID string) int {
 					Str("actual_parent", actual).
 					Msg("gc: would remove stray children entry (dry-run)")
 				reconciled++
+				GCChildrenReconciled.Inc()
 				continue
 			}
 			delete(children, name)
 			dirty = true
 			reconciled++
+			GCChildrenReconciled.Inc()
 			gc.log.Info().
 				Str("space_id", spaceID).
 				Str("parent_id", parentID).
@@ -636,6 +665,93 @@ func (gc *blobGC) reconcileChildren(ctx context.Context, spaceID string) int {
 					Msg("gc: reconcileChildren: PutChildren failed; skipping this parent for the cycle")
 			}
 		}
+	}
+
+	return reconciled
+}
+
+// reconcileTrash walks oc-trash for a single space and removes any trash
+// entry whose referenced node is already live AND reachable in the tree.
+// This catches the RestoreRecycleItem crash mode: PutNode + updateChildren
+// succeeded but DeleteTrash did not, leaving the node both restored AND
+// in trash.
+//
+// KVFS keeps directory nodes alive in oc-nodes even while trashed (for
+// subtree restorability). A trashed directory has a node entry but is NOT
+// listed in any parent's children map. A restored directory IS reachable.
+// The reachability check distinguishes the two cases.
+//
+// Resolution: the node is live and reachable; the trash entry is stale.
+// Honors the GC dry-run flag.
+func (gc *blobGC) reconcileTrash(ctx context.Context, spaceID string) int {
+	nodes, err := gc.store.ListNodesBySpace(spaceID)
+	if err != nil {
+		gc.log.Warn().Err(err).Str("space_id", spaceID).Msg("gc: reconcileTrash: list nodes failed")
+		return 0
+	}
+
+	liveNodes := make(map[string]*NodeEntry, len(nodes))
+	for _, n := range nodes {
+		liveNodes[n.ID] = n
+	}
+
+	// Build the set of node IDs reachable from some parent's children map.
+	reachable := make(map[string]struct{})
+	for _, n := range nodes {
+		if n.Type != NodeTypeDir {
+			continue
+		}
+		children, _, err := gc.store.GetChildren(spaceID, n.ID)
+		if err != nil {
+			continue
+		}
+		for _, childID := range children {
+			reachable[childID] = struct{}{}
+		}
+	}
+
+	trash, err := gc.store.ListTrash(spaceID)
+	if err != nil {
+		gc.log.Warn().Err(err).Str("space_id", spaceID).Msg("gc: reconcileTrash: list trash failed")
+		return 0
+	}
+
+	reconciled := 0
+	for _, t := range trash {
+		node, isLive := liveNodes[t.NodeID]
+		if !isLive {
+			continue
+		}
+		if _, ok := reachable[t.NodeID]; !ok {
+			continue
+		}
+		// Node is live AND reachable — trash entry is stale.
+		if gc.opts.GCDryRun {
+			gc.log.Info().
+				Str("space_id", spaceID).
+				Str("trash_key", t.Key).
+				Str("node_id", t.NodeID).
+				Str("parent_id", node.ParentID).
+				Msg("gc: would remove stale trash entry (node is live and reachable) (dry-run)")
+			reconciled++
+			GCTrashReconciled.Inc()
+			continue
+		}
+		if err := gc.store.DeleteTrash(spaceID, t.Key); err != nil {
+			gc.log.Warn().Err(err).
+				Str("space_id", spaceID).
+				Str("trash_key", t.Key).
+				Msg("gc: reconcileTrash: DeleteTrash failed; skipping this entry")
+			continue
+		}
+		reconciled++
+		GCTrashReconciled.Inc()
+		gc.log.Info().
+			Str("space_id", spaceID).
+			Str("trash_key", t.Key).
+			Str("node_id", t.NodeID).
+			Str("parent_id", node.ParentID).
+			Msg("gc: removed stale trash entry (node already restored)")
 	}
 
 	return reconciled
@@ -687,20 +803,57 @@ func (gc *blobGC) buildSpaceReferenceSet(spaceID string, uploads []*UploadSessio
 	return refs, nil
 }
 
-// cleanExpiredUploads removes upload sessions past their expiry and aborts
-// any associated S3 multipart uploads. Reuses the uploads list from buildReferenceSet.
-func (gc *blobGC) cleanExpiredUploads(ctx context.Context, uploads []*UploadSession) int {
-	now := time.Now().Unix()
-	cleaned := 0
-	for _, u := range uploads {
-		if u.Expires > 0 && u.Expires < now {
-			if u.S3MultipartID != "" {
-				gc.blob.AbortMultipartUpload(ctx, BlobKey(u.SpaceID, u.BlobID), u.S3MultipartID)
-			}
-			gc.store.DeleteUpload(u.ID)
-			cleaned++
-			gc.log.Debug().Str("session_id", u.ID).Msg("gc: cleaned expired upload session")
+// cleanExpiredUploads reaps dead upload sessions and aborts any associated
+// S3 multipart uploads. Three classes are reaped:
+//   - expired:   the session is past its Expires stamp;
+//   - no-expiry: the session has no Expires stamp (legacy/partial write)
+//     and its KV revision is older than the session TTL;
+//   - corrupt:   the stored value no longer unmarshals and its KV revision
+//     is older than the session TTL.
+//
+// The latter two are age-gated on the server-side Created timestamp so a
+// fresh in-flight session can never be reaped; a zero Created never reaps.
+// Staged upload bodies need no explicit cleanup here: the NATS staging
+// stream expires them via MaxAge (default equals the session TTL — keep
+// the two in lockstep) and disk staging is pod-local emptyDir.
+func (gc *blobGC) cleanExpiredUploads(ctx context.Context, entries []*UploadEntry, result *GCResult) {
+	now := time.Now()
+	nowUnix := now.Unix()
+	ttlCutoff := now.Add(-uploadSessionTTL)
+
+	for _, e := range entries {
+		var reason string
+		switch {
+		case e.Session != nil && e.Session.Expires > 0 && e.Session.Expires < nowUnix:
+			reason = "expired"
+		case e.Session != nil && e.Session.Expires == 0 && !e.Created.IsZero() && e.Created.Before(ttlCutoff):
+			reason = "no-expiry"
+		case e.Session == nil && !e.Created.IsZero() && e.Created.Before(ttlCutoff):
+			reason = "corrupt"
+		default:
+			continue
 		}
+
+		if gc.opts.GCDryRun {
+			result.WouldDelete++
+			GCWouldDelete.Inc()
+			gc.log.Info().Str("session_id", e.Key).Str("reason", reason).Msg("gc: would reap upload session (dry-run)")
+			continue
+		}
+
+		if e.Session != nil && e.Session.S3MultipartID != "" {
+			gc.blob.AbortMultipartUpload(ctx, BlobKey(e.Session.SpaceID, e.Session.BlobID), e.Session.S3MultipartID)
+		}
+		// The bucket key is the session ID, so one delete path covers both
+		// parseable and corrupt entries.
+		gc.store.DeleteUpload(e.Key)
+		if reason == "corrupt" {
+			result.CorruptUploadsReaped++
+			GCCorruptUploadsReaped.Inc()
+		} else {
+			result.ExpiredUploadsCleaned++
+			GCExpiredUploadsCleaned.Inc()
+		}
+		gc.log.Debug().Str("session_id", e.Key).Str("reason", reason).Msg("gc: reaped upload session")
 	}
-	return cleaned
 }

@@ -394,25 +394,3 @@ func TestSetLock_AlreadyLocked_AbortsRetry(t *testing.T) {
 		t.Errorf("expected locked error, got: %v", err)
 	}
 }
-
-func TestTouchParent_CASRetry(t *testing.T) {
-	store := newMockMetadataStore()
-	blob := newMockBlobStore()
-	d := testDriver(store, blob)
-
-	setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
-	oldNode, _, _ := store.GetNode("s1", "root")
-	oldMTime := oldNode.MTime
-
-	store.injectCASFailures(2)
-
-	d.touchParent(testContext(), "s1", "root")
-
-	node, _, _ := store.GetNode("s1", "root")
-	if node.MTime == oldMTime {
-		t.Error("touchParent should have updated MTime after CAS retry")
-	}
-	if node.ETag == "" || node.ETag == "old-etag" {
-		t.Error("touchParent should have updated ETag after CAS retry")
-	}
-}

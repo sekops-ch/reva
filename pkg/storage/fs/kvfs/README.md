@@ -130,7 +130,7 @@ backoff (1–50 ms + jitter); see [`kvfs.go:54`](kvfs.go#L54).
 
 | Method | KV ops | S3 ops | Notes |
 |---|---|---|---|
-| `CreateDir` | CAS `nodes` create + CAS `children` of parent + tree-size propagation | — | Parent ETag bumped via `touchParent` |
+| `CreateDir` | CAS `nodes` create + CAS `children` of parent + tree-size propagation | — | MTime + ETag propagated to space root via `propagateTreeSize` |
 | `TouchFile` | CAS `nodes` create or update + CAS `children` of parent | — | Optional `processing` flag for async upload pipelines |
 | `Move` | CAS update of (old parent `children`, new parent `children`, node `ParentID`) — 3-phase | — | Same-name overwrite supported; emits `ItemMoved` |
 | `Delete` | Snapshot to `trash` + remove from parent `children` | — | Soft delete; emits `ItemTrashed`. Blob deletion deferred until `PurgeRecycleItem` |

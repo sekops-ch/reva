@@ -211,6 +211,11 @@ func (u *kvfsUpload) FinishUpload(ctx context.Context) error {
 		checksum = "sha1:" + hex.EncodeToString(u.hasher.Sum(nil))
 	}
 
+	if hook := u.driver.commitFailHook; hook != nil {
+		u.driver.log.Warn().Str("session_id", u.session.ID).Msg("kvfs: commit-fail test seam fired")
+		return hook()
+	}
+
 	commitStart := time.Now()
 	err := u.commitNode(commitCtx, checksum)
 	commitDur := time.Since(commitStart)
@@ -343,32 +348,13 @@ func (d *kvfsDriver) NewUpload(ctx context.Context, info tusd.FileInfo) (tusd.Up
 // persisted offset is stale (we don't checkpoint per chunk — see
 // WriteChunk).
 //
-// Bounded retry absorbs the NATS KV cross-replica read-your-write window.
-// With R=3 RAFT replication the leader acks a PutUpload as soon as it has
-// the entry; follower replicas converge over a 10-100 ms window. A PATCH
-// that arrives within that window can route to a follower that has not
-// yet seen the new key — kvfs would surface a 404 to tusd and the client
-// would see ERR_UPLOAD_NOT_FOUND despite the session being fully
-// persisted on the originating pod. Three attempts × 50 ms covers the
-// worst-case observed replication time without measurably penalising the
-// steady-state (cache-hit) path.
+// Replicated KV reads can lag a just-ack'd PutUpload by a short
+// cross-replica convergence window; a cross-pod request that races it
+// gets ErrNotFound and tusd answers 404. The driver deliberately adds
+// no read-your-write retry here — consistency handling belongs to the
+// caller, and decomposedfs behaves the same way.
 func (d *kvfsDriver) GetUpload(ctx context.Context, id string) (tusd.Upload, error) {
-	const getUploadRetries = 3
-	const getUploadBackoff = 50 * time.Millisecond
-	var session *UploadSession
-	var err error
-	for attempt := 0; attempt < getUploadRetries; attempt++ {
-		session, err = d.store.GetUpload(id)
-		if err == nil {
-			break
-		}
-		if err != ErrNotFound {
-			return nil, err
-		}
-		if attempt < getUploadRetries-1 {
-			time.Sleep(getUploadBackoff)
-		}
-	}
+	session, err := d.store.GetUpload(id)
 	if err != nil {
 		if err == ErrNotFound {
 			return nil, tusd.ErrNotFound

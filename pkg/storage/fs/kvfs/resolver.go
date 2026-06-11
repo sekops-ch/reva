@@ -58,10 +58,11 @@ type UserResolver interface {
 // as "definitively dead". A definitive answer (vs. listing all users) avoids
 // any pagination-truncation risk that could otherwise mark a live user absent.
 type cs3UserResolver struct {
-	gatewayAddr string
-	saID        string
-	saSecret    string
-	log         *zerolog.Logger
+	gatewayAddr       string
+	saID              string
+	saSecret          string
+	serviceAccountIDs map[string]bool
+	log               *zerolog.Logger
 }
 
 // newCS3UserResolver builds a resolver from the storage service's existing
@@ -69,11 +70,17 @@ type cs3UserResolver struct {
 // of them is missing so the caller can degrade gracefully to a nil resolver
 // (identity reaping disabled, internal residue sweep still active) rather than
 // failing driver construction.
-func newCS3UserResolver(gatewayAddr, saID, saSecret string, log *zerolog.Logger) (UserResolver, error) {
+func newCS3UserResolver(gatewayAddr, saID, saSecret string, serviceAccountIDs []string, log *zerolog.Logger) (UserResolver, error) {
 	if gatewayAddr == "" || saID == "" || saSecret == "" {
 		return nil, fmt.Errorf("kvfs: user resolver needs gateway_addr + service_account_id + service_account_secret")
 	}
-	return &cs3UserResolver{gatewayAddr: gatewayAddr, saID: saID, saSecret: saSecret, log: log}, nil
+	saMap := make(map[string]bool, len(serviceAccountIDs))
+	for _, id := range serviceAccountIDs {
+		if id != "" {
+			saMap[id] = true
+		}
+	}
+	return &cs3UserResolver{gatewayAddr: gatewayAddr, saID: saID, saSecret: saSecret, serviceAccountIDs: saMap, log: log}, nil
 }
 
 func (r *cs3UserResolver) ResolveLiveness(ctx context.Context, ownerIDs []string) (map[string]bool, error) {
@@ -89,6 +96,10 @@ func (r *cs3UserResolver) ResolveLiveness(ctx context.Context, ownerIDs []string
 	out := make(map[string]bool, len(ownerIDs))
 	for _, id := range ownerIDs {
 		if id == "" {
+			continue
+		}
+		if r.serviceAccountIDs[id] {
+			out[id] = true
 			continue
 		}
 		res, err := gwc.GetUser(actx, &user.GetUserRequest{UserId: &user.UserId{OpaqueId: id}})

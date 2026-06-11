@@ -121,7 +121,18 @@ type kvfsDriver struct {
 	// best-effort downstream.
 	eventQueue chan eventJob
 	eventStop  chan struct{}
+
+	// commitFailHook is a test seam: when non-nil, FinishUpload calls it
+	// after the blob upload and fails the commit phase with its error.
+	// Lets crash-safety tests exercise the conditional-cleanup contract
+	// (session + staged bytes must survive a failed commit) end-to-end.
+	// Nil in production.
+	commitFailHook func() error
 }
+
+// defaultCommitFailHook seeds kvfsDriver.commitFailHook in New. Nil unless
+// a test harness sets it before driver construction.
+var defaultCommitFailHook func() error
 
 // New creates a new kvfs storage driver from the given config map.
 func New(m map[string]interface{}, stream events.Stream, log *zerolog.Logger) (storage.FS, error) {
@@ -214,8 +225,12 @@ func New(m map[string]interface{}, stream events.Stream, log *zerolog.Logger) (s
 		log:         log,
 		stream:      stream,
 		uploadCache: uploadCache,
-		eventQueue:  make(chan eventJob, eventQueueSize),
-		eventStop:   make(chan struct{}),
+		eventQueue:     make(chan eventJob, eventQueueSize),
+		eventStop:      make(chan struct{}),
+		commitFailHook: defaultCommitFailHook,
+	}
+	if d.commitFailHook != nil {
+		log.Warn().Msg("kvfs: commit-fail test seam is active — FinishUpload will synthesise commit failures (testing only)")
 	}
 	go d.eventPublisher()
 
@@ -266,7 +281,7 @@ func New(m map[string]interface{}, stream events.Stream, log *zerolog.Logger) (s
 				d.log.Warn().Err(err).Msg("kvfs: upload-age sampler failed to list uploads")
 				return
 			}
-			updateUploadAgeMetrics(uploads)
+			updateUploadAgeMetrics(opts.BucketPrefix, uploads)
 		}
 		sampleUploadAge()
 		t := time.NewTicker(uploadAgeSampleInterval)
@@ -299,11 +314,12 @@ func New(m map[string]interface{}, stream events.Stream, log *zerolog.Logger) (s
 		// config or construction error, degrade gracefully to a nil resolver:
 		// identity reaping is disabled but the internal residue sweep still
 		// runs. storage-system leaves these unset (no personal spaces).
-		if resolver, rerr := newCS3UserResolver(opts.GatewayAddr, opts.ServiceAccountID, opts.ServiceAccountSecret, log); rerr != nil {
+		saIDs := collectServiceAccountIDs(opts.ServiceAccountID)
+		if resolver, rerr := newCS3UserResolver(opts.GatewayAddr, opts.ServiceAccountID, opts.ServiceAccountSecret, saIDs, log); rerr != nil {
 			log.Warn().Err(rerr).Msg("kvfs: GC identity reaping disabled (resolver unavailable); residue sweep still active")
 		} else {
 			d.gc.resolver = resolver
-			log.Info().Str("gateway", opts.GatewayAddr).Msg("kvfs: GC identity reaping enabled")
+			log.Info().Str("gateway", opts.GatewayAddr).Int("service_accounts", len(saIDs)).Msg("kvfs: GC identity reaping enabled")
 		}
 
 		d.gc.Start()
@@ -333,6 +349,31 @@ func (d *kvfsDriver) Shutdown(ctx context.Context) error {
 // maxCASRetries returns the driver's configured CAS retry bound.
 func (d *kvfsDriver) maxCASRetries() int {
 	return resolveMaxCASRetries(d.opts)
+}
+
+// collectServiceAccountIDs builds the deduplicated list of service account
+// IDs that the GC resolver should treat as always-alive. Combines the
+// storage-users service's own SA (from Options) with the cluster-wide list
+// from SETTINGS_SERVICE_ACCOUNT_IDS (semicolon-separated env var).
+func collectServiceAccountIDs(primaryID string) []string {
+	seen := make(map[string]struct{})
+	var ids []string
+	add := func(id string) {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			return
+		}
+		if _, dup := seen[id]; dup {
+			return
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	add(primaryID)
+	for _, id := range strings.Split(os.Getenv("SETTINGS_SERVICE_ACCOUNT_IDS"), ";") {
+		add(id)
+	}
+	return ids
 }
 
 // commitPhase derives a detached, timeout-bounded context for the durable
@@ -452,11 +493,13 @@ func (d *kvfsDriver) doPublish(ctx context.Context, evf func() interface{}) {
 }
 
 // updateUploadAgeMetrics sets the oldest-age and session-count gauges from a
-// snapshot of oc-uploads. Driven by the sampler goroutine in New.
-func updateUploadAgeMetrics(uploads []*UploadSession) {
-	UploadSessionsTotal.Set(float64(len(uploads)))
+// snapshot of the instance's uploads bucket. Driven by the sampler goroutine
+// in New. The prefix label keeps concurrent instances' samplers from
+// overwriting each other on the shared registry.
+func updateUploadAgeMetrics(prefix string, uploads []*UploadSession) {
+	UploadSessionsTotal.WithLabelValues(prefix).Set(float64(len(uploads)))
 	if len(uploads) == 0 {
-		OldestUploadAgeSeconds.Set(0)
+		OldestUploadAgeSeconds.WithLabelValues(prefix).Set(0)
 		return
 	}
 	now := time.Now().Unix()
@@ -477,7 +520,7 @@ func updateUploadAgeMetrics(uploads []*UploadSession) {
 	if oldest < 0 {
 		oldest = 0
 	}
-	OldestUploadAgeSeconds.Set(float64(oldest))
+	OldestUploadAgeSeconds.WithLabelValues(prefix).Set(float64(oldest))
 }
 
 // --- Space operations ---
@@ -1088,7 +1131,7 @@ func (d *kvfsDriver) CreateDir(ctx context.Context, ref *provider.Reference) err
 			return err
 		}
 
-		d.touchParent(commitCtx, spaceID, parentID)
+		d.propagateTreeSize(commitCtx, spaceID, parentID, 0)
 
 		d.publishEvent(commitCtx, func() interface{} {
 			return events.ContainerCreated{
@@ -1150,7 +1193,7 @@ func (d *kvfsDriver) TouchFile(ctx context.Context, ref *provider.Reference, mar
 	}
 
 	if node.ParentID != "" {
-		d.touchParent(commitCtx, spaceID, node.ParentID)
+		d.propagateTreeSize(commitCtx, spaceID, node.ParentID, 0)
 	}
 
 	executant, _ := ctxpkg.ContextGetUser(ctx)
@@ -1220,9 +1263,8 @@ func (d *kvfsDriver) Delete(ctx context.Context, ref *provider.Reference) error 
 		d.store.DeleteNode(spaceID, nodeID)
 	}
 
-	// Update parent sizes
+	// Propagate size decrease + MTime/ETag to all ancestors.
 	d.propagateTreeSize(commitCtx, spaceID, node.ParentID, -node.Size)
-	d.touchParent(commitCtx, spaceID, node.ParentID)
 
 	executant, _ := ctxpkg.ContextGetUser(ctx)
 	d.publishEvent(commitCtx, func() interface{} {
@@ -1382,11 +1424,11 @@ func (d *kvfsDriver) Move(ctx context.Context, oldRef, newRef *provider.Referenc
 func (d *kvfsDriver) Upload(ctx context.Context, req storage.UploadRequest, uff storage.UploadFinishedFunc) (*provider.ResourceInfo, error) {
 	ref := req.Ref
 
-	var ifMatchEtag string
+	var ifMatchEtag, tusSibling string
 	if ref.GetResourceId() == nil || ref.GetResourceId().GetSpaceId() == "" {
 		var parsedRef *provider.Reference
 		var err error
-		parsedRef, ifMatchEtag, err = d.parseUploadPath(ref.GetPath())
+		parsedRef, ifMatchEtag, tusSibling, err = d.parseUploadPath(ref.GetPath())
 		if err != nil {
 			return nil, err
 		}
@@ -1496,6 +1538,18 @@ func (d *kvfsDriver) Upload(ctx context.Context, req storage.UploadRequest, uff 
 		return nil, err
 	}
 
+	// The simple commit succeeded, so the TUS session minted by the same
+	// InitiateUpload will never be used — reap it now instead of leaving
+	// it for the TTL reaper. Best-effort: DeleteUpload tolerates a
+	// missing key, and on failure the reaper still collects it.
+	if tusSibling != "" {
+		if delErr := d.store.DeleteUpload(tusSibling); delErr != nil {
+			d.log.Warn().Err(delErr).Str("session_id", tusSibling).Msg("Upload: failed to reap sibling TUS session — leaving for the TTL reaper")
+		} else {
+			UploadInFlight.WithLabelValues("tus").Dec()
+		}
+	}
+
 	d.publishEvent(commitCtx, func() interface{} {
 		return events.FileUploaded{
 			SpaceOwner: u.Id,
@@ -1593,9 +1647,8 @@ func (d *kvfsDriver) commitFileNode(ctx context.Context, p commitFileParams) (st
 				return "", err
 			}
 
-			// propagateTreeSize updates the parent's Size + MTime + ETag
-			// via propagateOneAncestor; an extra touchParent here would
-			// just re-CAS-write the same node.
+			// propagateTreeSize updates Size + MTime + ETag on the parent
+			// and every ancestor via propagateOneAncestor.
 			d.propagateTreeSize(ctx, p.SpaceID, p.ParentID, sizeDelta)
 			return existingID, nil
 		}
@@ -1642,8 +1695,7 @@ func (d *kvfsDriver) commitFileNode(ctx context.Context, p commitFileParams) (st
 		return "", err
 	}
 
-	// propagateOneAncestor (inside propagateTreeSize) covers the parent
-	// touch; an extra touchParent here would be redundant.
+	// propagateTreeSize covers the parent and all ancestors.
 	d.propagateTreeSize(ctx, p.SpaceID, p.ParentID, p.Size)
 	return nodeID, nil
 }
@@ -1743,22 +1795,36 @@ func (d *kvfsDriver) InitiateUpload(ctx context.Context, ref *provider.Reference
 	}
 
 	result["tus"] = tusID
+
+	// The caller picks ONE of the offered protocols, but the TUS session
+	// above is already persisted. Thread its ID through the simple ID so
+	// a simple-PUT commit can reap its never-used sibling — otherwise
+	// every simple upload strands one session until the TTL reaper runs.
+	simpleSep := "?"
+	if ifMatchEtag != "" {
+		simpleSep = "&"
+	}
+	result["simple"] = simpleID + simpleSep + "tus-sibling=" + url.QueryEscape(tusID)
+
 	return result, nil
 }
 
 // parseUploadPath decodes an upload path encoded by InitiateUpload.
-// Format: "storageId$spaceId!opaqueId/relativePath[?if-match=etag]"
-// Returns the reference and an optional if-match etag for CAS enforcement.
-func (d *kvfsDriver) parseUploadPath(p string) (*provider.Reference, string, error) {
+// Format: "storageId$spaceId!opaqueId/relativePath[?if-match=etag&tus-sibling=id]"
+// Returns the reference, an optional if-match etag for CAS enforcement, and
+// the ID of the sibling TUS session minted alongside the simple ID (so the
+// simple commit can reap it).
+func (d *kvfsDriver) parseUploadPath(p string) (*provider.Reference, string, string, error) {
 	// The simple handler prefixes with "/", clean it
 	p = strings.TrimPrefix(p, "/")
 
-	// Extract query parameters (if-match) before parsing the path
-	var ifMatchEtag string
+	// Extract query parameters before parsing the path
+	var ifMatchEtag, tusSibling string
 	if idx := strings.Index(p, "?"); idx >= 0 {
 		query, err := url.ParseQuery(p[idx+1:])
 		if err == nil {
 			ifMatchEtag = query.Get("if-match")
+			tusSibling = query.Get("tus-sibling")
 		}
 		p = p[:idx]
 	}
@@ -1766,7 +1832,7 @@ func (d *kvfsDriver) parseUploadPath(p string) (*provider.Reference, string, err
 	// Split on first "/" to separate spaceRef from file path
 	parts := strings.SplitN(p, "/", 2)
 	if len(parts) < 2 {
-		return nil, "", errtypes.BadRequest("kvfs: invalid upload path format: " + p)
+		return nil, "", "", errtypes.BadRequest("kvfs: invalid upload path format: " + p)
 	}
 
 	idPart := parts[0]
@@ -1774,13 +1840,13 @@ func (d *kvfsDriver) parseUploadPath(p string) (*provider.Reference, string, err
 
 	rid, err := storagespace.ParseID(idPart)
 	if err != nil {
-		return nil, "", errtypes.BadRequest("kvfs: failed to parse space ID from upload path: " + err.Error())
+		return nil, "", "", errtypes.BadRequest("kvfs: failed to parse space ID from upload path: " + err.Error())
 	}
 
 	return &provider.Reference{
 		ResourceId: &rid,
 		Path:       utils.MakeRelativePath(filePath),
-	}, ifMatchEtag, nil
+	}, ifMatchEtag, tusSibling, nil
 }
 
 // --- Revisions ---
@@ -2642,14 +2708,6 @@ func (d *kvfsDriver) propagateOneAncestor(spaceID, nodeID string, delta int64) (
 	return "", false
 }
 
-func (d *kvfsDriver) touchParent(ctx context.Context, spaceID, nodeID string) {
-	d.putNodeWithCAS(spaceID, nodeID, func(node *NodeEntry) {
-		now := time.Now().UnixNano()
-		node.MTime = now
-		node.ETag = calculateEtag(node.ID, now)
-	})
-}
-
 // recursiveDeleteNodesAndBlobs removes all descendant nodes and their S3 blobs.
 func (d *kvfsDriver) recursiveDeleteNodesAndBlobs(ctx context.Context, spaceID, nodeID string) {
 	children, _, err := d.store.GetChildren(spaceID, nodeID)
@@ -2750,7 +2808,7 @@ func (d *kvfsDriver) createEmptyFile(ctx context.Context, ref *provider.Referenc
 		return err
 	}
 
-	d.touchParent(commitCtx, spaceID, parentID)
+	d.propagateTreeSize(commitCtx, spaceID, parentID, 0)
 
 	d.publishEvent(commitCtx, func() interface{} {
 		return events.FileUploaded{

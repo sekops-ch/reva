@@ -72,20 +72,24 @@ var (
 	}, []string{"protocol"})
 
 	// OldestUploadAgeSeconds is the age of the oldest in-flight upload
-	// session, sampled at every GC tick. A growing value means TUS
-	// sessions are accumulating without being finished or reaped —
-	// usually a client-cancel leak.
-	OldestUploadAgeSeconds = promauto.NewGauge(prometheus.GaugeOpts{
+	// session, refreshed by the per-pod upload-staleness sampler. A
+	// growing value means TUS sessions are accumulating without being
+	// finished or reaped — usually a client-cancel leak. Labeled by
+	// bucket prefix: every driver instance in the process runs its own
+	// sampler against the shared registry, so an unlabeled gauge would be
+	// overwritten by whichever instance ticked last, hiding the others.
+	OldestUploadAgeSeconds = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "kvfs_oldest_upload_age_seconds",
-		Help: "Age of the oldest in-flight TUS upload session in seconds (0 if none)",
-	})
+		Help: "Age of the oldest in-flight TUS upload session in seconds (0 if none), per bucket prefix",
+	}, []string{"prefix"})
 
 	// UploadSessionsTotal is the total number of TUS upload sessions
-	// currently in oc-uploads, sampled at every GC tick.
-	UploadSessionsTotal = promauto.NewGauge(prometheus.GaugeOpts{
+	// currently in the uploads bucket, refreshed by the per-pod sampler.
+	// Prefix-labeled for the same reason as OldestUploadAgeSeconds.
+	UploadSessionsTotal = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "kvfs_upload_sessions_total",
-		Help: "Total number of TUS upload sessions in oc-uploads (sampled at GC tick)",
-	})
+		Help: "Total number of TUS upload sessions in the uploads bucket, per bucket prefix",
+	}, []string{"prefix"})
 
 	// ChildrenValueBytes observes the msgpack-encoded byte size of the
 	// per-parent children map on every PutChildren. Alert at
@@ -217,5 +221,39 @@ var (
 	GCResidueBlobsDeleted = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "kvfs_gc_residue_blobs_deleted_total",
 		Help: "Total number of S3 blobs of deleted spaces reaped by the GC residue sweep",
+	})
+
+	// GCChildrenReconciled counts oc-children entries removed because the
+	// child's authoritative ParentID disagrees with the parent directory
+	// (stale Move residue) or the child no longer exists (dangling ref).
+	GCChildrenReconciled = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "kvfs_gc_children_reconciled_total",
+		Help: "Total number of stale oc-children entries removed by the GC reconciler",
+	})
+
+	// GCTrashReconciled counts oc-trash entries removed because the
+	// referenced node is already live and reachable in the tree
+	// (RestoreRecycleItem crash residue).
+	GCTrashReconciled = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "kvfs_gc_trash_reconciled_total",
+		Help: "Total number of stale oc-trash entries removed by the GC consistency sweep",
+	})
+
+	// GCExpiredUploadsCleaned counts upload sessions reaped by GC: past
+	// their Expires stamp, or carrying no expiry and older than the
+	// session TTL. rate() of this vs the TUS initiate rate answers
+	// "are sessions created faster than reaped?".
+	GCExpiredUploadsCleaned = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "kvfs_gc_expired_uploads_cleaned_total",
+		Help: "Total upload sessions reaped by GC (expired, or no expiry and older than the session TTL)",
+	})
+
+	// GCCorruptUploadsReaped counts uploads-bucket entries whose value no
+	// longer unmarshals. Such entries are invisible to typed listings and
+	// would otherwise live forever; GC reaps them once they exceed the
+	// session TTL.
+	GCCorruptUploadsReaped = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "kvfs_gc_corrupt_uploads_reaped_total",
+		Help: "Total unparseable upload entries reaped by GC after exceeding the session TTL",
 	})
 )

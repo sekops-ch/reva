@@ -58,6 +58,8 @@ type MetadataStore interface {
 	ListAllNodes() ([]*NodeEntry, error)
 	ListAllVersions() ([]*VersionEntry, error)
 	ListAllUploads() ([]*UploadSession, error)
+	ListAllUploadEntries() ([]*UploadEntry, error)
+	PurgeDeletedUploads() error
 	ListAllTrash() ([]*TrashEntry, error)
 	TryAcquireLock(key string, holder string, ttl time.Duration) (bool, error)
 	ReleaseLock(key string, holder string) error
@@ -872,6 +874,57 @@ func (s *KVStore) ListAllVersions() ([]*VersionEntry, error) {
 // ListAllUploads returns all in-progress upload sessions.
 func (s *KVStore) ListAllUploads() ([]*UploadSession, error) {
 	return listAll[UploadSession](s.uploads, "uploads")
+}
+
+// UploadEntry is one live uploads-bucket entry as stored, with the
+// server-side creation timestamp of its current revision. Session is nil
+// when the stored bytes do not unmarshal — such entries are invisible to
+// typed listings but still occupy the bucket, so GC needs to see them.
+type UploadEntry struct {
+	Key     string
+	Created time.Time
+	Session *UploadSession
+}
+
+// ListAllUploadEntries walks the uploads bucket once and returns every
+// live entry with raw metadata. Used by GC so its reap policy can see
+// entry age and corruption, both of which ListAllUploads hides.
+func (s *KVStore) ListAllUploadEntries() ([]*UploadEntry, error) {
+	watcher, err := s.uploads.WatchAll(nats.IgnoreDeletes())
+	if err != nil {
+		if err == nats.ErrNoKeysFound {
+			return nil, nil
+		}
+		return nil, errors.Wrap(err, "kvfs: failed to watch all uploads")
+	}
+	defer watcher.Stop()
+
+	var result []*UploadEntry
+	for entry := range watcher.Updates() {
+		if entry == nil {
+			break
+		}
+		e := &UploadEntry{Key: entry.Key(), Created: entry.Created()}
+		var u UploadSession
+		if err := msgpack.Unmarshal(entry.Value(), &u); err == nil {
+			e.Session = &u
+		}
+		result = append(result, e)
+	}
+	return result, nil
+}
+
+// PurgeDeletedUploads compacts accumulated delete markers (tombstones) in
+// the uploads bucket. Every DeleteUpload leaves a marker that WatchAll-based
+// listings must still stream and discard; sessions are by far the
+// highest-churn bucket, so markers come to dominate its listing cost.
+// Markers younger than the client default threshold keep their newest
+// revision, which is safe for concurrent watchers.
+func (s *KVStore) PurgeDeletedUploads() error {
+	start := time.Now()
+	err := s.uploads.PurgeDeletes()
+	KVOperationDuration.WithLabelValues("uploads", "purge_deletes").Observe(time.Since(start).Seconds())
+	return errors.Wrap(err, "kvfs: failed to purge upload tombstones")
 }
 
 // ListAllTrash returns all trash entries across all spaces.

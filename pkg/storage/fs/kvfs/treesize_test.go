@@ -218,3 +218,88 @@ func TestPropagateTreeSize_DeepTree(t *testing.T) {
 		}
 	}
 }
+
+func TestPropagateZeroDelta_CreateDirDepth3_BubblesEtagToRoot(t *testing.T) {
+	// CreateDir at depth > 1 must bubble ETag to root via propagateTreeSize.
+	store := newMockMetadataStore()
+	d := treeSizeDriver(store)
+
+	// root -> a -> b (3 levels; CreateDir would propagate from b upward)
+	store.nodes["s1.root"] = &NodeEntry{ID: "root", SpaceID: "s1", ETag: "root-old", MTime: 1}
+	store.nodes["s1.a"] = &NodeEntry{ID: "a", SpaceID: "s1", ParentID: "root", ETag: "a-old", MTime: 1}
+	store.nodes["s1.b"] = &NodeEntry{ID: "b", SpaceID: "s1", ParentID: "a", ETag: "b-old", MTime: 1}
+	store.nodeRevs["s1.root"] = 1
+	store.nodeRevs["s1.a"] = 1
+	store.nodeRevs["s1.b"] = 1
+
+	d.propagateTreeSize(context.Background(), "s1", "b", 0)
+
+	for _, id := range []string{"b", "a", "root"} {
+		n, _, _ := store.GetNode("s1", id)
+		if n.ETag == id+"-old" {
+			t.Errorf("CreateDir depth=3: %s ETag not refreshed (still %q)", id, n.ETag)
+		}
+		if n.MTime == 1 {
+			t.Errorf("CreateDir depth=3: %s MTime not refreshed (still 1)", id)
+		}
+	}
+}
+
+func TestPropagateZeroDelta_TouchFileDepth3_BubblesEtagToRoot(t *testing.T) {
+	// TouchFile at depth > 1 must bubble ETag+MTime to root via propagateTreeSize.
+	store := newMockMetadataStore()
+	d := treeSizeDriver(store)
+
+	store.nodes["s1.root"] = &NodeEntry{ID: "root", SpaceID: "s1", ETag: "root-old", MTime: 1}
+	store.nodes["s1.a"] = &NodeEntry{ID: "a", SpaceID: "s1", ParentID: "root", ETag: "a-old", MTime: 1}
+	store.nodes["s1.b"] = &NodeEntry{ID: "b", SpaceID: "s1", ParentID: "a", ETag: "b-old", MTime: 1}
+	store.nodeRevs["s1.root"] = 1
+	store.nodeRevs["s1.a"] = 1
+	store.nodeRevs["s1.b"] = 1
+
+	d.propagateTreeSize(context.Background(), "s1", "b", 0)
+
+	root, _, _ := store.GetNode("s1", "root")
+	if root.ETag == "root-old" {
+		t.Error("TouchFile depth=3: root ETag not refreshed")
+	}
+	if root.MTime == 1 {
+		t.Error("TouchFile depth=3: root MTime not refreshed")
+	}
+}
+
+func TestDelete_PropagatesAllFieldsWithoutRedundantTouch(t *testing.T) {
+	// A single propagateTreeSize(-size) must update Size, MTime, and ETag
+	// on every ancestor without a separate parent touch.
+	store := newMockMetadataStore()
+	d := treeSizeDriver(store)
+
+	store.nodes["s1.root"] = &NodeEntry{ID: "root", SpaceID: "s1", Size: 500, ETag: "root-old", MTime: 1}
+	store.nodes["s1.a"] = &NodeEntry{ID: "a", SpaceID: "s1", ParentID: "root", Size: 500, ETag: "a-old", MTime: 1}
+	store.nodes["s1.b"] = &NodeEntry{ID: "b", SpaceID: "s1", ParentID: "a", Size: 200, ETag: "b-old", MTime: 1}
+	store.nodeRevs["s1.root"] = 1
+	store.nodeRevs["s1.a"] = 1
+	store.nodeRevs["s1.b"] = 1
+
+	d.propagateTreeSize(context.Background(), "s1", "b", -200)
+
+	for _, tc := range []struct {
+		id       string
+		wantSize int64
+	}{
+		{"b", 0},
+		{"a", 300},
+		{"root", 300},
+	} {
+		n, _, _ := store.GetNode("s1", tc.id)
+		if n.Size != tc.wantSize {
+			t.Errorf("%s Size = %d, want %d", tc.id, n.Size, tc.wantSize)
+		}
+		if n.ETag == tc.id+"-old" {
+			t.Errorf("%s ETag not refreshed (still %q)", tc.id, n.ETag)
+		}
+		if n.MTime == 1 {
+			t.Errorf("%s MTime not refreshed (still 1)", tc.id)
+		}
+	}
+}
