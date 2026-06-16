@@ -88,9 +88,15 @@ type KVStore struct {
 
 // NewKVStore connects to NATS JetStream and initializes KV buckets.
 func NewKVStore(opts *Options) (*KVStore, error) {
-	// Build NATS connection options
+	// Build NATS connection options with explicit reconnection tuning.
+	// Defaults (MaxReconnect=60, ReconnectWait=2s) are too conservative for
+	// a storage driver that must survive pod deaths without dropping requests.
 	natsOpts := []nats.Option{
 		nats.Name("opencloud-kvfs"),
+		nats.MaxReconnects(-1),
+		nats.ReconnectWait(1 * time.Second),
+		nats.ReconnectJitter(500*time.Millisecond, 2*time.Second),
+		nats.RetryOnFailedConnect(true),
 	}
 	if opts.NATSUsername != "" {
 		natsOpts = append(natsOpts, nats.UserInfo(opts.NATSUsername, opts.NATSPassword))
@@ -103,7 +109,7 @@ func NewKVStore(opts *Options) (*KVStore, error) {
 		return nil, errors.Wrap(err, "kvfs: failed to connect to NATS")
 	}
 
-	js, err := nc.JetStream()
+	js, err := nc.JetStream(nats.MaxWait(30 * time.Second))
 	if err != nil {
 		nc.Close()
 		return nil, errors.Wrap(err, "kvfs: failed to get JetStream context")

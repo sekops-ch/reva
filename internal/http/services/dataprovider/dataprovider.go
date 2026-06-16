@@ -162,6 +162,7 @@ func (s *svc) Close() error {
 func (s *svc) Unprotected() []string {
 	return []string{
 		"/tus",
+		"/simple",
 	}
 }
 

@@ -368,7 +368,7 @@ func (s *svc) handlePut(ctx context.Context, w http.ResponseWriter, r *http.Requ
 				errors.HandleWebdavError(&log, w, b, err)
 				return
 			}
-			log.Error().Err(err).Msg("PUT request to data server failed")
+			log.Error().Int("status_code", httpRes.StatusCode).Str("url", httpReq.URL.String()).Msg("PUT request to data server failed")
 			w.WriteHeader(httpRes.StatusCode)
 			return
 		}
