@@ -394,3 +394,94 @@ func TestSetLock_AlreadyLocked_AbortsRetry(t *testing.T) {
 		t.Errorf("expected locked error, got: %v", err)
 	}
 }
+
+// --- casRetryLoop helper unit tests ---
+
+func TestCasRetryLoop_SuccessFirstTry(t *testing.T) {
+	d := testDriver(newMockMetadataStore(), newMockBlobStore())
+	calls := 0
+	err := d.casRetryLoop("cas_test_ok", func() error {
+		calls++
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+	if calls != 1 {
+		t.Errorf("calls = %d, want 1", calls)
+	}
+}
+
+func TestCasRetryLoop_RetryThenSucceed(t *testing.T) {
+	d := testDriver(newMockMetadataStore(), newMockBlobStore())
+	op := "cas_test_retry"
+	labels := map[string]string{"operation": op}
+	before := getCounterValue(t, "kvfs_cas_retries_total", labels)
+	calls := 0
+	err := d.casRetryLoop(op, func() error {
+		calls++
+		if calls <= 3 {
+			return ErrCASConflict
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+	if calls != 4 {
+		t.Errorf("calls = %d, want 4", calls)
+	}
+	if delta := getCounterValue(t, "kvfs_cas_retries_total", labels) - before; delta != 3 {
+		t.Errorf("CASRetries delta = %v, want 3", delta)
+	}
+}
+
+func TestCasRetryLoop_AbortOnOtherError(t *testing.T) {
+	d := testDriver(newMockMetadataStore(), newMockBlobStore())
+	op := "cas_test_abort"
+	labels := map[string]string{"operation": op}
+	beforeR := getCounterValue(t, "kvfs_cas_retries_total", labels)
+	beforeE := getCounterValue(t, "kvfs_cas_exhausted_total", labels)
+	calls := 0
+	err := d.casRetryLoop(op, func() error {
+		calls++
+		return io.EOF
+	})
+	if err != io.EOF {
+		t.Fatalf("err = %v, want io.EOF (non-CAS error returned as-is)", err)
+	}
+	if calls != 1 {
+		t.Errorf("calls = %d, want 1 (no retry on non-CAS error)", calls)
+	}
+	if d := getCounterValue(t, "kvfs_cas_retries_total", labels) - beforeR; d != 0 {
+		t.Errorf("CASRetries delta = %v, want 0", d)
+	}
+	if d := getCounterValue(t, "kvfs_cas_exhausted_total", labels) - beforeE; d != 0 {
+		t.Errorf("CASExhausted delta = %v, want 0", d)
+	}
+}
+
+func TestCasRetryLoop_ExhaustionReturnsConflict(t *testing.T) {
+	d := testDriver(newMockMetadataStore(), newMockBlobStore())
+	op := "cas_test_exhaust"
+	labels := map[string]string{"operation": op}
+	beforeR := getCounterValue(t, "kvfs_cas_retries_total", labels)
+	beforeE := getCounterValue(t, "kvfs_cas_exhausted_total", labels)
+	calls := 0
+	err := d.casRetryLoop(op, func() error {
+		calls++
+		return ErrCASConflict
+	})
+	if err != ErrCASConflict {
+		t.Fatalf("err = %v, want ErrCASConflict", err)
+	}
+	if calls != 10 {
+		t.Errorf("calls = %d, want 10 (default maxCASRetries)", calls)
+	}
+	if d := getCounterValue(t, "kvfs_cas_retries_total", labels) - beforeR; d != 10 {
+		t.Errorf("CASRetries delta = %v, want 10", d)
+	}
+	if d := getCounterValue(t, "kvfs_cas_exhausted_total", labels) - beforeE; d != 1 {
+		t.Errorf("CASExhausted delta = %v, want 1", d)
+	}
+}
