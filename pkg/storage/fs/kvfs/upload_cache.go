@@ -302,8 +302,11 @@ func (c *natsStreamUploadCache) Append(sessionID string, startOffset int64, src 
 				Header:  nats.Header{},
 			}
 			msg.Header.Set("Upload-Offset", strconv.FormatInt(startOffset+totalWritten, 10))
-			if _, err := c.js.PublishMsg(msg); err != nil {
-				return totalWritten, errors.Wrap(err, "natsStreamUploadCache: PublishMsg")
+			pubStart := time.Now()
+			_, pubErr := c.js.PublishMsg(msg)
+			UploadCachePublishDuration.Observe(time.Since(pubStart).Seconds())
+			if pubErr != nil {
+				return totalWritten, errors.Wrap(pubErr, "natsStreamUploadCache: PublishMsg")
 			}
 			totalWritten += int64(n)
 		}

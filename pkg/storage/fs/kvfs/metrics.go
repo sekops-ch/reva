@@ -135,6 +135,12 @@ var (
 		Buckets: []float64{0.0001, 0.001, 0.005, 0.01, 0.05, 0.1, 0.2, 0.3, 0.5, 1.0, 5.0, 30.0},
 	}, []string{"phase"})
 
+	UploadCachePublishDuration = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "kvfs_upload_cache_publish_duration_seconds",
+		Help:    "Latency of each NATS JetStream PublishMsg in the upload cache",
+		Buckets: []float64{0.0001, 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.2, 0.5, 1.0, 5.0},
+	})
+
 	// TempFileBytesInFlight is the current total bytes held in the upload
 	// cache across all in-flight sessions on this pod. Read directly from
 	// the diskUploadCache via SetTempFileBytesInFlight() on each upload event.
