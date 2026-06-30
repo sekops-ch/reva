@@ -19,7 +19,6 @@ import (
 	"context"
 	"crypto/sha1"
 	"encoding/hex"
-	"hash"
 	"io"
 	"time"
 
@@ -41,7 +40,6 @@ import (
 type kvfsUpload struct {
 	session *UploadSession
 	driver  *kvfsDriver
-	hasher  hash.Hash
 }
 
 // WriteChunk appends bytes from src to the session's staging cache.
@@ -58,12 +56,11 @@ func (u *kvfsUpload) WriteChunk(ctx context.Context, offset int64, src io.Reader
 	start := time.Now()
 	defer func() { TUSPhaseDuration.WithLabelValues("write_chunk").Observe(time.Since(start).Seconds()) }()
 
-	if u.hasher == nil {
-		u.hasher = sha1.New()
-	}
-	teeReader := io.TeeReader(src, u.hasher)
-
-	n, err := u.driver.uploadCache.Append(u.session.ID, offset, teeReader)
+	// No checksum is computed here: the per-request upload object is recreated
+	// by GetUpload on every PATCH (and on every resume), so a hasher fed here
+	// would only ever see one request's bytes. The SHA-1 is instead computed
+	// in FinishUpload, in-band with the S3 upload of the finalized staged body.
+	n, err := u.driver.uploadCache.Append(u.session.ID, offset, src)
 	if err != nil {
 		// Context cancellation isn't a hard error here — partial chunks
 		// stay on disk. The client retries (TUS resume) and finds the
@@ -174,6 +171,13 @@ func (u *kvfsUpload) FinishUpload(ctx context.Context) error {
 
 	blobKey := BlobKey(u.session.SpaceID, u.session.BlobID)
 
+	// checksum is computed in-band with the modern blob upload below, over the
+	// finalized staged body — so it always reflects the complete object that
+	// lands in S3, regardless of how many PATCH requests (or cross-pod resumes)
+	// produced it. The legacy multipart branch (dead for new sessions) leaves
+	// it empty, matching the parseChecksum("") -> nil contract.
+	var checksum string
+
 	// Legacy compat for sessions created before disk-staging: if
 	// S3MultipartID is set, finalize via the multipart-complete API.
 	// New sessions never set it.
@@ -186,29 +190,30 @@ func (u *kvfsUpload) FinishUpload(ctx context.Context) error {
 			return errors.Wrap(err, "kvfs: FinishUpload failed to complete legacy multipart")
 		}
 	} else {
-		// Modern path: stream the staged body to S3 in a single Upload call.
-		// minio-go's PutObject internally splits to multipart for sizes
-		// over its threshold, so we don't need our own size discrimination.
+		// Modern path: stream the staged body to S3 in a single Upload call,
+		// teeing it through a SHA-1 hasher so the checksum is computed over
+		// exactly the bytes that reach S3. minio-go's PutObject internally
+		// splits to multipart over its threshold; the tee is purely streaming
+		// and never seeks, so it is transparent to the disk and nats backends.
 		reader, err := u.driver.uploadCache.Reader(u.session.ID)
 		if err != nil {
 			return errors.Wrap(err, "kvfs: temp file missing at FinishUpload")
 		}
 		defer reader.Close()
 
+		hasher := sha1.New()
 		blobStart := time.Now()
-		err = u.driver.blob.Upload(commitCtx, blobKey, reader, u.session.Offset)
+		err = u.driver.blob.Upload(commitCtx, blobKey, io.TeeReader(reader, hasher), u.session.Offset)
 		blobDur := time.Since(blobStart)
 		TUSPhaseDuration.WithLabelValues("blob_upload").Observe(blobDur.Seconds())
 		if err != nil {
 			u.driver.log.Error().Err(err).Str("session_id", u.session.ID).Dur("dur", blobDur).Msg("kvfs: blob upload failed")
 			return errors.Wrap(err, "kvfs: blob upload failed")
 		}
+		// Finalize only after a fully successful upload, so a partial or failed
+		// read can never commit a checksum over truncated bytes.
+		checksum = "sha1:" + hex.EncodeToString(hasher.Sum(nil))
 		u.driver.log.Debug().Str("session_id", u.session.ID).Dur("dur", blobDur).Int64("size", u.session.Offset).Msg("kvfs: blob upload ok")
-	}
-
-	var checksum string
-	if u.hasher != nil {
-		checksum = "sha1:" + hex.EncodeToString(u.hasher.Sum(nil))
 	}
 
 	if hook := u.driver.commitFailHook; hook != nil {

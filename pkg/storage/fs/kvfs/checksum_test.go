@@ -114,30 +114,29 @@ func TestFinishUpload_ComputesSHA1Checksum(t *testing.T) {
 	d := testDriver(store, blob)
 
 	setupSpaceEmpty(store, "space-1", "root-1")
-	blob.nextUploadID = "mp-cs"
 
 	content := []byte("tus checksum data")
 
+	// Modern disk-staged path (S3MultipartID == ""): the body is staged in the
+	// upload cache and pushed to S3 once at FinishUpload, where the SHA-1 is
+	// computed in-band over the staged bytes.
 	session := &UploadSession{
-		ID:            "sess-cs-1",
-		SpaceID:       "space-1",
-		Filename:      "tus-cs.txt",
-		ParentID:      "root-1",
-		Size:          int64(len(content)),
-		Offset:        0,
-		Storage:       map[string]string{},
-		BlobID:        "tus-blob-cs",
-		S3MultipartID: "mp-cs",
-		Parts:         nil,
-		OwnerID:       "test-user-id",
+		ID:       "sess-cs-1",
+		SpaceID:  "space-1",
+		Filename: "tus-cs.txt",
+		ParentID: "root-1",
+		Size:     int64(len(content)),
+		Offset:   0,
+		Storage:  map[string]string{},
+		BlobID:   "tus-blob-cs",
+		OwnerID:  "test-user-id",
 	}
 	store.uploads["sess-cs-1"] = session
-	blob.multiparts["mp-cs"] = map[int][]byte{}
 
 	ctx := testContext()
 	upload := &kvfsUpload{session: session, driver: d}
 
-	// WriteChunk feeds the hasher
+	// WriteChunk stages the body to the upload cache.
 	_, err := upload.WriteChunk(ctx, 0, bytes.NewReader(content))
 	if err != nil {
 		t.Fatalf("WriteChunk failed: %v", err)
@@ -175,20 +174,22 @@ func TestFinishUpload_MultipleChunks_Checksum(t *testing.T) {
 	chunk2 := []byte("second chunk")
 	fullContent := append(chunk1, chunk2...)
 
+	// Modern disk-staged path: both chunks land in the upload cache and the
+	// SHA-1 is computed over the reassembled body at FinishUpload. (Multiple
+	// chunks on ONE instance — see TestFinishUpload_MultiRequest_Checksum for
+	// the cross-request lifecycle that reproduces the hasher-reset bug.)
 	session := &UploadSession{
-		ID:            "sess-mc-1",
-		SpaceID:       "space-1",
-		Filename:      "multi-chunk.txt",
-		ParentID:      "root-1",
-		Size:          int64(len(fullContent)),
-		Offset:        0,
-		Storage:       map[string]string{},
-		BlobID:        "mc-blob",
-		S3MultipartID: "mp-mc",
-		OwnerID:       "test-user-id",
+		ID:       "sess-mc-1",
+		SpaceID:  "space-1",
+		Filename: "multi-chunk.txt",
+		ParentID: "root-1",
+		Size:     int64(len(fullContent)),
+		Offset:   0,
+		Storage:  map[string]string{},
+		BlobID:   "mc-blob",
+		OwnerID:  "test-user-id",
 	}
 	store.uploads["sess-mc-1"] = session
-	blob.multiparts["mp-mc"] = map[int][]byte{}
 
 	ctx := testContext()
 	upload := &kvfsUpload{session: session, driver: d}
@@ -215,6 +216,85 @@ func TestFinishUpload_MultipleChunks_Checksum(t *testing.T) {
 	node, _, _ := store.GetNode("space-1", nodeID)
 	if node.Checksum != expected {
 		t.Errorf("multi-chunk checksum = %q, want %q", node.Checksum, expected)
+	}
+}
+
+// TestFinishUpload_MultiRequest_Checksum reproduces the real TUS lifecycle
+// where every PATCH is a separate HTTP request: GetUpload mints a fresh
+// *kvfsUpload per request. A correct stored checksum must reflect the FULL
+// staged body, not just the bytes of the request that happened to run
+// FinishUpload. This is the regression guard for the per-request hasher-reset
+// bug — pre-fix the stored SHA-1 was computed over only the final chunk.
+func TestFinishUpload_MultiRequest_Checksum(t *testing.T) {
+	store := newMockMetadataStore()
+	blob := newMockBlobStore()
+	d := testDriver(store, blob)
+	ctx := testContext()
+
+	setupSpaceEmpty(store, "space-1", "root-1")
+
+	chunk1 := []byte("first chunk of a multi-PATCH upload ")
+	chunk2 := []byte("second chunk delivered in a separate request")
+	full := append(append([]byte{}, chunk1...), chunk2...)
+
+	// Modern disk-staged path (S3MultipartID == ""). No pre-init multipart.
+	store.uploads["sess-mr-1"] = &UploadSession{
+		ID:       "sess-mr-1",
+		SpaceID:  "space-1",
+		Filename: "multi-request.txt",
+		ParentID: "root-1",
+		Size:     int64(len(full)),
+		Offset:   0,
+		Storage:  map[string]string{},
+		BlobID:   "mr-blob",
+		OwnerID:  "test-user-id",
+	}
+
+	// Request 1 — PATCH chunk1 on a fresh instance, then discarded (the HTTP
+	// request ends; tusd does not retain the upload object).
+	u1, err := d.GetUpload(ctx, "sess-mr-1")
+	if err != nil {
+		t.Fatalf("GetUpload (req 1): %v", err)
+	}
+	if _, err := u1.(*kvfsUpload).WriteChunk(ctx, 0, bytes.NewReader(chunk1)); err != nil {
+		t.Fatalf("WriteChunk (req 1): %v", err)
+	}
+
+	// Request 2 — PATCH chunk2 completes the upload and triggers FinishUpload,
+	// all on a brand-new instance (hasher reset), exactly as tusd does.
+	u2, err := d.GetUpload(ctx, "sess-mr-1")
+	if err != nil {
+		t.Fatalf("GetUpload (req 2): %v", err)
+	}
+	ku2 := u2.(*kvfsUpload)
+	if _, err := ku2.WriteChunk(ctx, int64(len(chunk1)), bytes.NewReader(chunk2)); err != nil {
+		t.Fatalf("WriteChunk (req 2): %v", err)
+	}
+	UploadInFlight.WithLabelValues("tus").Add(1)
+	if err := ku2.FinishUpload(ctx); err != nil {
+		t.Fatalf("FinishUpload: %v", err)
+	}
+
+	children, _, _ := store.GetChildren("space-1", "root-1")
+	nodeID := children["multi-request.txt"]
+	if nodeID == "" {
+		t.Fatal("expected file node to exist")
+	}
+	node, _, _ := store.GetNode("space-1", nodeID)
+
+	// The blob that landed in S3 must be the FULL reassembled body (this was
+	// already correct pre-fix — the staging cache is offset-addressed).
+	if got := blob.blobs[BlobKey("space-1", "mr-blob")]; !bytes.Equal(got, full) {
+		t.Fatalf("stored blob = %d bytes, want %d (full body)", len(got), len(full))
+	}
+	if node.Size != int64(len(full)) {
+		t.Errorf("node.Size = %d, want %d", node.Size, len(full))
+	}
+	// ...and the stored checksum must match that full body. Pre-fix this was
+	// "sha1:"+sha1Hex(chunk2) because the hasher was reset on the req-2 instance.
+	want := "sha1:" + sha1Hex(full)
+	if node.Checksum != want {
+		t.Errorf("multi-request checksum = %q, want %q", node.Checksum, want)
 	}
 }
 
