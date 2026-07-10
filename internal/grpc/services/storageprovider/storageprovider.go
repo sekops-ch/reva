@@ -363,11 +363,13 @@ func (s *Service) InitiateFileUpload(ctx context.Context, req *provider.Initiate
 	metadata := map[string]string{}
 	ifMatch := req.GetIfMatch()
 	if ifMatch != "" {
-		if !validateIfMatch(ifMatch, sRes.GetInfo()) {
-			return &provider.InitiateFileUploadResponse{
-				Status: status.NewAborted(ctx, errors.New("etag mismatch"), "etag mismatch"),
-			}, nil
-		}
+		// Pass if-match through to the driver unconditionally instead of
+		// pre-rejecting on a Stat here (see the FIXME above). Drivers
+		// enforce the precondition at commit time with content awareness:
+		// a retry of a commit whose success response was lost (e.g. a
+		// gateway 504) carries the old etag, and only the driver can tell
+		// that replay apart from a genuine conflict by comparing the
+		// uploaded content against the current node.
 		metadata["if-match"] = ifMatch
 	}
 	ifUnmodifiedSince := req.GetIfUnmodifiedSince()
