@@ -108,6 +108,15 @@ var (
 		Help: "TUS uploads terminated because the request context was cancelled",
 	})
 
+	// IdempotentOverwriteDetected counts uploads where the If-Match etag
+	// mismatched but the existing node already had the same content
+	// (checksum + size). This detects 504-retry replays and prevents
+	// the client from entering a permanent 412 loop.
+	IdempotentOverwriteDetected = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "kvfs_idempotent_overwrite_detected_total",
+		Help: "Uploads detected as idempotent replays (504 retry recovery)",
+	})
+
 	// EventQueueDropped counts events dropped because the async publish
 	// queue was full. Non-zero values mean we are losing observability
 	// events; raise the buffer or reduce event volume.

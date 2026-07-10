@@ -1177,6 +1177,65 @@ func TestFinishUploadIfMatchEtagMismatch(t *testing.T) {
 	}
 }
 
+// TestFinishUploadQuotaReturns507 verifies that when quota is exhausted,
+// FinishUpload wraps the error as a tusd.Error with HTTP 507 (not 500).
+func TestFinishUploadQuotaReturns507(t *testing.T) {
+	store := newMockMetadataStore()
+	blob := newMockBlobStore()
+	d := testDriver(store, blob)
+	ctx := testContext()
+
+	// Space with quota=1 byte, root node already at size=1 → full.
+	setupSpaceEmpty(store, "space-1", "parent-1")
+	store.spaces["space-1"].Quota = 1
+	store.nodes["space-1.parent-1"].Size = 1
+
+	session := &UploadSession{
+		ID:       "sess-quota",
+		SpaceID:  "space-1",
+		Filename: "bigfile.txt",
+		ParentID: "parent-1",
+		Size:     1024,
+		Offset:   0,
+		BlobID:   "blob-quota",
+		OwnerID:  "test-user-id",
+	}
+	store.uploads[session.ID] = session
+	UploadInFlight.WithLabelValues("tus").Add(1)
+
+	u := &kvfsUpload{session: session, driver: d}
+
+	// Stage some content (modern path — no S3MultipartID).
+	data := []byte("this exceeds quota")
+	n, err := u.WriteChunk(ctx, 0, bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("WriteChunk: %v", err)
+	}
+	session.Offset = n
+
+	err = u.FinishUpload(ctx)
+	if err == nil {
+		t.Fatal("FinishUpload should fail when quota is exceeded")
+	}
+
+	// The error must be a tusd.Error with status 507.
+	var tusErr tusd.Error
+	if !errors.As(err, &tusErr) {
+		t.Fatalf("expected tusd.Error, got %T: %v", err, err)
+	}
+	if tusErr.HTTPResponse.StatusCode != 507 {
+		t.Errorf("status code = %d, want 507", tusErr.HTTPResponse.StatusCode)
+	}
+	if tusErr.ErrorCode != "ERR_QUOTA_EXCEEDED" {
+		t.Errorf("error code = %q, want %q", tusErr.ErrorCode, "ERR_QUOTA_EXCEEDED")
+	}
+
+	// Blob should be cleaned up.
+	if len(blob.deleteCalled) != 1 {
+		t.Errorf("expected blob Delete on quota failure, got %d calls", len(blob.deleteCalled))
+	}
+}
+
 func TestFinishUploadCompleteMultipartError(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
@@ -1229,6 +1288,7 @@ func TestCommitNodeCASExhausted(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
 	d := testDriver(store, blob)
+	d.opts.MaxCASRetries = 10
 	ctx := testContext()
 
 	setupSpaceEmpty(store, "space-1", "parent-1")
@@ -2096,20 +2156,37 @@ func TestUploadSimpleCommitWithIfMatchParsesBothParams(t *testing.T) {
 		t.Errorf("sibling session should be reaped on overwrite commit, err = %v", err)
 	}
 
-	// Stale etag must still be rejected (if-match parsing intact).
+	// Stale etag with DIFFERENT content must still be rejected.
+	differentContent := []byte("xxx")
 	result2, err := d.InitiateUpload(ctx, &provider.Reference{
 		ResourceId: &provider.ResourceId{SpaceId: "s1", OpaqueId: "root"},
 		Path:       "./existing.txt",
-	}, 3, map[string]string{"if-match": "stale-etag"})
+	}, int64(len(differentContent)), map[string]string{"if-match": "stale-etag"})
 	if err != nil {
 		t.Fatalf("second InitiateUpload: %v", err)
 	}
 	if _, err := d.Upload(ctx, storage.UploadRequest{
 		Ref:    &provider.Reference{Path: "/" + result2["simple"]},
+		Body:   io.NopCloser(bytes.NewReader(differentContent)),
+		Length: int64(len(differentContent)),
+	}, nil); err == nil {
+		t.Error("Upload with stale if-match and different content should fail")
+	}
+
+	// Stale etag with SAME content succeeds (idempotent overwrite).
+	result3, err := d.InitiateUpload(ctx, &provider.Reference{
+		ResourceId: &provider.ResourceId{SpaceId: "s1", OpaqueId: "root"},
+		Path:       "./existing.txt",
+	}, int64(len(content)), map[string]string{"if-match": "stale-etag"})
+	if err != nil {
+		t.Fatalf("third InitiateUpload: %v", err)
+	}
+	if _, err := d.Upload(ctx, storage.UploadRequest{
+		Ref:    &provider.Reference{Path: "/" + result3["simple"]},
 		Body:   io.NopCloser(bytes.NewReader(content)),
 		Length: int64(len(content)),
-	}, nil); err == nil {
-		t.Error("Upload with stale if-match should fail")
+	}, nil); err != nil {
+		t.Errorf("Upload with stale if-match but same content should succeed (idempotent), got: %v", err)
 	}
 }
 
@@ -2143,5 +2220,222 @@ func TestUploadSimpleCommitFailureKeepsSibling(t *testing.T) {
 	// reaper collects it otherwise.
 	if _, err := store.GetUpload(tusID); err != nil {
 		t.Errorf("sibling session should survive a failed simple commit, err = %v", err)
+	}
+}
+
+// --- Idempotent overwrite tests ---
+
+// TestCommitFileNodeIdempotentOverwrite verifies that when If-Match
+// etag mismatches but the existing node already has the same checksum
+// and size, commitFileNode returns success (idempotent replay).
+func TestCommitFileNodeIdempotentOverwrite(t *testing.T) {
+	store := newMockMetadataStore()
+	blob := newMockBlobStore()
+	d := testDriver(store, blob)
+	ctx := testContext()
+
+	setupSpaceWithFile(store, "space-1", "parent-1", "existing-node", "test.txt")
+	node := store.nodes["space-1.existing-node"]
+	node.Checksum = "sha1:abc123"
+	node.Size = 500
+	node.ETag = "new-etag-after-commit"
+
+	nodeID, err := d.commitFileNode(ctx, commitFileParams{
+		SpaceID:     "space-1",
+		ParentID:    "parent-1",
+		Name:        "test.txt",
+		BlobID:      "different-blob-from-retry",
+		Size:        500,
+		Checksum:    "sha1:abc123",
+		MimeType:    "text/plain",
+		IfMatchEtag: "old-etag",
+		OwnerID:     "test-user-id",
+	})
+	if err != nil {
+		t.Fatalf("expected idempotent success, got error: %v", err)
+	}
+	if nodeID != "existing-node" {
+		t.Errorf("nodeID = %q, want %q", nodeID, "existing-node")
+	}
+
+	// Node should NOT have been updated (no version, no blob change).
+	afterNode := store.nodes["space-1.existing-node"]
+	if afterNode.BlobID != "old-blob" {
+		t.Errorf("node.BlobID changed to %q, expected unchanged %q", afterNode.BlobID, "old-blob")
+	}
+
+	versions, _ := store.ListVersions("space-1", "existing-node")
+	if len(versions) != 0 {
+		t.Errorf("expected 0 versions (idempotent skip), got %d", len(versions))
+	}
+}
+
+// TestCommitFileNodeEtagMismatchDifferentContent verifies that a
+// genuine etag mismatch (different content) still returns Aborted.
+func TestCommitFileNodeEtagMismatchDifferentContent(t *testing.T) {
+	store := newMockMetadataStore()
+	blob := newMockBlobStore()
+	d := testDriver(store, blob)
+	ctx := testContext()
+
+	setupSpaceWithFile(store, "space-1", "parent-1", "existing-node", "test.txt")
+	node := store.nodes["space-1.existing-node"]
+	node.Checksum = "sha1:abc123"
+	node.Size = 500
+	node.ETag = "new-etag"
+
+	_, err := d.commitFileNode(ctx, commitFileParams{
+		SpaceID:     "space-1",
+		ParentID:    "parent-1",
+		Name:        "test.txt",
+		BlobID:      "new-blob",
+		Size:        600,
+		Checksum:    "sha1:different",
+		MimeType:    "text/plain",
+		IfMatchEtag: "old-etag",
+		OwnerID:     "test-user-id",
+	})
+	if err == nil {
+		t.Fatal("expected Aborted error for genuine etag mismatch with different content")
+	}
+	if !strings.Contains(err.Error(), "etag mismatch") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+// TestCommitFileNodeIdempotentGuardNoChecksum verifies that the
+// idempotency guard does NOT fire when checksum is empty (legacy
+// multipart path). The etag mismatch should return Aborted as before.
+func TestCommitFileNodeIdempotentGuardNoChecksum(t *testing.T) {
+	store := newMockMetadataStore()
+	blob := newMockBlobStore()
+	d := testDriver(store, blob)
+	ctx := testContext()
+
+	setupSpaceWithFile(store, "space-1", "parent-1", "existing-node", "test.txt")
+	node := store.nodes["space-1.existing-node"]
+	node.Checksum = "sha1:abc123"
+	node.Size = 500
+	node.ETag = "new-etag"
+
+	_, err := d.commitFileNode(ctx, commitFileParams{
+		SpaceID:     "space-1",
+		ParentID:    "parent-1",
+		Name:        "test.txt",
+		BlobID:      "new-blob",
+		Size:        500,
+		Checksum:    "",
+		MimeType:    "text/plain",
+		IfMatchEtag: "old-etag",
+		OwnerID:     "test-user-id",
+	})
+	if err == nil {
+		t.Fatal("expected Aborted error when checksum is empty (guard should not fire)")
+	}
+	if !strings.Contains(err.Error(), "etag mismatch") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+// TestCommitFileNodeIdempotentGuardSizeMismatch verifies that matching
+// checksum but different size does NOT trigger the idempotency guard.
+func TestCommitFileNodeIdempotentGuardSizeMismatch(t *testing.T) {
+	store := newMockMetadataStore()
+	blob := newMockBlobStore()
+	d := testDriver(store, blob)
+	ctx := testContext()
+
+	setupSpaceWithFile(store, "space-1", "parent-1", "existing-node", "test.txt")
+	node := store.nodes["space-1.existing-node"]
+	node.Checksum = "sha1:abc123"
+	node.Size = 500
+	node.ETag = "new-etag"
+
+	_, err := d.commitFileNode(ctx, commitFileParams{
+		SpaceID:     "space-1",
+		ParentID:    "parent-1",
+		Name:        "test.txt",
+		BlobID:      "new-blob",
+		Size:        999,
+		Checksum:    "sha1:abc123",
+		MimeType:    "text/plain",
+		IfMatchEtag: "old-etag",
+		OwnerID:     "test-user-id",
+	})
+	if err == nil {
+		t.Fatal("expected Aborted error when size mismatches")
+	}
+	if !strings.Contains(err.Error(), "etag mismatch") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+// TestFinishUploadIdempotentReplay is the end-to-end test: a TUS
+// session whose FinishUpload succeeds but whose response is lost. The
+// retry session has a different BlobID but uploads the same content.
+// FinishUpload should detect the idempotent overwrite and succeed.
+func TestFinishUploadIdempotentReplay(t *testing.T) {
+	store := newMockMetadataStore()
+	blob := newMockBlobStore()
+	d := testDriver(store, blob)
+	ctx := testContext()
+
+	// Simulate the state after the first (successful but lost) commit:
+	// the existing node has the content checksum and a new etag.
+	// sha1 of 1024 bytes of 'A' = 746c3f4d286c531e065e8af76e0ac0868831c6b4
+	knownChecksum := "sha1:746c3f4d286c531e065e8af76e0ac0868831c6b4"
+	setupSpaceWithFile(store, "space-1", "parent-1", "existing-node", "test.txt")
+	node := store.nodes["space-1.existing-node"]
+	node.Checksum = knownChecksum
+	node.Size = 1024
+	node.BlobID = "first-commit-blob"
+	node.ETag = "etag-after-first-commit"
+
+	// Create a retry session: different BlobID, stale If-Match etag.
+	session := &UploadSession{
+		ID:          "retry-sess",
+		SpaceID:     "space-1",
+		Filename:    "test.txt",
+		ParentID:    "parent-1",
+		Size:        1024,
+		Offset:      0,
+		BlobID:      "retry-blob-uuid",
+		IfMatchEtag: "old-etag",
+		OwnerID:     "test-user-id",
+	}
+	store.uploads[session.ID] = session
+	UploadInFlight.WithLabelValues("tus").Add(1)
+
+	// Stage the same content in the upload cache (modern path, no S3MultipartID).
+	data := bytes.Repeat([]byte("A"), 1024)
+	u := &kvfsUpload{session: session, driver: d}
+	n, err := u.WriteChunk(ctx, 0, bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("WriteChunk: %v", err)
+	}
+	if n != 1024 {
+		t.Fatalf("WriteChunk wrote %d, want 1024", n)
+	}
+
+	err = u.FinishUpload(ctx)
+	if err != nil {
+		t.Fatalf("FinishUpload should succeed on idempotent replay, got: %v", err)
+	}
+
+	// Session should be cleaned up.
+	if _, err := store.GetUpload(session.ID); err != ErrNotFound {
+		t.Error("upload session should be deleted after idempotent FinishUpload")
+	}
+
+	// No version should have been created.
+	versions, _ := store.ListVersions("space-1", "existing-node")
+	if len(versions) != 0 {
+		t.Errorf("expected 0 versions on idempotent replay, got %d", len(versions))
+	}
+
+	// The existing node's BlobID should be unchanged (no re-write).
+	afterNode := store.nodes["space-1.existing-node"]
+	if afterNode.BlobID != "first-commit-blob" {
+		t.Errorf("node.BlobID changed to %q, expected unchanged %q", afterNode.BlobID, "first-commit-blob")
 	}
 }

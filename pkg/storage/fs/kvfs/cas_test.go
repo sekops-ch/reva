@@ -69,6 +69,7 @@ func TestCreateDir_CASExhausted_ReturnsError(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
 	d := testDriver(store, blob)
+	d.opts.MaxCASRetries = 10
 
 	setupSpaceEmpty(store, "space-1", "root-1")
 
@@ -126,6 +127,7 @@ func TestCreateDir_CleansUpOnCASFailure(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
 	d := testDriver(store, blob)
+	d.opts.MaxCASRetries = 10
 
 	setupSpaceEmpty(store, "space-1", "root-1")
 
@@ -254,6 +256,7 @@ func TestPutNodeWithCASCheck_Exhausted(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
 	d := testDriver(store, blob)
+	d.opts.MaxCASRetries = 10
 
 	setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
 	store.injectCASFailures(20)
@@ -463,6 +466,7 @@ func TestCasRetryLoop_AbortOnOtherError(t *testing.T) {
 
 func TestCasRetryLoop_ExhaustionReturnsConflict(t *testing.T) {
 	d := testDriver(newMockMetadataStore(), newMockBlobStore())
+	d.opts.MaxCASRetries = 10
 	op := "cas_test_exhaust"
 	labels := map[string]string{"operation": op}
 	beforeR := getCounterValue(t, "kvfs_cas_retries_total", labels)
@@ -476,7 +480,7 @@ func TestCasRetryLoop_ExhaustionReturnsConflict(t *testing.T) {
 		t.Fatalf("err = %v, want ErrCASConflict", err)
 	}
 	if calls != 10 {
-		t.Errorf("calls = %d, want 10 (default maxCASRetries)", calls)
+		t.Errorf("calls = %d, want 10 (explicit maxCASRetries)", calls)
 	}
 	if d := getCounterValue(t, "kvfs_cas_retries_total", labels) - beforeR; d != 10 {
 		t.Errorf("CASRetries delta = %v, want 10", d)

@@ -27,6 +27,7 @@ import (
 	tusd "github.com/tus/tusd/v2/pkg/handler"
 
 	ctxpkg "github.com/opencloud-eu/reva/v2/pkg/ctx"
+	"github.com/opencloud-eu/reva/v2/pkg/errtypes"
 	"github.com/opencloud-eu/reva/v2/pkg/events"
 	"github.com/opencloud-eu/reva/v2/pkg/mime"
 )
@@ -227,10 +228,14 @@ func (u *kvfsUpload) FinishUpload(ctx context.Context) error {
 	TUSPhaseDuration.WithLabelValues("commit_node").Observe(commitDur.Seconds())
 	if err != nil {
 		u.driver.log.Error().Err(err).Str("session_id", u.session.ID).Dur("dur", commitDur).Msg("kvfs: commitNode failed — rolling back blob")
-		// Use commitCtx so the cleanup itself isn't cancelled by the
-		// already-canceled request ctx.
 		if delErr := u.driver.blob.Delete(commitCtx, blobKey); delErr != nil {
 			u.driver.log.Warn().Err(delErr).Str("blob_key", blobKey).Msg("kvfs: rollback blob delete failed — leaving for GC")
+		}
+		// Quota exhaustion must surface as HTTP 507 (not 500). The tusd
+		// handler only maps its own Error type to HTTP status codes; a
+		// raw errtypes.InsufficientStorage falls through to 500.
+		if _, ok := err.(errtypes.InsufficientStorage); ok {
+			return tusd.NewError("ERR_QUOTA_EXCEEDED", err.Error(), 507)
 		}
 		return err
 	}

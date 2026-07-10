@@ -50,7 +50,7 @@ import (
 	"github.com/pkg/errors"
 )
 
-const defaultMaxCASRetries = 10
+const defaultMaxCASRetries = 100
 
 // commitPhaseTimeout bounds every detached commit context returned by
 // [kvfsDriver.commitPhase]. 5 minutes comfortably envelopes worst-case
@@ -1052,6 +1052,31 @@ func (d *kvfsDriver) commitFileNode(ctx context.Context, p commitFileParams) (st
 	}
 
 	if existingID, exists := children[p.Name]; exists {
+		// Idempotency guard: when a prior FinishUpload committed but the
+		// HTTP response was lost (504), the client retries with a new
+		// session carrying the old If-Match etag. The node's etag moved
+		// forward so the precondition check would fail. Detect by content
+		// identity: same checksum + size means the desired state is
+		// already achieved. Return success without re-versioning or
+		// re-propagating tree size.
+		if p.IfMatchEtag != "" && p.Checksum != "" {
+			if node, _, err := d.store.GetNode(p.SpaceID, existingID); err == nil {
+				if node.ETag != p.IfMatchEtag &&
+					node.Checksum == p.Checksum &&
+					node.Size == p.Size {
+					IdempotentOverwriteDetected.Inc()
+					d.log.Info().
+						Str("node_id", existingID).
+						Str("checksum", p.Checksum).
+						Int64("size", p.Size).
+						Str("stale_etag", p.IfMatchEtag).
+						Str("current_etag", node.ETag).
+						Msg("kvfs: idempotent overwrite — content already matches")
+					return existingID, nil
+				}
+			}
+		}
+
 		// Overwrite path: CAS-update the existing node's blob/size/etag.
 		// Children map is unchanged so no children CAS is needed. The version
 		// snapshot is taken once (firstTry), on the first attempt only, so a CAS
