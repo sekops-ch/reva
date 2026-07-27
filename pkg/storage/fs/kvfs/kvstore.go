@@ -24,6 +24,7 @@ import (
 
 	"github.com/nats-io/nats.go"
 	"github.com/pkg/errors"
+	"github.com/rs/zerolog"
 	"github.com/vmihailenco/msgpack/v5"
 )
 
@@ -87,7 +88,11 @@ type KVStore struct {
 }
 
 // NewKVStore connects to NATS JetStream and initializes KV buckets.
-func NewKVStore(opts *Options) (*KVStore, error) {
+func NewKVStore(opts *Options, log *zerolog.Logger) (*KVStore, error) {
+	if log == nil {
+		l := zerolog.Nop()
+		log = &l
+	}
 	// Build NATS connection options with explicit reconnection tuning.
 	// Defaults (MaxReconnect=60, ReconnectWait=2s) are too conservative for
 	// a storage driver that must survive pod deaths without dropping requests.
@@ -156,15 +161,7 @@ func NewKVStore(opts *Options) (*KVStore, error) {
 				ensureReplicas(js, kv, opts.NATSReplicas)
 			}
 			if name == childrenBucket && opts.ChildrenMaxValueSize > 0 {
-				if err := ensureMaxValueSize(js, kv, opts.ChildrenMaxValueSize); err != nil {
-					// NATS will refuse MaxMsgSize > server max_payload. The
-					// only fix is at the NATS server level (max_payload in
-					// nats.conf). Surface the rejection — silent failure
-					// here would leave operators thinking the env var took
-					// effect when it didn't.
-					fmt.Printf("kvfs: WARNING — ensureMaxValueSize on %s failed: %v\n", name, err)
-					fmt.Printf("kvfs: HINT — NATS server max_payload may be lower than requested %d bytes; bump it in nats.conf (current default 1 MiB)\n", opts.ChildrenMaxValueSize)
-				}
+				ensureChildrenValueSize(js, kv, name, opts.ChildrenMaxValueSize, log)
 			}
 		}
 		*target = kv
@@ -296,6 +293,21 @@ func ensureMaxValueSize(js streamUpdater, kv kvStatusProvider, desired int32) er
 		return errors.Wrapf(err, "kvfs: failed to update MaxMsgSize from %d to %d for %s", info.Config.MaxMsgSize, desired, streamName)
 	}
 	return nil
+}
+
+// ensureChildrenValueSize applies the configured children value-size cap to
+// an already-existing bucket, downgrading a rejection to a structured
+// warning: NATS refuses MaxMsgSize > server max_payload, and the only fix
+// is at the NATS server level (max_payload in nats.conf). Surfacing the
+// rejection matters — silent failure would leave operators thinking the
+// env var took effect when it didn't.
+func ensureChildrenValueSize(js streamUpdater, kv kvStatusProvider, name string, desired int32, log *zerolog.Logger) {
+	if err := ensureMaxValueSize(js, kv, desired); err != nil {
+		log.Warn().Err(err).Str("bucket", name).
+			Int32("children_max_value_size", desired).
+			Str("hint", "NATS server max_payload may be lower than requested; bump it in nats.conf (current default 1 MiB)").
+			Msg("kvfs: ensureMaxValueSize failed")
+	}
 }
 
 // ensureReplicas upgrades an existing KV bucket's replica count if it is

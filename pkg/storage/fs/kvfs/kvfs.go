@@ -52,6 +52,11 @@ import (
 
 const defaultMaxCASRetries = 100
 
+// defaultMaxDeleteDepth bounds recursive delete traversal (trash purge,
+// space delete) when max_delete_depth is unset. Deep enough for any sane
+// tree; shallow enough that the recursion can never threaten the stack.
+const defaultMaxDeleteDepth = 100
+
 // commitPhaseTimeout bounds every detached commit context returned by
 // [kvfsDriver.commitPhase]. 5 minutes comfortably envelopes worst-case
 // 1 GiB blob uploads on a slow NATS leader; prevents goroutine leaks on
@@ -147,7 +152,7 @@ func New(m map[string]interface{}, stream events.Stream, log *zerolog.Logger) (s
 		return nil, fmt.Errorf("kvfs: S3 configuration incomplete")
 	}
 
-	store, err := NewKVStore(opts)
+	store, err := NewKVStore(opts, log)
 	if err != nil {
 		return nil, err
 	}
@@ -167,6 +172,8 @@ func New(m map[string]interface{}, stream events.Stream, log *zerolog.Logger) (s
 	// Export the effective CAS retry bound per instance so dead config
 	// (value diverging from the deployment setting) is observable.
 	MaxCASRetriesGauge.WithLabelValues(opts.BucketPrefix).Set(float64(opts.MaxCASRetries))
+	// Same dead-config seam for the recursive-delete depth bound.
+	MaxDeleteDepthGauge.WithLabelValues(opts.BucketPrefix).Set(float64(resolveMaxDeleteDepth(opts)))
 
 	// Initialise the upload-staging cache. Disk-backed (default) requires
 	// the temp directory to exist; create it eagerly so the first
@@ -194,7 +201,7 @@ func New(m map[string]interface{}, stream events.Stream, log *zerolog.Logger) (s
 			MaxAge:        opts.UploadNATSMaxAge,
 			MaxBytes:      opts.UploadNATSMaxBytes,
 			MaxChunkBytes: opts.UploadNATSMaxChunkBytes,
-		})
+		}, log)
 		if err != nil {
 			store.Close()
 			return nil, errors.Wrap(err, "kvfs: failed to initialise nats upload cache")
@@ -301,7 +308,12 @@ func New(m map[string]interface{}, stream events.Stream, log *zerolog.Logger) (s
 		d.gc.reapSpace = func(ctx context.Context, spaceID, rootID string) error {
 			cctx, cancel := d.commitPhase(ctx)
 			defer cancel()
-			d.deleteSpaceContents(cctx, spaceID, rootID)
+			// A depth-bound violation surfaces through the GC's error
+			// accounting and the reap retries next cycle; the bound must
+			// be raised for such a space to ever be reaped.
+			if err := d.deleteSpaceContents(cctx, spaceID, rootID); err != nil {
+				return err
+			}
 			return d.store.DeleteSpace(spaceID)
 		}
 

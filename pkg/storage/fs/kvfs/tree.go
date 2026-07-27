@@ -17,7 +17,10 @@ package kvfs
 
 import (
 	"context"
+	"fmt"
 	"time"
+
+	"github.com/opencloud-eu/reva/v2/pkg/errtypes"
 )
 
 // propagateTreeSize walks ancestors starting at nodeID up to the space root,
@@ -114,11 +117,26 @@ func (d *kvfsDriver) propagateOneAncestor(spaceID, nodeID string, delta int64) (
 	}
 }
 
-// recursiveDeleteNodesAndBlobs removes all descendant nodes and their S3 blobs.
-func (d *kvfsDriver) recursiveDeleteNodesAndBlobs(ctx context.Context, spaceID, nodeID string) {
+// recursiveDeleteNodesAndBlobs removes all descendant nodes and their S3
+// blobs. depth is the current nesting level below the delete root (external
+// callers pass 0); descending past the configured MaxDeleteDepth aborts
+// with a BadRequest so a pathological tree can never threaten the runtime
+// stack (recursion frames are bounded by the configured depth, constant
+// per deployment). Only the depth violation
+// propagates as an error — per-item store/blob failures stay best-effort,
+// exactly as before.
+//
+// Deletion is bottom-up (a child dir's subtree is deleted before the child
+// itself), so a depth abort leaves a connected, shallower tree: nothing is
+// orphaned, the item stays restorable, and the operation can be retried
+// after raising the bound.
+func (d *kvfsDriver) recursiveDeleteNodesAndBlobs(ctx context.Context, spaceID, nodeID string, depth int) error {
+	if max := resolveMaxDeleteDepth(d.opts); depth > max {
+		return errtypes.BadRequest(fmt.Sprintf("kvfs: recursive delete exceeds max depth %d", max))
+	}
 	children, _, err := d.store.GetChildren(spaceID, nodeID)
 	if err != nil {
-		return
+		return nil
 	}
 	for _, childID := range children {
 		child, _, err := d.store.GetNode(spaceID, childID)
@@ -126,30 +144,14 @@ func (d *kvfsDriver) recursiveDeleteNodesAndBlobs(ctx context.Context, spaceID, 
 			continue
 		}
 		if child.Type == NodeTypeDir {
-			d.recursiveDeleteNodesAndBlobs(ctx, spaceID, childID)
+			if err := d.recursiveDeleteNodesAndBlobs(ctx, spaceID, childID, depth+1); err != nil {
+				return err
+			}
 		} else if child.BlobID != "" {
 			d.blob.Delete(ctx, BlobKey(spaceID, child.BlobID))
 		}
 		d.store.DeleteNode(spaceID, childID)
 		d.store.DeleteChildren(spaceID, childID)
 	}
-}
-
-// recursiveDeleteNodes removes all descendant nodes of a directory.
-func (d *kvfsDriver) recursiveDeleteNodes(ctx context.Context, spaceID, nodeID string) {
-	children, _, err := d.store.GetChildren(spaceID, nodeID)
-	if err != nil {
-		return
-	}
-	for _, childID := range children {
-		child, _, err := d.store.GetNode(spaceID, childID)
-		if err != nil {
-			continue
-		}
-		if child.Type == NodeTypeDir {
-			d.recursiveDeleteNodes(ctx, spaceID, childID)
-		}
-		d.store.DeleteNode(spaceID, childID)
-	}
-	d.store.DeleteChildren(spaceID, nodeID)
+	return nil
 }

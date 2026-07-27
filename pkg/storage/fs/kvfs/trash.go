@@ -233,7 +233,11 @@ func (d *kvfsDriver) PurgeRecycleItem(ctx context.Context, ref *provider.Referen
 	if trashItem.Node.Type == NodeTypeDir {
 		// Directories: nodes and children maps are still alive in KV.
 		// Recursively delete all descendants, their blobs, and versions.
-		d.recursiveDeleteNodesAndBlobs(commitCtx, spaceID, trashItem.NodeID)
+		// A depth-bound violation aborts BEFORE the root node/children/
+		// trash entry are touched — the item stays intact and restorable.
+		if err := d.recursiveDeleteNodesAndBlobs(commitCtx, spaceID, trashItem.NodeID, 0); err != nil {
+			return err
+		}
 		d.store.DeleteNode(spaceID, trashItem.NodeID)
 		d.store.DeleteChildren(spaceID, trashItem.NodeID)
 	} else if trashItem.Node.BlobID != "" {
@@ -280,7 +284,13 @@ func (d *kvfsDriver) EmptyRecycle(ctx context.Context, ref *provider.Reference) 
 
 	for _, t := range trashItems {
 		if t.Node.Type == NodeTypeDir {
-			d.recursiveDeleteNodesAndBlobs(commitCtx, spaceID, t.NodeID)
+			// Abort the whole empty on the first over-deep item: loud
+			// and retriable (after raising the bound) beats silently
+			// leaving some items behind. Already-purged items are gone;
+			// this item and the rest stay in the trash untouched.
+			if err := d.recursiveDeleteNodesAndBlobs(commitCtx, spaceID, t.NodeID, 0); err != nil {
+				return err
+			}
 			d.store.DeleteNode(spaceID, t.NodeID)
 			d.store.DeleteChildren(spaceID, t.NodeID)
 		} else if t.Node.BlobID != "" {

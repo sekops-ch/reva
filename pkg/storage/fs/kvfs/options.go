@@ -54,6 +54,15 @@ type Options struct {
 	// than the default 10; tune up on contended workloads.
 	MaxCASRetries int `mapstructure:"max_cas_retries"`
 
+	// MaxDeleteDepth bounds how many directory levels a recursive delete
+	// (trash purge, space delete) will traverse below the delete root.
+	// Exceeding it fails the operation with a BadRequest instead of
+	// risking the runtime stack on a pathological tree. Deletion is
+	// bottom-up, so an aborted delete leaves a connected (shallower)
+	// tree that can be retried after raising the bound. Zero means use
+	// the package default.
+	MaxDeleteDepth int `mapstructure:"max_delete_depth"`
+
 	// UploadBackend selects the TUS body-staging implementation:
 	//   - "disk" (default): buffer chunks to UploadTmpDir; matches every
 	//     other reva storage driver. WriteChunk returns in microseconds.
@@ -159,6 +168,16 @@ func resolveMaxCASRetries(o *Options) int {
 	return defaultMaxCASRetries
 }
 
+// resolveMaxDeleteDepth returns the configured recursive-delete depth
+// bound, or the package default when unset (<= 0). Same fixture-defense
+// contract as resolveMaxCASRetries.
+func resolveMaxDeleteDepth(o *Options) int {
+	if o != nil && o.MaxDeleteDepth > 0 {
+		return o.MaxDeleteDepth
+	}
+	return defaultMaxDeleteDepth
+}
+
 // init sets defaults for missing config values.
 func (o *Options) init() {
 	if len(o.NATSNodes) == 0 {
@@ -178,6 +197,9 @@ func (o *Options) init() {
 	}
 	if o.MaxCASRetries <= 0 {
 		o.MaxCASRetries = defaultMaxCASRetries
+	}
+	if o.MaxDeleteDepth <= 0 {
+		o.MaxDeleteDepth = defaultMaxDeleteDepth
 	}
 	if o.UploadBackend == "" {
 		o.UploadBackend = "disk"

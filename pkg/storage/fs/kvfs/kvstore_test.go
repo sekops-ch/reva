@@ -16,11 +16,13 @@
 package kvfs
 
 import (
+	"bytes"
 	"errors"
 	"testing"
 	"time"
 
 	"github.com/nats-io/nats.go"
+	"github.com/rs/zerolog"
 )
 
 // --- Options parsing tests ---
@@ -431,7 +433,7 @@ func TestEnsureMaxValueSize_UpdateStreamError(t *testing.T) {
 }
 
 // contains is a tiny strings.Contains stand-in to keep the test file's
-// import surface narrow (only "errors", "testing", "time", "nats.go").
+// import surface narrow.
 func contains(haystack, needle string) bool {
 	for i := 0; i+len(needle) <= len(haystack); i++ {
 		if haystack[i:i+len(needle)] == needle {
@@ -439,4 +441,61 @@ func contains(haystack, needle string) bool {
 		}
 	}
 	return false
+}
+
+// ensureChildrenValueSize downgrades an ensure failure to a structured
+// warning (bucket + requested size + hint fields) — the non-fatal contract
+// the old WARNING+HINT prints documented. Uses the same mock seams as the
+// ensureMaxValueSize tests, so the rejection is deterministic.
+func TestEnsureChildrenValueSize_RejectionLogsStructuredWarning(t *testing.T) {
+	kv := &mockKVStatusProvider{
+		statusResult: &mockKVStatus{bucket: "oc-children"},
+	}
+	js := &mockStreamUpdater{
+		streamInfo: &nats.StreamInfo{
+			Config: nats.StreamConfig{Name: "KV_oc-children", MaxMsgSize: 1 * 1024 * 1024},
+		},
+		updateStreamErr: errors.New("maximum message size exceeds max payload"),
+	}
+
+	var buf bytes.Buffer
+	logger := zerolog.New(&buf)
+	ensureChildrenValueSize(js, kv, "oc-children", desiredMaxValueSize, &logger)
+
+	out := buf.String()
+	if !contains(out, `"level":"warn"`) {
+		t.Fatalf("expected warn level, got: %q", out)
+	}
+	if !contains(out, "ensureMaxValueSize failed") || !contains(out, "oc-children") {
+		t.Fatalf("expected message + bucket field, got: %q", out)
+	}
+	if !contains(out, "hint") || !contains(out, "max_payload") {
+		t.Fatalf("expected the HINT semantics as a log field, got: %q", out)
+	}
+	if !contains(out, "children_max_value_size") {
+		t.Fatalf("expected the requested size as a log field, got: %q", out)
+	}
+}
+
+// The success path must stay silent — the warning fires only on rejection.
+func TestEnsureChildrenValueSize_SuccessLogsNothing(t *testing.T) {
+	kv := &mockKVStatusProvider{
+		statusResult: &mockKVStatus{bucket: "oc-children"},
+	}
+	js := &mockStreamUpdater{
+		streamInfo: &nats.StreamInfo{
+			Config: nats.StreamConfig{Name: "KV_oc-children", MaxMsgSize: 1 * 1024 * 1024},
+		},
+	}
+
+	var buf bytes.Buffer
+	logger := zerolog.New(&buf)
+	ensureChildrenValueSize(js, kv, "oc-children", desiredMaxValueSize, &logger)
+
+	if out := buf.String(); out != "" {
+		t.Fatalf("expected no log output on success, got: %q", out)
+	}
+	if !js.updateCalled {
+		t.Fatal("expected the widen path to run")
+	}
 }

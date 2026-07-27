@@ -349,15 +349,21 @@ func (d *kvfsDriver) DeleteStorageSpace(ctx context.Context, req *provider.Delet
 	commitCtx, cancel := d.commitPhase(ctx)
 	defer cancel()
 
-	d.deleteSpaceContents(commitCtx, spaceID, space.RootID)
+	if err := d.deleteSpaceContents(commitCtx, spaceID, space.RootID); err != nil {
+		return err
+	}
 
 	return d.store.DeleteSpace(spaceID)
 }
 
 // deleteSpaceContents removes all nodes, blobs, trash, versions, and uploads
 // belonging to a space. Called before deleting the space entry itself.
-func (d *kvfsDriver) deleteSpaceContents(ctx context.Context, spaceID, rootID string) {
-	d.recursiveDeleteNodesAndBlobs(ctx, spaceID, rootID)
+// Returns an error only on a depth-bound violation (see
+// recursiveDeleteNodesAndBlobs); everything else stays best-effort.
+func (d *kvfsDriver) deleteSpaceContents(ctx context.Context, spaceID, rootID string) error {
+	if err := d.recursiveDeleteNodesAndBlobs(ctx, spaceID, rootID, 0); err != nil {
+		return err
+	}
 	d.store.DeleteNode(spaceID, rootID)
 	d.store.DeleteChildren(spaceID, rootID)
 
@@ -366,7 +372,9 @@ func (d *kvfsDriver) deleteSpaceContents(ctx context.Context, spaceID, rootID st
 		for _, t := range trashItems {
 			if t.Node.Type == NodeTypeDir {
 				// Trashed directories still have live nodes — clean them up
-				d.recursiveDeleteNodesAndBlobs(ctx, spaceID, t.NodeID)
+				if err := d.recursiveDeleteNodesAndBlobs(ctx, spaceID, t.NodeID, 0); err != nil {
+					return err
+				}
 				d.store.DeleteNode(spaceID, t.NodeID)
 				d.store.DeleteChildren(spaceID, t.NodeID)
 			} else if t.Node.BlobID != "" {
@@ -398,6 +406,7 @@ func (d *kvfsDriver) deleteSpaceContents(ctx context.Context, spaceID, rootID st
 			d.store.DeleteUpload(u.ID)
 		}
 	}
+	return nil
 }
 
 // spaceToCS3 converts a SpaceEntry + root node to a CS3 StorageSpace.

@@ -53,6 +53,63 @@ func TestResolveMaxCASRetries(t *testing.T) {
 	}
 }
 
+// resolveMaxDeleteDepth mirrors the resolveMaxCASRetries contract: the
+// configured value when positive, the package default otherwise.
+func TestResolveMaxDeleteDepth(t *testing.T) {
+	cases := []struct {
+		name string
+		opts *Options
+		want int
+	}{
+		{"configured", &Options{MaxDeleteDepth: 50}, 50},
+		{"zero falls back to default", &Options{MaxDeleteDepth: 0}, defaultMaxDeleteDepth},
+		{"negative falls back to default", &Options{MaxDeleteDepth: -1}, defaultMaxDeleteDepth},
+		{"nil opts falls back to default", nil, defaultMaxDeleteDepth},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := resolveMaxDeleteDepth(tc.opts); got != tc.want {
+				t.Errorf("resolveMaxDeleteDepth(%+v) = %d, want %d", tc.opts, got, tc.want)
+			}
+		})
+	}
+}
+
+// A configured max_delete_depth must survive decode unchanged.
+func TestOptionsParseMaxDeleteDepth(t *testing.T) {
+	m := minimalConfig()
+	m["max_delete_depth"] = 50
+	opts, err := parseConfig(m)
+	if err != nil {
+		t.Fatalf("parseConfig failed: %v", err)
+	}
+	if opts.MaxDeleteDepth != 50 {
+		t.Errorf("expected MaxDeleteDepth=50, got %d", opts.MaxDeleteDepth)
+	}
+}
+
+// An omitted max_delete_depth must default to defaultMaxDeleteDepth via
+// init(); an explicit zero must be normalised the same way.
+func TestOptionsDefaultMaxDeleteDepth(t *testing.T) {
+	opts, err := parseConfig(minimalConfig())
+	if err != nil {
+		t.Fatalf("parseConfig failed: %v", err)
+	}
+	if opts.MaxDeleteDepth != defaultMaxDeleteDepth {
+		t.Errorf("expected MaxDeleteDepth=%d, got %d", defaultMaxDeleteDepth, opts.MaxDeleteDepth)
+	}
+
+	m := minimalConfig()
+	m["max_delete_depth"] = 0
+	opts, err = parseConfig(m)
+	if err != nil {
+		t.Fatalf("parseConfig failed: %v", err)
+	}
+	if opts.MaxDeleteDepth != defaultMaxDeleteDepth {
+		t.Errorf("explicit zero: expected MaxDeleteDepth=%d, got %d", defaultMaxDeleteDepth, opts.MaxDeleteDepth)
+	}
+}
+
 // A configured max_cas_retries must survive decode unchanged.
 func TestOptionsParseMaxCASRetries(t *testing.T) {
 	m := minimalConfig()

@@ -19,18 +19,35 @@ import (
 	"bytes"
 	"crypto/rand"
 	"io"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
+	"github.com/rs/zerolog"
 )
+
+// nopCacheLogger returns the no-op logger used by tests that don't assert
+// on log output.
+func nopCacheLogger() *zerolog.Logger {
+	l := zerolog.Nop()
+	return &l
+}
 
 // embeddedNATS spins up an in-process NATS JetStream server for tests. The
 // server uses a per-test TempDir for storage so concurrent tests don't
 // collide. Returns a JetStreamContext bound to the server; the server is
 // shut down via t.Cleanup.
 func embeddedNATS(t *testing.T) nats.JetStreamContext {
+	t.Helper()
+	js, _ := embeddedNATSWithURL(t)
+	return js
+}
+
+// embeddedNATSWithURL additionally exposes the server's client URL for
+// tests that need to drive their own connection (e.g. NewKVStore).
+func embeddedNATSWithURL(t *testing.T) (nats.JetStreamContext, string) {
 	t.Helper()
 	opts := &server.Options{
 		Host:      "127.0.0.1",
@@ -59,7 +76,7 @@ func embeddedNATS(t *testing.T) nats.JetStreamContext {
 	if err != nil {
 		t.Fatalf("jetstream: %v", err)
 	}
-	return js
+	return js, ns.ClientURL()
 }
 
 func defaultNATSCacheOpts() natsStreamUploadCacheOptions {
@@ -78,7 +95,7 @@ func defaultNATSCacheOpts() natsStreamUploadCacheOptions {
 // touched session ID (no messages on its subject).
 func TestNATSStreamUploadCache_SizeEmpty(t *testing.T) {
 	js := embeddedNATS(t)
-	cache, err := newNATSStreamUploadCache(js, defaultNATSCacheOpts())
+	cache, err := newNATSStreamUploadCache(js, defaultNATSCacheOpts(), nopCacheLogger())
 	if err != nil {
 		t.Fatalf("newNATSStreamUploadCache: %v", err)
 	}
@@ -96,7 +113,7 @@ func TestNATSStreamUploadCache_SizeEmpty(t *testing.T) {
 // Append → Size happy path and confirms Size returns the cumulative bytes.
 func TestNATSStreamUploadCache_AppendThenSize(t *testing.T) {
 	js := embeddedNATS(t)
-	cache, err := newNATSStreamUploadCache(js, defaultNATSCacheOpts())
+	cache, err := newNATSStreamUploadCache(js, defaultNATSCacheOpts(), nopCacheLogger())
 	if err != nil {
 		t.Fatalf("new: %v", err)
 	}
@@ -123,7 +140,7 @@ func TestNATSStreamUploadCache_AppendThenSize(t *testing.T) {
 // ordered Reader output for two sequential Appends on the same session.
 func TestNATSStreamUploadCache_MultipleAppends(t *testing.T) {
 	js := embeddedNATS(t)
-	cache, err := newNATSStreamUploadCache(js, defaultNATSCacheOpts())
+	cache, err := newNATSStreamUploadCache(js, defaultNATSCacheOpts(), nopCacheLogger())
 	if err != nil {
 		t.Fatalf("new: %v", err)
 	}
@@ -165,7 +182,7 @@ func TestNATSStreamUploadCache_SplitsLargeAppend(t *testing.T) {
 	js := embeddedNATS(t)
 	opts := defaultNATSCacheOpts()
 	opts.MaxChunkBytes = 256 // force several sub-messages
-	cache, err := newNATSStreamUploadCache(js, opts)
+	cache, err := newNATSStreamUploadCache(js, opts, nopCacheLogger())
 	if err != nil {
 		t.Fatalf("new: %v", err)
 	}
@@ -208,11 +225,11 @@ func TestNATSStreamUploadCache_CrossPod(t *testing.T) {
 	js := embeddedNATS(t)
 	// Two independent cache instances sharing the same JS context simulate
 	// two opencloud pods with shared NATS staging.
-	cacheA, err := newNATSStreamUploadCache(js, defaultNATSCacheOpts())
+	cacheA, err := newNATSStreamUploadCache(js, defaultNATSCacheOpts(), nopCacheLogger())
 	if err != nil {
 		t.Fatalf("newA: %v", err)
 	}
-	cacheB, err := newNATSStreamUploadCache(js, defaultNATSCacheOpts())
+	cacheB, err := newNATSStreamUploadCache(js, defaultNATSCacheOpts(), nopCacheLogger())
 	if err != nil {
 		t.Fatalf("newB: %v", err)
 	}
@@ -258,7 +275,7 @@ func TestNATSStreamUploadCache_CrossPod(t *testing.T) {
 // subsequent Size returns 0.
 func TestNATSStreamUploadCache_Drop(t *testing.T) {
 	js := embeddedNATS(t)
-	cache, err := newNATSStreamUploadCache(js, defaultNATSCacheOpts())
+	cache, err := newNATSStreamUploadCache(js, defaultNATSCacheOpts(), nopCacheLogger())
 	if err != nil {
 		t.Fatalf("new: %v", err)
 	}
@@ -285,7 +302,7 @@ func TestNATSStreamUploadCache_Drop(t *testing.T) {
 // session is a no-op (no error).
 func TestNATSStreamUploadCache_DropIdempotent(t *testing.T) {
 	js := embeddedNATS(t)
-	cache, err := newNATSStreamUploadCache(js, defaultNATSCacheOpts())
+	cache, err := newNATSStreamUploadCache(js, defaultNATSCacheOpts(), nopCacheLogger())
 	if err != nil {
 		t.Fatalf("new: %v", err)
 	}
@@ -302,7 +319,7 @@ func TestNATSStreamUploadCache_OffsetHeaderEncoding(t *testing.T) {
 	js := embeddedNATS(t)
 	opts := defaultNATSCacheOpts()
 	opts.MaxChunkBytes = 8 // tiny → forces splits
-	cache, err := newNATSStreamUploadCache(js, opts)
+	cache, err := newNATSStreamUploadCache(js, opts, nopCacheLogger())
 	if err != nil {
 		t.Fatalf("new: %v", err)
 	}
@@ -327,7 +344,7 @@ func TestNATSStreamUploadCache_OffsetHeaderEncoding(t *testing.T) {
 // without hanging.
 func TestNATSStreamUploadCache_ReaderOnEmpty(t *testing.T) {
 	js := embeddedNATS(t)
-	cache, err := newNATSStreamUploadCache(js, defaultNATSCacheOpts())
+	cache, err := newNATSStreamUploadCache(js, defaultNATSCacheOpts(), nopCacheLogger())
 	if err != nil {
 		t.Fatalf("new: %v", err)
 	}
@@ -354,7 +371,7 @@ func TestNATSStreamUploadCache_ReaderOnEmpty(t *testing.T) {
 // optimisation that dropped the per-chunk GetLastMsg round-trip.
 func TestNATSStreamUploadCache_AppendHonorsCallerOffset(t *testing.T) {
 	js := embeddedNATS(t)
-	cache, err := newNATSStreamUploadCache(js, defaultNATSCacheOpts())
+	cache, err := newNATSStreamUploadCache(js, defaultNATSCacheOpts(), nopCacheLogger())
 	if err != nil {
 		t.Fatalf("new: %v", err)
 	}
@@ -371,5 +388,39 @@ func TestNATSStreamUploadCache_AppendHonorsCallerOffset(t *testing.T) {
 	}
 	if want := off + int64(len(data)); size != want {
 		t.Fatalf("Size=%d, want %d (caller offset not honoured — Append may be re-probing)", size, want)
+	}
+}
+
+// A failed config-drift reconcile (UpdateStream) must stay non-fatal and
+// emit a structured warning carrying the stream name. Storage-type changes
+// are rejected by JetStream, which makes a deterministic reconcile failure.
+func TestNATSStreamUploadCache_UpdateStreamFailureLogsWarning(t *testing.T) {
+	js := embeddedNATS(t)
+	if _, err := newNATSStreamUploadCache(js, defaultNATSCacheOpts(), nopCacheLogger()); err != nil {
+		t.Fatalf("initial create: %v", err)
+	}
+
+	opts := defaultNATSCacheOpts()
+	opts.Storage = "memory" // file → memory: JetStream refuses the update
+
+	var buf bytes.Buffer
+	logger := zerolog.New(&buf)
+	cache, err := newNATSStreamUploadCache(js, opts, &logger)
+	if err != nil {
+		t.Fatalf("UpdateStream failure must be non-fatal, got: %v", err)
+	}
+	if cache == nil {
+		t.Fatal("expected a usable cache despite the reconcile failure")
+	}
+
+	out := buf.String()
+	if !strings.Contains(out, "UpdateStream config reconcile failed") {
+		t.Fatalf("expected the reconcile warning in log output, got: %q", out)
+	}
+	if !strings.Contains(out, opts.StreamName) {
+		t.Fatalf("expected the stream name %q as a log field, got: %q", opts.StreamName, out)
+	}
+	if !strings.Contains(out, `"level":"warn"`) {
+		t.Fatalf("expected warn level, got: %q", out)
 	}
 }

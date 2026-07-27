@@ -47,6 +47,15 @@ var (
 		Help: "Effective MaxCASRetries bound per kvfs instance (labeled by bucket prefix)",
 	}, []string{"prefix"})
 
+	// MaxDeleteDepthGauge exports the effective recursive-delete depth
+	// bound per kvfs instance — same dead-config seam as
+	// MaxCASRetriesGauge: a scraped value diverging from the deployment
+	// setting means the env var is not reaching the driver.
+	MaxDeleteDepthGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "kvfs_max_delete_depth",
+		Help: "Effective MaxDeleteDepth bound per kvfs instance (labeled by bucket prefix)",
+	}, []string{"prefix"})
+
 	// KVOperationDuration observes the duration of NATS KV operations.
 	KVOperationDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "kvfs_kv_operation_duration_seconds",

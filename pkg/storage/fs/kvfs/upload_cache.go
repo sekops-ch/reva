@@ -16,7 +16,6 @@
 package kvfs
 
 import (
-	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -27,6 +26,7 @@ import (
 
 	"github.com/nats-io/nats.go"
 	"github.com/pkg/errors"
+	"github.com/rs/zerolog"
 )
 
 // UploadCache is the staging backend for TUS upload bodies. Implementations
@@ -200,7 +200,11 @@ type natsStreamUploadCache struct {
 // newNATSStreamUploadCache binds (or creates) the stream and returns a cache.
 // Caller owns the JetStream context — we share it with KVStore via
 // KVStore.JetStream() and never close it ourselves.
-func newNATSStreamUploadCache(js nats.JetStreamContext, opts natsStreamUploadCacheOptions) (*natsStreamUploadCache, error) {
+func newNATSStreamUploadCache(js nats.JetStreamContext, opts natsStreamUploadCacheOptions, log *zerolog.Logger) (*natsStreamUploadCache, error) {
+	if log == nil {
+		l := zerolog.Nop()
+		log = &l
+	}
 	if opts.StreamName == "" {
 		return nil, errors.New("natsStreamUploadCache: stream name required")
 	}
@@ -247,7 +251,8 @@ func newNATSStreamUploadCache(js nats.JetStreamContext, opts natsStreamUploadCac
 		if _, err := js.UpdateStream(cfg); err != nil {
 			// Non-fatal — config-drift updates are best-effort. Log and
 			// continue; the existing stream still works.
-			fmt.Printf("natsStreamUploadCache: WARN — UpdateStream %q: %v\n", opts.StreamName, err)
+			log.Warn().Err(err).Str("stream", opts.StreamName).
+				Msg("natsStreamUploadCache: UpdateStream config reconcile failed; continuing with existing stream config")
 		}
 	}
 

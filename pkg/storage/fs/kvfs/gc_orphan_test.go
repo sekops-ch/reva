@@ -265,7 +265,9 @@ func TestGCRun_IdentityReapingEndToEnd(t *testing.T) {
 	d.gc.reapSpace = func(ctx context.Context, spaceID, rootID string) error {
 		cctx, cancel := d.commitPhase(ctx)
 		defer cancel()
-		d.deleteSpaceContents(cctx, spaceID, rootID)
+		if err := d.deleteSpaceContents(cctx, spaceID, rootID); err != nil {
+			return err
+		}
 		return d.store.DeleteSpace(spaceID)
 	}
 	d.gc.resolver = &mockUserResolver{live: map[string]bool{"alice": true, "ghost": false, "gp": false}}

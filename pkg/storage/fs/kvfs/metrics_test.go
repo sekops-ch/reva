@@ -75,6 +75,7 @@ func TestMetricsRegistration(t *testing.T) {
 		"kvfs_blob_operation_duration_seconds",
 		"kvfs_upload_in_flight",
 		"kvfs_max_cas_retries",
+		"kvfs_max_delete_depth",
 		"kvfs_tree_size_drift_total",
 		"kvfs_gc_children_reconciled_total",
 		"kvfs_gc_trash_reconciled_total",
@@ -90,6 +91,7 @@ func TestMetricsRegistration(t *testing.T) {
 	BlobOperationDuration.WithLabelValues("upload")
 	UploadInFlight.WithLabelValues("simple")
 	MaxCASRetriesGauge.WithLabelValues("oc")
+	MaxDeleteDepthGauge.WithLabelValues("oc")
 	TreeSizeDrift.Inc()
 	GCChildrenReconciled.Inc()
 	GCTrashReconciled.Inc()
@@ -309,6 +311,7 @@ func TestMetricDescriptions(t *testing.T) {
 		{"kvfs_blob_operation_duration_seconds", "Duration of S3 blob operations in seconds"},
 		{"kvfs_upload_in_flight", "Number of uploads currently in progress (per-pod lifetime counter; may drift — see kvfs_oldest_upload_age_seconds)"},
 		{"kvfs_max_cas_retries", "Effective MaxCASRetries bound per kvfs instance (labeled by bucket prefix)"},
+		{"kvfs_max_delete_depth", "Effective MaxDeleteDepth bound per kvfs instance (labeled by bucket prefix)"},
 		{"kvfs_tree_size_drift_total", "Total number of ancestor CAS failures during tree-size propagation"},
 		{"kvfs_gc_children_reconciled_total", "Total number of stale oc-children entries removed by the GC reconciler"},
 		{"kvfs_gc_trash_reconciled_total", "Total number of stale oc-trash entries removed by the GC consistency sweep"},
@@ -367,6 +370,7 @@ func TestMetricTypes(t *testing.T) {
 	gaugeMetrics := []string{
 		"kvfs_upload_in_flight",
 		"kvfs_max_cas_retries",
+		"kvfs_max_delete_depth",
 	}
 	for _, name := range gaugeMetrics {
 		mf, ok := metrics[name]
@@ -391,6 +395,20 @@ func TestMaxCASRetriesGauge(t *testing.T) {
 	}
 	if got := getGaugeValue(t, "kvfs_max_cas_retries", map[string]string{"prefix": "sys"}); got != 20 {
 		t.Errorf("kvfs_max_cas_retries{prefix=sys} = %v, want 20", got)
+	}
+}
+
+// TestMaxDeleteDepthGauge mirrors the MaxCASRetries gauge contract: a
+// distinct effective bound per bucket prefix.
+func TestMaxDeleteDepthGauge(t *testing.T) {
+	MaxDeleteDepthGauge.WithLabelValues("oc").Set(100)
+	MaxDeleteDepthGauge.WithLabelValues("sys").Set(80)
+
+	if got := getGaugeValue(t, "kvfs_max_delete_depth", map[string]string{"prefix": "oc"}); got != 100 {
+		t.Errorf("kvfs_max_delete_depth{prefix=oc} = %v, want 100", got)
+	}
+	if got := getGaugeValue(t, "kvfs_max_delete_depth", map[string]string{"prefix": "sys"}); got != 80 {
+		t.Errorf("kvfs_max_delete_depth{prefix=sys} = %v, want 80", got)
 	}
 }
 
