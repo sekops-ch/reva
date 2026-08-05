@@ -18,18 +18,29 @@ package kvfs
 import (
 	"context"
 	"os"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/rs/zerolog"
 )
 
-// gcLockTTL bounds how long one sweep can hold the cluster-wide lock
-// before another pod can steal it. Long enough to cover a real sweep on
-// a bucket the size of `oc-uploads`; not so long that a sweep stalled by
-// a recently-killed pod blocks everyone for hours. Exposed as a variable
-// so unit tests can override; production code never writes it.
-var gcLockTTL = 30 * time.Minute
+// gcLeaseTTL is the lifetime written into the cluster-wide `gc-sweep` lock
+// entry. It is a SHORT, heartbeat-renewed lease (see renewLeaseUntilDone), not
+// a whole-sweep bound: a live sweeper keeps pushing the expiry forward every
+// gcLeaseRenewInterval, so the lease only needs to outlive a couple of renew
+// cycles plus NATS/scheduling jitter. A holder that dies mid-sweep stops
+// renewing, so the lease lapses within gcLeaseTTL and a successor can acquire
+// it with NO external lock clearing (previously a flat 30-min TTL that
+// stranded the lock for up to 30 min on a mid-sweep kill). Exposed as a
+// variable so unit tests can override; production code never writes it.
+var gcLeaseTTL = 90 * time.Second
+
+// gcLeaseRenewInterval is how often the live holder renews the sweep lease.
+// ~gcLeaseTTL/3, so two consecutive missed/slow renewals still leave slack
+// before the lease could expire and a successor could steal it.
+var gcLeaseRenewInterval = 30 * time.Second
 
 // GCResult holds the outcome of a single GC run.
 type GCResult struct {
@@ -67,6 +78,20 @@ type blobGC struct {
 	stopCh   chan struct{}
 	holderID string
 
+	// baseCtx is the sweep root context. It defaults to context.Background()
+	// and is replaced by the driver with a context it cancels on Shutdown, so a
+	// graceful SIGTERM cancels an in-flight sweep and the lock is released
+	// immediately (the SIGTERM fast-path) instead of waiting for
+	// the lease to lapse. loop() and runInitialSweepWithRetry() derive Run's
+	// context from it; tests that call Run(ctx) directly bypass it.
+	baseCtx context.Context
+
+	// firstSweepDone is flipped true by the first sweep that runs identity
+	// reaping. It gates the bounded resolver warm-up retry (see resolveLiveness)
+	// to the once-per-restart start sweep, which fires before the pod's own
+	// gateway can answer lookups.
+	firstSweepDone atomic.Bool
+
 	// resolver answers which space owners are still live users. Nil disables
 	// identity reaping (e.g. the storage-system instance, which has no
 	// personal spaces); the residue sweep still runs. See resolver.go.
@@ -93,6 +118,7 @@ func newBlobGC(store MetadataStore, blob BlobStore, opts *Options, log *zerolog.
 		log:      log,
 		stopCh:   make(chan struct{}),
 		holderID: host,
+		baseCtx:  context.Background(),
 	}
 }
 
@@ -107,30 +133,36 @@ func (gc *blobGC) Start() {
 
 // initialSweepRetryInterval is how long the initial sweep waits between
 // attempts when the gc-sweep lock is held by another (possibly recently-
-// killed) pod. Smaller than gcLockTTL so a stale lock from a killed pod
-// can be reclaimed within minutes rather than the full sweep interval.
-// Exposed as a variable so unit tests can override without polluting
-// production behaviour.
-var initialSweepRetryInterval = 5 * time.Minute
+// killed) pod. Decoupled from gcLeaseTTL and kept below it, so once a killed
+// holder's short lease lapses the successor reclaims it on the next retry —
+// worst case ~gcLeaseTTL + this interval (well within the ≤5-min
+// acceptance). Exposed as a variable so unit tests can override.
+var initialSweepRetryInterval = 60 * time.Second
+
+// initialSweepRetryBudget caps how long runInitialSweepWithRetry keeps trying
+// before deferring to the interval ticker, so the goroutine cannot leak on a
+// genuinely contested lock. Independent of the (now short) lease TTL; long
+// enough that two pods repeatedly contending still both get a fair shot.
+var initialSweepRetryBudget = 30 * time.Minute
 
 // runInitialSweepWithRetry executes the initial GC sweep, retrying with
 // a bounded backoff if another pod currently holds the sweep lock. Without
 // the retry, a stale lock left behind by a recently-killed pod would block
 // the initial sweep, and the next attempt would not happen until
 // GCIntervalDuration() (typically 24 h) later. Retries are capped at
-// 2 × gcLockTTL so this goroutine cannot leak indefinitely on a
+// initialSweepRetryBudget so this goroutine cannot leak indefinitely on a
 // genuinely contested lock.
 func (gc *blobGC) runInitialSweepWithRetry() {
 	gc.log.Info().Msg("gc: running initial sweep on start")
-	deadline := time.Now().Add(2 * gcLockTTL)
+	deadline := time.Now().Add(initialSweepRetryBudget)
 	for {
-		result := gc.Run(context.Background())
+		result := gc.Run(gc.baseCtx)
 		if result.Duration > 0 {
 			return // sweep actually ran (lock acquired, sweep completed)
 		}
 		if time.Now().After(deadline) {
 			gc.log.Warn().
-				Dur("waited", 2*gcLockTTL).
+				Dur("waited", initialSweepRetryBudget).
 				Msg("gc: initial sweep retry deadline exceeded; deferring to the interval ticker")
 			return
 		}
@@ -164,14 +196,14 @@ func (gc *blobGC) loop() {
 			gc.log.Info().Msg("gc: background loop stopped")
 			return
 		case <-ticker.C:
-			gc.Run(context.Background())
+			gc.Run(gc.baseCtx)
 		}
 	}
 }
 
 // Run executes a single GC sweep. Safe to call from tests directly.
 func (gc *blobGC) Run(ctx context.Context) GCResult {
-	acquired, err := gc.store.TryAcquireLock("gc-sweep", gc.holderID, gcLockTTL)
+	acquired, err := gc.store.TryAcquireLock("gc-sweep", gc.holderID, gcLeaseTTL)
 	if err != nil {
 		gc.log.Warn().Err(err).Msg("gc: failed to acquire sweep lock")
 		return GCResult{}
@@ -180,7 +212,30 @@ func (gc *blobGC) Run(ctx context.Context) GCResult {
 		gc.log.Info().Msg("gc: another pod holds the sweep lock, skipping this cycle")
 		return GCResult{}
 	}
+
+	// Sweep lease: hold a SHORT lock renewed by a heartbeat while we work.
+	// The defers below run LIFO, so on any return path they execute as:
+	//   sweepCancel() → stop the heartbeat and FENCE the destructive loops
+	//   hbWG.Wait()   → join the heartbeat goroutine (no leak, no late renew)
+	//   ReleaseLock() → free the lock (holder-checked no-op if it was stolen)
+	// hbWG.Wait is registered before the goroutine is spawned, so every
+	// early-return path below still joins the heartbeat. The heartbeat fences
+	// (cancels sweepCtx) the moment it can no longer prove we hold the lease,
+	// so a successor that legitimately steals an expired lease can never run
+	// its destructive deletes concurrently with ours. Reassigning ctx to the
+	// cancellable child makes every ctx-aware op below honour the fence; the
+	// per-item boundary checks cover the KV deletes that take no context.
 	defer gc.store.ReleaseLock("gc-sweep", gc.holderID)
+	var hbWG sync.WaitGroup
+	defer hbWG.Wait()
+	sweepCtx, sweepCancel := context.WithCancel(ctx)
+	defer sweepCancel()
+	hbWG.Add(1)
+	go func() {
+		defer hbWG.Done()
+		gc.renewLeaseUntilDone(sweepCtx, sweepCancel)
+	}()
+	ctx = sweepCtx
 
 	start := time.Now()
 	result := GCResult{}
@@ -250,6 +305,9 @@ func (gc *blobGC) Run(ctx context.Context) GCResult {
 	gc.reconcileResidue(ctx, liveSpaceIDs, uploads, cutoff, &result)
 
 	for _, space := range spaces {
+		if ctx.Err() != nil {
+			break // sweep lease lost — stop before touching another space
+		}
 		refs, err := gc.buildSpaceReferenceSet(space.ID, uploads)
 		if err != nil {
 			gc.log.Error().Err(err).Str("space_id", space.ID).Msg("gc: failed to build reference set for space, skipping")
@@ -269,6 +327,9 @@ func (gc *blobGC) Run(ctx context.Context) GCResult {
 		}
 
 		for _, blob := range blobs {
+			if ctx.Err() != nil {
+				break // sweep lease lost mid-space — stop deleting immediately
+			}
 			result.BlobsScanned++
 			GCBlobsScanned.Inc()
 
@@ -318,7 +379,8 @@ func (gc *blobGC) Run(ctx context.Context) GCResult {
 	// marker per key; uploads churn orders of magnitude faster than any
 	// other bucket, so without compaction the markers come to dominate
 	// every WatchAll-based uploads listing (sampler, GC, per-space scans).
-	if !gc.opts.GCDryRun {
+	// Skip on a fenced (lease-lost) sweep — the successor will compact.
+	if !gc.opts.GCDryRun && ctx.Err() == nil {
 		if err := gc.store.PurgeDeletedUploads(); err != nil {
 			gc.log.Warn().Err(err).Msg("gc: failed to purge upload tombstones")
 			GCErrors.Inc()
@@ -347,6 +409,58 @@ func (gc *blobGC) Run(ctx context.Context) GCResult {
 	return result
 }
 
+// renewLeaseUntilDone is the sweep-lease heartbeat. While the sweep runs it
+// renews the SHORT gc-sweep lease every gcLeaseRenewInterval, so a live holder
+// keeps the lock while a holder that dies simply stops renewing and lets the
+// lease lapse within gcLeaseTTL. It FENCES the sweep — cancel() — the moment it
+// can no longer prove we still hold the lease, so a successor that legitimately
+// steals an expired lease never runs its destructive deletes concurrently with
+// ours (the regression guard: no two live sweepers). It fences when either:
+//   - RenewLock reports the lease definitively lost (stolen / released / gone), or
+//   - no successful renewal for (gcLeaseTTL - gcLeaseRenewInterval): NATS has
+//     been unreachable long enough that the lease may have expired and been
+//     stolen. A pod that cannot talk to NATS cannot know it still holds the
+//     lease, so it must stop deleting.
+//
+// It returns when the sweep context is done (sweep finished, or already fenced
+// — the second cancel from Run's defer is a harmless no-op).
+func (gc *blobGC) renewLeaseUntilDone(ctx context.Context, cancel context.CancelFunc) {
+	ticker := time.NewTicker(gcLeaseRenewInterval)
+	defer ticker.Stop()
+
+	lastRenewOK := time.Now()
+	fenceAfter := gcLeaseTTL - gcLeaseRenewInterval
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			ok, err := gc.store.RenewLock("gc-sweep", gc.holderID, gcLeaseTTL)
+			switch {
+			case err == nil && ok:
+				lastRenewOK = time.Now()
+			case err == nil && !ok:
+				gc.log.Warn().Str("holder", gc.holderID).
+					Msg("gc: sweep lease lost; fencing sweep to prevent a concurrent sweeper")
+				cancel()
+				return
+			default:
+				// Transient store error: ownership momentarily unknown. Fence
+				// only once we can no longer prove the lease is still ours.
+				if time.Since(lastRenewOK) >= fenceAfter {
+					gc.log.Warn().Err(err).Str("holder", gc.holderID).
+						Dur("since_last_renew", time.Since(lastRenewOK)).
+						Msg("gc: sweep lease renewal doubtful past safety margin; fencing sweep")
+					cancel()
+					return
+				}
+				gc.log.Debug().Err(err).Msg("gc: sweep lease renewal failed (transient); will retry")
+			}
+		}
+	}
+}
+
 // reapIdentityOrphans deletes spaces whose owner is no longer a live user.
 // Personal spaces are reaped through the standard DeleteStorageSpace path
 // (gc.reapSpace); orphaned project/virtual spaces are only SURFACED (logged +
@@ -359,6 +473,13 @@ func (gc *blobGC) Run(ctx context.Context) GCResult {
 // answer (present in the map as false) triggers a reap; an owner absent from
 // the map is "unknown" and is never reaped. This makes it impossible for a
 // degraded identity backend to delete a live user's space.
+//
+// Visibility: per-owner "unknown" answers used to vanish — the whole
+// sweep reported a clean zero. The kvfs_gc_identity_unknown_owners gauge now
+// records how many owners ended the sweep unclassified, and the FIRST sweep
+// after a restart applies a bounded resolver warm-up retry (see resolveLiveness)
+// so the start-sweep race against a not-yet-ready gateway no longer silently
+// skips reaping until the next 24 h cycle.
 func (gc *blobGC) reapIdentityOrphans(ctx context.Context, spaces []*SpaceEntry, result *GCResult) {
 	if gc.resolver == nil {
 		return // identity reaping disabled for this instance
@@ -377,15 +498,43 @@ func (gc *blobGC) reapIdentityOrphans(ctx context.Context, spaces []*SpaceEntry,
 		owners = append(owners, sp.Owner)
 	}
 
-	liveness, err := gc.resolver.ResolveLiveness(ctx, owners)
+	// Warm-up applies to the once-per-restart start sweep only.
+	firstSweep := !gc.firstSweepDone.Swap(true)
+	liveness, err := gc.resolveLiveness(ctx, owners, firstSweep)
 	if err != nil {
-		gc.log.Warn().Err(err).Msg("gc: identity reaping skipped (resolver unavailable) — no spaces reaped this cycle")
+		// Whole-lookup failure: skip reaping (unchanged safety) but make the
+		// degradation visible — every owner is unknown this sweep.
+		gc.log.Warn().Err(err).Int("unknown_owners", len(owners)).
+			Msg("gc: identity reaping skipped (resolver unavailable) — no spaces reaped this cycle")
 		GCIdentityReapingSkipped.Inc()
+		GCIdentityUnknownOwners.Set(float64(len(owners)))
 		return
+	}
+
+	// Count owners the resolver could not classify (present in owners, absent
+	// from the liveness map): transient per-owner RPC errors / ambiguous
+	// statuses. They are never reaped; surfacing the count is the visibility fix.
+	unknown := 0
+	for _, o := range owners {
+		if _, determined := liveness[o]; !determined {
+			unknown++
+		}
+	}
+	GCIdentityUnknownOwners.Set(float64(unknown))
+	if unknown > 0 {
+		gc.log.Warn().Int("unknown_owners", unknown).Int("total_owners", len(owners)).
+			Msg("gc: some space owners could not be resolved this sweep; their spaces were NOT reaped (identity backend degraded?)")
 	}
 
 	projectOrphans := 0
 	for _, sp := range spaces {
+		if ctx.Err() != nil {
+			// Sweep lease lost mid-reap: stop before touching more spaces. The
+			// in-flight reapSpace (detached commit ctx) cannot be interrupted,
+			// but re-reaping a dead-owner space is idempotent, so a successor
+			// finishing the same space is a no-op.
+			return
+		}
 		live, determined := liveness[sp.Owner]
 		if !determined || live {
 			// Unknown owner (never reap) or live owner (keep).
@@ -438,6 +587,66 @@ func (gc *blobGC) reapIdentityOrphans(ctx context.Context, spaces []*SpaceEntry,
 	GCOrphanProjectSpaces.Set(float64(projectOrphans))
 }
 
+// gcResolverWarmupAttempts / gcResolverWarmupInterval bound the FIRST-sweep
+// warm-up retry of the identity resolver (see resolveLiveness): up to ~1 min
+// total. Exposed as variables so unit tests can shrink them.
+var gcResolverWarmupAttempts = 6
+var gcResolverWarmupInterval = 10 * time.Second
+
+// resolveLiveness calls the user resolver, optionally applying a bounded
+// warm-up retry on the process's FIRST sweep. It retries while the lookup
+// errors or leaves some owners unclassified, up to gcResolverWarmupAttempts,
+// pausing gcResolverWarmupInterval between tries (honouring ctx cancellation).
+//
+// This is a RESOLVER-RPC retry (gateway / GetUser), explicitly NOT a
+// KV-consistency retry — the standing kvfs guard forbids driver-side retries
+// against NATS KV, never against the identity backend. Retrying is safe: a
+// genuinely dead user returns a *determined* false (present in the map), never
+// "unknown"; only transient backend failures leave an owner absent, so a retry
+// can only turn unknowns into determined answers, never flip a live user to dead.
+func (gc *blobGC) resolveLiveness(ctx context.Context, owners []string, warmup bool) (map[string]bool, error) {
+	attempts := 1
+	if warmup {
+		attempts = gcResolverWarmupAttempts
+	}
+
+	var (
+		liveness map[string]bool
+		err      error
+	)
+	for attempt := 0; attempt < attempts; attempt++ {
+		liveness, err = gc.resolver.ResolveLiveness(ctx, owners)
+		if err == nil && allOwnersClassified(owners, liveness) {
+			return liveness, nil
+		}
+		if attempt == attempts-1 {
+			break
+		}
+		if warmup {
+			gc.log.Info().Int("attempt", attempt+1).Int("of", attempts).
+				Msg("gc: identity resolver warming up; retrying owner liveness lookup")
+		}
+		select {
+		case <-ctx.Done():
+			return liveness, err
+		case <-time.After(gcResolverWarmupInterval):
+		}
+	}
+	return liveness, err
+}
+
+// allOwnersClassified reports whether every requested owner has a determined
+// liveness answer (present in the map). An empty owner list is trivially
+// classified.
+func allOwnersClassified(owners []string, liveness map[string]bool) bool {
+	for _, o := range owners {
+		if _, ok := liveness[o]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
 // reconcileResidue reaps data whose owning space no longer exists in
 // oc-spaces. This covers crash-mid-DeleteStorageSpace and best-effort delete
 // failures (deleteSpaceContents discards per-item errors), plus anything the
@@ -476,6 +685,9 @@ func (gc *blobGC) reconcileResidue(ctx context.Context, liveSpaceIDs map[string]
 	}
 
 	for sid := range ghosts {
+		if ctx.Err() != nil {
+			return // sweep lease lost — stop before reaping another ghost space
+		}
 		gc.reapGhostSpace(ctx, sid, cutoff, result)
 	}
 }
@@ -487,6 +699,9 @@ func (gc *blobGC) reconcileResidue(ctx context.Context, liveSpaceIDs map[string]
 // missing space entry means the space was deleted, not mid-provision; the S3
 // blob delete still honours the age cutoff as a second belt.
 func (gc *blobGC) reapGhostSpace(ctx context.Context, spaceID string, cutoff time.Time, result *GCResult) {
+	if ctx.Err() != nil {
+		return // sweep lease lost — do not begin reaping this ghost space
+	}
 	dryRun := gc.opts.GCDryRun
 
 	delKey := func() {
@@ -501,6 +716,9 @@ func (gc *blobGC) reapGhostSpace(ctx context.Context, spaceID string, cutoff tim
 
 	if nodes, err := gc.store.ListNodesBySpace(spaceID); err == nil {
 		for _, n := range nodes {
+			if ctx.Err() != nil {
+				return // fenced mid-ghost — stop deleting KV entries
+			}
 			if !dryRun {
 				gc.store.DeleteNode(n.SpaceID, n.ID)
 				if n.Type == NodeTypeDir {
@@ -514,6 +732,9 @@ func (gc *blobGC) reapGhostSpace(ctx context.Context, spaceID string, cutoff tim
 	}
 	if versions, err := gc.store.ListVersionsBySpace(spaceID); err == nil {
 		for _, v := range versions {
+			if ctx.Err() != nil {
+				return
+			}
 			if !dryRun {
 				gc.store.DeleteVersion(v.SpaceID, v.NodeID, v.Key)
 			}
@@ -524,6 +745,9 @@ func (gc *blobGC) reapGhostSpace(ctx context.Context, spaceID string, cutoff tim
 	}
 	if trash, err := gc.store.ListTrash(spaceID); err == nil {
 		for _, t := range trash {
+			if ctx.Err() != nil {
+				return
+			}
 			if !dryRun {
 				gc.store.DeleteTrash(t.SpaceID, t.Key)
 			}
@@ -534,6 +758,9 @@ func (gc *blobGC) reapGhostSpace(ctx context.Context, spaceID string, cutoff tim
 	}
 	if ups, err := gc.store.ListUploadsBySpace(spaceID); err == nil {
 		for _, u := range ups {
+			if ctx.Err() != nil {
+				return
+			}
 			if !dryRun {
 				if u.S3MultipartID != "" {
 					gc.blob.AbortMultipartUpload(ctx, BlobKey(u.SpaceID, u.BlobID), u.S3MultipartID)
@@ -557,6 +784,9 @@ func (gc *blobGC) reapGhostSpace(ctx context.Context, spaceID string, cutoff tim
 		return
 	}
 	for _, b := range blobs {
+		if ctx.Err() != nil {
+			return // fenced mid-ghost — stop deleting blobs
+		}
 		if !b.LastModified.IsZero() && b.LastModified.After(cutoff) {
 			continue // too young — never reap an in-flight provision
 		}
@@ -822,6 +1052,9 @@ func (gc *blobGC) cleanExpiredUploads(ctx context.Context, entries []*UploadEntr
 	ttlCutoff := now.Add(-uploadSessionTTL)
 
 	for _, e := range entries {
+		if ctx.Err() != nil {
+			return // sweep lease lost — stop reaping upload sessions
+		}
 		var reason string
 		switch {
 		case e.Session != nil && e.Session.Expires > 0 && e.Session.Expires < nowUnix:

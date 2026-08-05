@@ -50,6 +50,10 @@ type mockBlobStore struct {
 	abortCalled    []string
 	completeCalled []string
 	deleteCalled   []string
+
+	// deleteHook, if set, is invoked (outside the mutex) after each successful
+	// Delete. Lease-fencing tests use it to cancel the sweep mid-delete.
+	deleteHook func(key string)
 }
 
 func newMockBlobStore() *mockBlobStore {
@@ -82,9 +86,13 @@ func (m *mockBlobStore) Download(ctx context.Context, key string) (io.ReadCloser
 
 func (m *mockBlobStore) Delete(ctx context.Context, key string) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	delete(m.blobs, key)
 	m.deleteCalled = append(m.deleteCalled, key)
+	hook := m.deleteHook
+	m.mu.Unlock()
+	if hook != nil {
+		hook(key)
+	}
 	return nil
 }
 
@@ -204,6 +212,12 @@ type mockMetadataStore struct {
 	putChildrenErr    error
 	casFailsLeft      int
 	childCASFailsLeft int
+
+	// Lease-renewal test hooks. renewLostFor makes RenewLock report the
+	// lease definitively lost for a holder (simulating a concurrent steal);
+	// renewErrFor makes it return a transient error (ownership unknown).
+	renewLostFor map[string]bool
+	renewErrFor  map[string]bool
 
 	// uploadCreated optionally overrides the KV created-timestamp per
 	// session ID for ListAllUploadEntries; unset IDs default to now so
@@ -657,6 +671,24 @@ func (m *mockMetadataStore) TryAcquireLock(key string, holder string, ttl time.D
 	return true, nil
 }
 
+func (m *mockMetadataStore) RenewLock(key string, holder string, ttl time.Duration) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.renewErrFor[holder] {
+		return false, fmt.Errorf("mock: transient renew error for %s", holder)
+	}
+	existing, ok := m.locks[key]
+	if !ok {
+		return false, nil // lock gone — lost
+	}
+	if existing.Holder != holder || m.renewLostFor[holder] {
+		return false, nil // stolen / not ours — lost
+	}
+	existing.ExpiresAt = time.Now().Add(ttl).UnixNano()
+	return true, nil
+}
+
 func (m *mockMetadataStore) ReleaseLock(key string, holder string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -665,6 +697,45 @@ func (m *mockMetadataStore) ReleaseLock(key string, holder string) error {
 		delete(m.locks, key)
 	}
 	return nil
+}
+
+// --- lease-test helpers ---
+
+// setLock pre-inserts a lock entry held by holder for ttl from now.
+func (m *mockMetadataStore) setLock(key, holder string, ttl time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.locks[key] = &kvLockEntry{Holder: holder, ExpiresAt: time.Now().Add(ttl).UnixNano()}
+}
+
+// expireLock back-dates a lock's expiry so a successor can steal it, simulating
+// a holder that stopped renewing (died mid-sweep).
+func (m *mockMetadataStore) expireLock(key string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if e, ok := m.locks[key]; ok {
+		e.ExpiresAt = time.Now().Add(-time.Second).UnixNano()
+	}
+}
+
+// failRenewFor makes RenewLock report the lease definitively lost for holder.
+func (m *mockMetadataStore) failRenewFor(holder string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.renewLostFor == nil {
+		m.renewLostFor = map[string]bool{}
+	}
+	m.renewLostFor[holder] = true
+}
+
+// failRenewErrFor makes RenewLock return a transient error for holder.
+func (m *mockMetadataStore) failRenewErrFor(holder string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.renewErrFor == nil {
+		m.renewErrFor = map[string]bool{}
+	}
+	m.renewErrFor[holder] = true
 }
 
 // --- Test helpers ---

@@ -1024,17 +1024,41 @@ func TestReconcileTrash_DryRunDoesNotMutate(t *testing.T) {
 
 // --- runInitialSweepWithRetry tests ---
 
-// withShortGCTimings shrinks the GC retry/lock timings for the duration
-// of one unit test so the retry path is exercisable in seconds rather
-// than the production 30+5 min budget. Restores defaults on cleanup.
+// withShortGCTimings shrinks the GC retry/lease timings for the duration
+// of one unit test so the retry path is exercisable in milliseconds rather
+// than the production budget. The retry budget tracks 2×ttl (the old
+// "2 × lock TTL" deadline the retry tests rely on) and the lease renew
+// interval tracks ttl/3. Restores defaults on cleanup.
 func withShortGCTimings(t *testing.T, ttl, retry time.Duration) {
-	prevTTL := gcLockTTL
+	prevTTL := gcLeaseTTL
+	prevRenew := gcLeaseRenewInterval
 	prevRetry := initialSweepRetryInterval
-	gcLockTTL = ttl
+	prevBudget := initialSweepRetryBudget
+	gcLeaseTTL = ttl
+	gcLeaseRenewInterval = ttl / 3
+	if gcLeaseRenewInterval <= 0 {
+		gcLeaseRenewInterval = time.Millisecond
+	}
 	initialSweepRetryInterval = retry
+	initialSweepRetryBudget = 2 * ttl
 	t.Cleanup(func() {
-		gcLockTTL = prevTTL
+		gcLeaseTTL = prevTTL
+		gcLeaseRenewInterval = prevRenew
 		initialSweepRetryInterval = prevRetry
+		initialSweepRetryBudget = prevBudget
+	})
+}
+
+// withShortGCLease overrides just the sweep-lease TTL and renew interval, for
+// the lease/heartbeat/fencing tests that need fine control over both.
+func withShortGCLease(t *testing.T, ttl, renew time.Duration) {
+	prevTTL := gcLeaseTTL
+	prevRenew := gcLeaseRenewInterval
+	gcLeaseTTL = ttl
+	gcLeaseRenewInterval = renew
+	t.Cleanup(func() {
+		gcLeaseTTL = prevTTL
+		gcLeaseRenewInterval = prevRenew
 	})
 }
 

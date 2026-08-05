@@ -33,14 +33,31 @@ type mockUserResolver struct {
 	serviceAccountIDs map[string]bool // service account IDs always treated as alive
 	err               error
 	seen              []string // owner IDs the GC asked about (for assertions)
+
+	// Warm-up simulation: the first failFirstErr calls return a
+	// whole-lookup error (gateway not ready); the next unknownFirst calls
+	// return an empty map (every owner unknown). Both drain per call, so a
+	// bounded warm-up retry eventually reaches the healthy answer below.
+	failFirstErr int
+	unknownFirst int
+	calls        int
 }
 
 func (m *mockUserResolver) ResolveLiveness(ctx context.Context, ownerIDs []string) (map[string]bool, error) {
 	m.seen = append(m.seen, ownerIDs...)
+	m.calls++
 	if m.err != nil {
 		return nil, m.err
 	}
+	if m.failFirstErr > 0 {
+		m.failFirstErr--
+		return nil, errors.New("mock: gateway not ready (warm-up)")
+	}
 	out := make(map[string]bool, len(ownerIDs))
+	if m.unknownFirst > 0 {
+		m.unknownFirst--
+		return out, nil // every owner unknown this attempt
+	}
 	for _, id := range ownerIDs {
 		if m.serviceAccountIDs[id] {
 			out[id] = true
@@ -450,5 +467,193 @@ func TestGCReapIdentityOrphans_ServiceAccountSpaceNeverReaped(t *testing.T) {
 	}
 	if result.OrphanPersonalSpacesDeleted != 1 {
 		t.Errorf("OrphanPersonalSpacesDeleted = %d, want 1", result.OrphanPersonalSpacesDeleted)
+	}
+}
+
+// --- identity-reaping visibility ---
+
+// TestGCIdentityUnknownOwnersGauge — per-owner "unknown" answers (owners absent
+// from the resolver map) are counted on kvfs_gc_identity_unknown_owners so a
+// resolver-degraded sweep is distinguishable from a clean one.
+func TestGCIdentityUnknownOwnersGauge(t *testing.T) {
+	store := newMockMetadataStore()
+	blob := newMockBlobStore()
+	gc := testGC(store, blob, false)
+	gc.resolver = &mockUserResolver{live: map[string]bool{
+		"alice": true,
+		"ghost": false,
+		// "maybe" and "later" absent -> unknown (2)
+	}}
+	gc.reapSpace = recordingReaper(store, new([]string))
+
+	spaces := []*SpaceEntry{
+		{ID: "s1", Type: "personal", Owner: "alice", RootID: "r1"},
+		{ID: "s2", Type: "personal", Owner: "ghost", RootID: "r2"},
+		{ID: "s3", Type: "personal", Owner: "maybe", RootID: "r3"},
+		{ID: "s4", Type: "personal", Owner: "later", RootID: "r4"},
+	}
+
+	var result GCResult
+	gc.reapIdentityOrphans(context.Background(), spaces, &result)
+
+	if v := getGaugeValue(t, "kvfs_gc_identity_unknown_owners", nil); v != 2 {
+		t.Errorf("kvfs_gc_identity_unknown_owners = %v, want 2", v)
+	}
+}
+
+// TestGCIdentityUnknownOwnersGauge_ZeroWhenClean — a sweep that classifies every
+// owner resets the gauge to 0 (correct healthy value; the >0 alert reads it right).
+func TestGCIdentityUnknownOwnersGauge_ZeroWhenClean(t *testing.T) {
+	store := newMockMetadataStore()
+	blob := newMockBlobStore()
+	gc := testGC(store, blob, false)
+	gc.resolver = &mockUserResolver{live: map[string]bool{"alice": true, "ghost": false}}
+	gc.reapSpace = recordingReaper(store, new([]string))
+
+	spaces := []*SpaceEntry{
+		{ID: "s1", Type: "personal", Owner: "alice", RootID: "r1"},
+		{ID: "s2", Type: "personal", Owner: "ghost", RootID: "r2"},
+	}
+
+	var result GCResult
+	gc.reapIdentityOrphans(context.Background(), spaces, &result)
+
+	if v := getGaugeValue(t, "kvfs_gc_identity_unknown_owners", nil); v != 0 {
+		t.Errorf("kvfs_gc_identity_unknown_owners = %v, want 0 on a clean sweep", v)
+	}
+}
+
+// TestGCIdentityUnknownOwnersGauge_AllOnWholeError — a whole-lookup failure
+// leaves every distinct owner unknown; the gauge reflects that AND the existing
+// skip counter still fires (the two signals coexist).
+func TestGCIdentityUnknownOwnersGauge_AllOnWholeError(t *testing.T) {
+	store := newMockMetadataStore()
+	blob := newMockBlobStore()
+	gc := testGC(store, blob, false)
+	gc.resolver = &mockUserResolver{err: errors.New("gateway down")}
+	gc.reapSpace = recordingReaper(store, new([]string))
+
+	spaces := []*SpaceEntry{
+		{ID: "s1", Type: "personal", Owner: "alice", RootID: "r1"},
+		{ID: "s2", Type: "personal", Owner: "ghost", RootID: "r2"},
+	}
+
+	skippedBefore := getCounterValue(t, "kvfs_gc_identity_reaping_skipped_total", nil)
+	var result GCResult
+	gc.reapIdentityOrphans(context.Background(), spaces, &result)
+
+	if v := getGaugeValue(t, "kvfs_gc_identity_unknown_owners", nil); v != 2 {
+		t.Errorf("kvfs_gc_identity_unknown_owners = %v, want 2 (all owners unknown on whole error)", v)
+	}
+	if d := getCounterValue(t, "kvfs_gc_identity_reaping_skipped_total", nil) - skippedBefore; d != 1 {
+		t.Errorf("identity_reaping_skipped delta = %v, want 1", d)
+	}
+}
+
+// TestGCIdentityWarmupRetrySucceeds — the FIRST sweep retries a not-ready
+// gateway (whole-lookup errors) up to the bound, then reaps once it answers.
+// This is a RESOLVER-RPC retry, not a KV retry. Bite check: with a single
+// attempt (no warm-up) the first error would skip reaping.
+func TestGCIdentityWarmupRetrySucceeds(t *testing.T) {
+	store := newMockMetadataStore()
+	blob := newMockBlobStore()
+	withShortResolverWarmup(t, 5, 2*time.Millisecond)
+	gc := testGC(store, blob, false)
+	gc.resolver = &mockUserResolver{
+		live:         map[string]bool{"ghost": false},
+		failFirstErr: 2, // gateway not ready for the first 2 attempts
+	}
+	var reaped []string
+	gc.reapSpace = recordingReaper(store, &reaped)
+
+	spaces := []*SpaceEntry{{ID: "dead-p", Type: "personal", Owner: "ghost", RootID: "r"}}
+
+	var result GCResult
+	gc.reapIdentityOrphans(context.Background(), spaces, &result) // first sweep
+
+	if len(reaped) != 1 {
+		t.Fatalf("warm-up should retry past the not-ready gateway and reap; reaped=%v", reaped)
+	}
+	if v := getGaugeValue(t, "kvfs_gc_identity_unknown_owners", nil); v != 0 {
+		t.Errorf("unknown_owners after successful warm-up = %v, want 0", v)
+	}
+}
+
+// TestGCIdentityWarmupRetriesUnknowns — warm-up also drains transient per-owner
+// unknowns (empty map), reaching a clean classification within the bound.
+func TestGCIdentityWarmupRetriesUnknowns(t *testing.T) {
+	store := newMockMetadataStore()
+	blob := newMockBlobStore()
+	withShortResolverWarmup(t, 5, 2*time.Millisecond)
+	gc := testGC(store, blob, false)
+	gc.resolver = &mockUserResolver{
+		live:         map[string]bool{"ghost": false},
+		unknownFirst: 2, // first 2 attempts return "all unknown"
+	}
+	var reaped []string
+	gc.reapSpace = recordingReaper(store, &reaped)
+
+	spaces := []*SpaceEntry{{ID: "dead-p", Type: "personal", Owner: "ghost", RootID: "r"}}
+
+	var result GCResult
+	gc.reapIdentityOrphans(context.Background(), spaces, &result)
+
+	if len(reaped) != 1 {
+		t.Fatalf("warm-up should retry past transient unknowns and reap; reaped=%v", reaped)
+	}
+}
+
+// TestGCIdentityWarmupBounded — warm-up gives up after the bound on a
+// persistently-unready gateway (no hang), skipping reaping as before.
+func TestGCIdentityWarmupBounded(t *testing.T) {
+	store := newMockMetadataStore()
+	blob := newMockBlobStore()
+	withShortResolverWarmup(t, 3, 2*time.Millisecond)
+	gc := testGC(store, blob, false)
+	resolver := &mockUserResolver{failFirstErr: 100} // never becomes ready
+	gc.resolver = resolver
+	var reaped []string
+	gc.reapSpace = recordingReaper(store, &reaped)
+
+	spaces := []*SpaceEntry{{ID: "dead-p", Type: "personal", Owner: "ghost", RootID: "r"}}
+
+	skippedBefore := getCounterValue(t, "kvfs_gc_identity_reaping_skipped_total", nil)
+	var result GCResult
+	gc.reapIdentityOrphans(context.Background(), spaces, &result)
+
+	if len(reaped) != 0 {
+		t.Errorf("a persistently unready gateway must reap nothing; reaped=%v", reaped)
+	}
+	if resolver.calls != 3 {
+		t.Errorf("resolver calls = %d, want exactly the warm-up bound (3)", resolver.calls)
+	}
+	if d := getCounterValue(t, "kvfs_gc_identity_reaping_skipped_total", nil) - skippedBefore; d != 1 {
+		t.Errorf("identity_reaping_skipped delta = %v, want 1", d)
+	}
+}
+
+// TestGCIdentityWarmupFirstSweepOnly — warm-up applies only to the first sweep;
+// a subsequent sweep makes a single resolver attempt.
+func TestGCIdentityWarmupFirstSweepOnly(t *testing.T) {
+	store := newMockMetadataStore()
+	blob := newMockBlobStore()
+	withShortResolverWarmup(t, 5, 2*time.Millisecond)
+	gc := testGC(store, blob, false)
+	gc.reapSpace = recordingReaper(store, new([]string))
+	spaces := []*SpaceEntry{{ID: "s1", Type: "personal", Owner: "alice", RootID: "r"}}
+
+	// First sweep consumes the warm-up allowance (resolver healthy, one call).
+	gc.resolver = &mockUserResolver{live: map[string]bool{"alice": true}}
+	var r1 GCResult
+	gc.reapIdentityOrphans(context.Background(), spaces, &r1)
+
+	// Second sweep: resolver would need warm-up but must NOT retry.
+	second := &mockUserResolver{failFirstErr: 100}
+	gc.resolver = second
+	var r2 GCResult
+	gc.reapIdentityOrphans(context.Background(), spaces, &r2)
+
+	if second.calls != 1 {
+		t.Errorf("second sweep resolver calls = %d, want 1 (no warm-up after the first sweep)", second.calls)
 	}
 }

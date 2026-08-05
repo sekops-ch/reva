@@ -106,6 +106,11 @@ type kvfsDriver struct {
 	gc     *blobGC
 	stream events.Stream
 
+	// gcCancel cancels the GC sweep root context on Shutdown, so a graceful
+	// SIGTERM aborts an in-flight sweep and its deferred ReleaseLock frees the
+	// gc-sweep lock immediately instead of waiting for the lease to lapse.
+	gcCancel context.CancelFunc
+
 	// uploadCache stages TUS upload bodies between WriteChunk calls.
 	// Disk-backed by default (decomposedfs-style). See upload_cache.go.
 	uploadCache UploadCache
@@ -302,6 +307,13 @@ func New(m map[string]interface{}, stream events.Stream, log *zerolog.Logger) (s
 	if opts.GCEnabled {
 		d.gc = newBlobGC(store, blob, opts, log)
 
+		// Root the sweep context on a driver-owned cancellable context so a
+		// graceful Shutdown/SIGTERM aborts an in-flight sweep and releases the
+		// gc-sweep lock immediately (the SIGTERM fast-path).
+		gcCtx, gcCancel := context.WithCancel(context.Background())
+		d.gcCancel = gcCancel
+		d.gc.baseCtx = gcCtx
+
 		// Reuse the ONE crash-safe deletion path for GC space reaping:
 		// deleteSpaceContents (detached commit ctx) + DeleteSpace, identical
 		// to DeleteStorageSpace. The GC never re-implements deletion.
@@ -348,6 +360,11 @@ func (d *kvfsDriver) Shutdown(ctx context.Context) error {
 		close(d.eventStop)
 	}
 	if d.gc != nil {
+		// Cancel the sweep context first so an in-flight sweep aborts and its
+		// deferred ReleaseLock frees the gc-sweep lock now, then stop the loop.
+		if d.gcCancel != nil {
+			d.gcCancel()
+		}
 		d.gc.Stop()
 	}
 	d.store.Close()

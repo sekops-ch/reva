@@ -63,6 +63,7 @@ type MetadataStore interface {
 	PurgeDeletedUploads() error
 	ListAllTrash() ([]*TrashEntry, error)
 	TryAcquireLock(key string, holder string, ttl time.Duration) (bool, error)
+	RenewLock(key string, holder string, ttl time.Duration) (bool, error)
 	ReleaseLock(key string, holder string) error
 }
 
@@ -232,6 +233,56 @@ func (s *KVStore) TryAcquireLock(key string, holder string, ttl time.Duration) (
 	_, err = s.locks.Update(key, data, kve.Revision())
 	if err != nil {
 		return false, nil
+	}
+	return true, nil
+}
+
+// RenewLock extends the lease on a lock this holder already owns. It is the
+// heartbeat half of the GC sweep lease (see gc.go): TryAcquireLock takes a
+// SHORT lease and a live holder keeps pushing the expiry forward with RenewLock,
+// so a holder that dies mid-sweep lets the lease lapse in seconds-to-minutes
+// instead of the full TTL — and a successor can acquire without any external
+// lock clearing.
+//
+// Return contract, mirroring the CAS steal in TryAcquireLock so the two
+// serialise to a single winner per revision:
+//   - (true, nil)  → renewed; we still hold the lease.
+//   - (false, nil) → we no longer hold it: the key is gone, a different holder
+//     owns it, or our CAS lost to a concurrent steal (wrong last sequence). The
+//     caller MUST stop acting under the lease (fence).
+//   - (false, err) → a transient store error; ownership is momentarily unknown.
+//     The caller treats sustained transient failure as doubt and fences on a
+//     timer (it cannot prove it still holds the lease).
+//
+// It always Get-then-CAS on the freshly-read revision and never blind-Puts: an
+// unconditional write would clobber a successor that legitimately stole an
+// expired lease.
+func (s *KVStore) RenewLock(key string, holder string, ttl time.Duration) (bool, error) {
+	kve, err := s.locks.Get(key)
+	if err != nil {
+		if err == nats.ErrKeyNotFound {
+			return false, nil // lock gone — we no longer hold it
+		}
+		return false, err
+	}
+
+	var existing kvLockEntry
+	if err := json.Unmarshal(kve.Value(), &existing); err == nil {
+		if existing.Holder != holder {
+			return false, nil // stolen by another holder
+		}
+	}
+
+	entry := kvLockEntry{
+		Holder:    holder,
+		ExpiresAt: time.Now().Add(ttl).UnixNano(),
+	}
+	data, _ := json.Marshal(entry)
+	if _, err := s.locks.Update(key, data, kve.Revision()); err != nil {
+		if err == nats.ErrKeyExists || isWrongLastSequence(err) {
+			return false, nil // a concurrent steal bumped the revision — lease lost
+		}
+		return false, err // transient — ownership unknown, let the caller fence on doubt
 	}
 	return true, nil
 }

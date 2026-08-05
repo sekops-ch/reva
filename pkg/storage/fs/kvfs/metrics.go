@@ -232,6 +232,20 @@ var (
 		Help: "Total number of GC sweeps that skipped identity reaping (resolver error/empty)",
 	})
 
+	// GCIdentityUnknownOwners is the number of distinct space owners whose
+	// liveness could NOT be determined on the most recent sweep that ran
+	// identity reaping (per-owner resolver RPC errors / ambiguous statuses,
+	// or a whole-lookup failure). Such owners are conservatively left un-reaped
+	// ("unknown → never reap"), so a persistently non-zero value means a
+	// degraded identity backend is silently suppressing orphan reaping — the
+	// gap that made per-owner failures invisible before this gauge existed. Set per sweep
+	// (0 on a clean sweep) by the resolver-enabled instance only; the
+	// storage-system instance has a nil resolver and never writes it.
+	GCIdentityUnknownOwners = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "kvfs_gc_identity_unknown_owners",
+		Help: "Distinct space owners whose liveness could not be determined on the last sweep (>0 => degraded identity backend, reaping suppressed)",
+	})
+
 	// GCResidueKeysDeleted counts KV entries (nodes/versions/trash/uploads)
 	// reaped by the internal-consistency sweep because their owning space no
 	// longer exists in oc-spaces (crash-mid-delete / best-effort residue).
