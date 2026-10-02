@@ -27,7 +27,6 @@ import (
 	"io"
 	"net/url"
 	"os"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -349,6 +348,8 @@ func New(m map[string]interface{}, stream events.Stream, log *zerolog.Logger) (s
 			Str("min_age", opts.GCMinAge).
 			Bool("identity_reaping", d.gc.resolver != nil).
 			Msg("blob garbage collection enabled")
+	} else if opts.MaxVersions > 0 {
+		log.Warn().Int("max_versions", opts.MaxVersions).Msg("kvfs: max_versions trims version entries only; enable gc_enabled to reclaim their blobs")
 	}
 
 	return d, nil
@@ -515,6 +516,10 @@ func updateUploadAgeMetrics(prefix string, uploads []*UploadSession) {
 
 // GetMD returns resource info for the referenced resource.
 func (d *kvfsDriver) GetMD(ctx context.Context, ref *provider.Reference, mdKeys, fieldMask []string) (*provider.ResourceInfo, error) {
+	// ocdav stats a version (HEAD/GET …/meta/<id>/v/<key>) by its revision key.
+	if isRevisionRef(ref) {
+		return d.statRevision(ctx, ref)
+	}
 	spaceID, nodeID, node, rp, err := d.resolveAndAuthorize(ctx, ref, func(rp *provider.ResourcePermissions) bool { return rp.Stat })
 	if err != nil {
 		return nil, err
@@ -570,6 +575,10 @@ func (d *kvfsDriver) ListFolder(ctx context.Context, ref *provider.Reference, md
 
 // Download returns a ReadCloser for the blob content of a file.
 func (d *kvfsDriver) Download(ctx context.Context, ref *provider.Reference, openReaderFunc func(*provider.ResourceInfo) bool) (*provider.ResourceInfo, io.ReadCloser, error) {
+	// The spaces dataprovider fetches a version by its revision key.
+	if isRevisionRef(ref) {
+		return d.downloadRevisionRef(ctx, ref, openReaderFunc)
+	}
 	spaceID, _, node, _, err := d.resolveAndAuthorize(ctx, ref, func(rp *provider.ResourcePermissions) bool { return rp.InitiateFileDownload })
 	if err != nil {
 		return nil, nil, err
@@ -1111,6 +1120,7 @@ func (d *kvfsDriver) commitFileNode(ctx context.Context, p commitFileParams) (st
 		// snapshot is taken once (firstTry), on the first attempt only, so a CAS
 		// retry never creates duplicate version entries.
 		firstTry := true
+		snapshotted := false
 		var sizeDelta int64
 		if err := d.casRetryLoop("upload", func() error {
 			existingNode, nodeRev, err := d.store.GetNode(p.SpaceID, existingID)
@@ -1137,7 +1147,7 @@ func (d *kvfsDriver) commitFileNode(ctx context.Context, p commitFileParams) (st
 				if err := d.store.PutVersion(version); err != nil {
 					d.log.Warn().Err(err).Str("node_id", existingID).Msg("failed to create version entry")
 				}
-				d.trimVersions(ctx, p.SpaceID, existingID)
+				snapshotted = true
 			}
 			firstTry = false
 
@@ -1162,6 +1172,10 @@ func (d *kvfsDriver) commitFileNode(ctx context.Context, p commitFileParams) (st
 		// propagateTreeSize updates Size + MTime + ETag on the parent
 		// and every ancestor via propagateOneAncestor.
 		d.propagateTreeSize(ctx, p.SpaceID, p.ParentID, sizeDelta)
+		// Trim only after the new head is committed: a failed overwrite keeps every version.
+		if snapshotted {
+			d.trimVersions(ctx, p.SpaceID, existingID)
+		}
 		return existingID, nil
 	}
 
@@ -1347,166 +1361,6 @@ func (d *kvfsDriver) parseUploadPath(p string) (*provider.Reference, string, str
 		ResourceId: &rid,
 		Path:       utils.MakeRelativePath(filePath),
 	}, ifMatchEtag, tusSibling, nil
-}
-
-// --- Revisions ---
-
-func (d *kvfsDriver) ListRevisions(ctx context.Context, ref *provider.Reference) ([]*provider.FileVersion, error) {
-	spaceID, nodeID, _, _, err := d.resolveAndAuthorize(ctx, ref, func(rp *provider.ResourcePermissions) bool { return rp.ListFileVersions })
-	if err != nil {
-		return nil, err
-	}
-
-	versions, err := d.store.ListVersions(spaceID, nodeID)
-	if err != nil {
-		return nil, err
-	}
-
-	var result []*provider.FileVersion
-	for _, v := range versions {
-		result = append(result, &provider.FileVersion{
-			Key:   v.Key,
-			Size:  uint64(v.Size),
-			Mtime: uint64(v.MTime / int64(time.Second)),
-			Etag:  v.ETag,
-		})
-	}
-	return result, nil
-}
-
-func (d *kvfsDriver) DownloadRevision(ctx context.Context, ref *provider.Reference, key string, openReaderFunc func(*provider.ResourceInfo) bool) (*provider.ResourceInfo, io.ReadCloser, error) {
-	spaceID, nodeID, _, _, err := d.resolveAndAuthorize(ctx, ref, func(rp *provider.ResourcePermissions) bool {
-		return rp.ListFileVersions && rp.InitiateFileDownload
-	})
-	if err != nil {
-		return nil, nil, err
-	}
-
-	version, err := d.store.GetVersion(spaceID, nodeID, key)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	ri := &provider.ResourceInfo{
-		Size:  uint64(version.Size),
-		Etag:  version.ETag,
-		Mtime: &types.Timestamp{Seconds: uint64(version.MTime / int64(time.Second))},
-	}
-
-	if openReaderFunc != nil && !openReaderFunc(ri) {
-		return ri, nil, nil
-	}
-
-	reader, err := d.blob.Download(ctx, BlobKey(spaceID, version.BlobID))
-	if err != nil {
-		return nil, nil, err
-	}
-
-	return ri, reader, nil
-}
-
-func (d *kvfsDriver) RestoreRevision(ctx context.Context, ref *provider.Reference, key string) error {
-	spaceID, nodeID, authNode, _, err := d.resolveAndAuthorize(ctx, ref, func(rp *provider.ResourcePermissions) bool { return rp.RestoreFileVersion })
-	if err != nil {
-		return err
-	}
-	if err := d.checkNodeLock(ctx, authNode); err != nil {
-		return err
-	}
-
-	version, err := d.store.GetVersion(spaceID, nodeID, key)
-	if err != nil {
-		return err
-	}
-
-	node, rev, err := d.store.GetNode(spaceID, nodeID)
-	if err != nil {
-		return err
-	}
-
-	// Detached commit context — PutVersion + trimVersions + PutNode +
-	// propagateTreeSize must complete atomically; partial restoration
-	// leaves a node pointing at the wrong blob or a missing-version
-	// dangling reference. See [kvfsDriver.commitPhase].
-	commitCtx, cancel := d.commitPhase(ctx)
-	defer cancel()
-
-	// Save current as new version
-	if !d.opts.DisableVersioning {
-		currentVersion := &VersionEntry{
-			Key:      uuid.New().String(),
-			NodeID:   nodeID,
-			SpaceID:  spaceID,
-			BlobID:   node.BlobID,
-			BlobSize: node.BlobSize,
-			MTime:    node.MTime,
-			ETag:     node.ETag,
-			Size:     node.Size,
-			Checksum: node.Checksum,
-		}
-		if err := d.store.PutVersion(currentVersion); err != nil {
-			d.log.Warn().Err(err).Str("node_id", nodeID).Msg("failed to create version entry")
-		}
-		d.trimVersions(commitCtx, spaceID, nodeID)
-	}
-
-	sizeDelta := version.Size - node.Size
-	node.BlobID = version.BlobID
-	node.BlobSize = version.BlobSize
-	node.Size = version.Size
-	node.Checksum = version.Checksum
-	node.MTime = time.Now().UnixNano()
-	node.ETag = calculateEtag(nodeID, node.MTime)
-
-	if err := d.store.PutNode(node, rev); err != nil {
-		return err
-	}
-
-	d.propagateTreeSize(commitCtx, spaceID, node.ParentID, sizeDelta)
-
-	executant, _ := ctxpkg.ContextGetUser(ctx)
-	d.publishEvent(commitCtx, func() interface{} {
-		if executant == nil {
-			return nil
-		}
-		return events.FileVersionRestored{
-			SpaceOwner: executant.Id,
-			Executant:  executant.Id,
-			Ref:        spaceRef(spaceID, nodeID),
-			Owner:      executant.Id,
-			Key:        key,
-			Timestamp:  nowTimestamp(),
-		}
-	})
-
-	return nil
-}
-
-func (d *kvfsDriver) trimVersions(ctx context.Context, spaceID, nodeID string) {
-	if d.opts.MaxVersions <= 0 {
-		return
-	}
-
-	versions, err := d.store.ListVersions(spaceID, nodeID)
-	if err != nil {
-		d.log.Warn().Err(err).Str("node_id", nodeID).Msg("trimVersions: failed to list versions")
-		return
-	}
-
-	if len(versions) <= d.opts.MaxVersions {
-		return
-	}
-
-	sort.Slice(versions, func(i, j int) bool {
-		return versions[i].MTime > versions[j].MTime
-	})
-
-	for _, v := range versions[d.opts.MaxVersions:] {
-		if v.BlobID != "" {
-			d.blob.Delete(ctx, BlobKey(spaceID, v.BlobID))
-		}
-		d.store.DeleteVersion(spaceID, nodeID, v.Key)
-	}
 }
 
 // --- Recycle bin ---

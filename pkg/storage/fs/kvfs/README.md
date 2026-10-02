@@ -96,7 +96,7 @@ All values are msgpack-encoded; KV revision numbers drive CAS.
 | `<prefix>-children` | `<spaceID>.<parentID>` | [`ChildMap`](kvstore.go) (`map[name]nodeID`) | Directory listing |
 | `<prefix>-spaces` | `<spaceID>` | [`SpaceEntry`](node.go#L90) | Space root (type, owner, name, quota, root nodeID) |
 | `<prefix>-trash` | `<spaceID>.<trashKey>` | [`TrashEntry`](node.go#L101) | Soft-deleted item with full node snapshot + original path |
-| `<prefix>-versions` | `<spaceID>.<nodeID>.<versionKey>` | [`VersionEntry`](node.go#L113) | File revision (separate blob ID, size, etag, checksum) |
+| `<prefix>-versions` | `<spaceID>.<nodeID>.<versionKey>` | [`VersionEntry`](node.go#L113) | File revision: blob ID (shared with the head after a restore), size, etag, checksum |
 | `<prefix>-uploads` | `<uploadID>` | [`UploadSession`](node.go#L126) | TUS multipart upload state (S3 multipart ID, parts, offset, expiry, if-match) |
 | `<prefix>-locks` | `<lockKey>` (e.g. `gc-sweep`) | JSON `kvLockEntry` | Distributed locks for cross-pod coordination |
 
@@ -108,8 +108,10 @@ each struct field are short (2–4 chars) to minimize KV value size.
 Blobs live under `s3://<bucket>/<spaceID>/<pathified-blobID>`. The
 "pathification" splits a flat UUID into a 2-level hex prefix to keep S3 list
 operations bounded (see `BlobKey()` in [`blobstore.go`](blobstore.go)). A node
-references its blob by `BlobID`; versions reference their own independent
-blobs.
+references its blob by `BlobID`; a version entry keeps the `BlobID` its content
+had. Blobs are never copied, so after a restore the head and the restored entry
+share one blob; only GC (§7) deletes blobs that trims or deletes leave
+unreferenced.
 
 ### 3.3 Identity model
 
@@ -136,7 +138,7 @@ backoff (1–50 ms + jitter); see [`kvfs.go:54`](kvfs.go#L54).
 | `Delete` | Snapshot to `trash` + remove from parent `children` | — | Soft delete; emits `ItemTrashed`. Blob deletion deferred until `PurgeRecycleItem` |
 | `CreateReference` | — | — | **Not supported** — symlinks are out of scope |
 | `GetPathByID` | Walk `ParentID` via `nodes` reads | — | |
-| `GetMD` | `nodes` get | — | Permission-gated |
+| `GetMD` | `nodes` get | — | Permission-gated; a revision key `<nodeID>.REV.<key>` as opaque ID stats that version (Stat + ListFileVersions) |
 | `ListFolder` | `children` get + batched `nodes` get (`GetNodes`, 50-way concurrency) | — | Permission-filtered |
 
 ### 4.2 Data plane
@@ -148,7 +150,7 @@ backoff (1–50 ms + jitter); see [`kvfs.go:54`](kvfs.go#L54).
 | `WriteChunk` (TUS) | `PutUpload` (offset++) | `UploadPart` | Per-chunk; gauge `kvfs_upload_in_flight{protocol="tus"}` |
 | `FinishUpload` (TUS) | `commitNode` CAS-retry + `DeleteUpload` | `CompleteMultipartUpload` | Computes SHA-1 from concatenation; emits `FileUploaded` |
 | `Terminate` (TUS) | `DeleteUpload` | `AbortMultipartUpload` | |
-| `Download` | `nodes` get | `GET` (stream) | |
+| `Download` | `nodes` get | `GET` (stream) | A revision key as opaque ID streams that version (ListFileVersions + InitiateFileDownload) |
 
 ### 4.3 Spaces
 
@@ -169,9 +171,9 @@ backoff (1–50 ms + jitter); see [`kvfs.go:54`](kvfs.go#L54).
 | `RestoreRecycleItem` | `PutNode` + parent `children` update + `DeleteTrash` | — | `restoreRef` supports move-on-restore; idempotent (`NotFound` on missing key) |
 | `PurgeRecycleItem` | `DeleteTrash` | `Delete` (blob) | Idempotent |
 | `EmptyRecycle` | Bulk `DeleteTrash` | Bulk `Delete` | |
-| `ListRevisions` | `ListVersions(spaceID, nodeID)` | — | |
-| `DownloadRevision` | `GetVersion` | `GET` | |
-| `RestoreRevision` | `PutVersion` (current → new version) + CAS update node | Blob copy (server-side) | Trims to `MaxVersions` |
+| `ListRevisions` | `ListVersions(spaceID, nodeID)` | — | Keys are revision keys (decomposedfs/posix format), so ocdav can address a version |
+| `DownloadRevision` | `GetVersion` | `GET` | Accepts revision and bare keys; a key naming another node is NotFound |
+| `RestoreRevision` | `PutVersion` (current → new entry) + CAS `PutNode` + trim | — (blob re-pointed, not copied) | Restored entry stays listed; trimming runs after the head commit and never drops it |
 | `AddGrant` / `RemoveGrant` / `UpdateGrant` | CAS update of `NodeEntry.Grants` | — | Inline ACL; CAS-retried |
 | `DenyGrant` | — | — | **Not supported** |
 | `ListGrants` | `nodes` get | — | Populates `Opaque` with role metadata |
@@ -215,11 +217,11 @@ client ── PUT body ──▶ kvfs.Upload
                           ├─▶ checkQuota
                           ├─▶ blob.Upload (S3 single PUT, hashing SHA-1 inline)
                           └─▶ commitFileNode (CAS-retried)
-                                   ├─ create or update NodeEntry (with new BlobID)
-                                   ├─ archive previous blob into VersionEntry (if any)
-                                   ├─ update parent children map
+                                   ├─ overwrite: snapshot the previous head into a VersionEntry (first attempt only)
+                                   ├─ create: add the node to the parent children map
+                                   ├─ CAS update of NodeEntry (with new BlobID)
                                    ├─ propagate tree size
-                                   └─ trim to MaxVersions
+                                   └─ trim version entries to MaxVersions (after the commit; blobs left to GC)
 ```
 
 Emits `events.FileUploaded`.
@@ -250,15 +252,20 @@ Implements `tusd.Core`, `tusd.Terminater`, and `tusd.LengthDeferrer`. The
 
 The `blobGC` loop runs on `Options.GCInterval` (default 24 h). Each sweep:
 
-1. **Acquire distributed lock** `gc-sweep` in the `locks` bucket
-   (holder = hostname, TTL = 30 min). Skip the run if the lock is held.
+1. **Acquire the sweep lease** `gc-sweep` in the `locks` bucket (holder =
+   hostname, 90 s TTL renewed every 30 s; a lost lease fences the sweep). Skip
+   the run if another holder has it.
 2. **Per-space reference set**: union of `BlobID`s referenced by `nodes`,
-   `versions`, `uploads`, and `trash` (`buildSpaceReferenceSet`).
+   `versions`, `uploads`, and `trash` (`buildSpaceReferenceSet`), built from
+   sequential `nodes`, `versions` and `trash` listings plus the upload
+   sessions read at sweep start.
 3. **List S3 blobs under the space prefix**. For each blob:
    - If referenced → keep.
    - If unreferenced **and** older than `Options.GCMinAge` (default 24 h) →
      delete (or log under `GCDryRun`). The age guard prevents deletion of
-     blobs uploaded between the metadata snapshot and the S3 list.
+     blobs uploaded between the metadata snapshot and the S3 list. Age is the
+     blob's upload time, so a blob a trim left unreferenced goes at the first
+     sweep after it is older than `GCMinAge`.
 4. **Clean expired upload sessions**: `cleanExpiredUploads` aborts the S3
    multipart and deletes the `uploads` entry for any session past its expiry.
 5. **Release lock**.
@@ -284,12 +291,16 @@ All fields are loadable from a `map[string]interface{}` via `mapstructure`
 | `S3AccessKey` / `S3SecretKey` | `s3.access_key` / `s3.secret_key` | — | S3 credentials |
 | `BucketPrefix` | `bucket_prefix` | `oc` | KV bucket name prefix |
 | `DisableVersioning` | `disable_versioning` | `false` | Skip version creation on overwrite |
-| `MaxVersions` | `max_versions` | `0` (unlimited) | Per-file version cap |
+| `MaxVersions` | `max_versions` | `0` (unlimited) | Per-file cap on version entries |
 | `GCEnabled` | `gc_enabled` | `false` | Run the GC loop |
 | `GCInterval` | `gc_interval` | `24h` | Sweep frequency |
 | `GCMinAge` | `gc_min_age` | `24h` | Minimum blob age before deletion |
 | `GCDryRun` | `gc_dry_run` | `false` | Log-only mode |
 | `GCRunOnStart` | `gc_run_on_start` | `false` | Immediate sweep at boot |
+
+Trimming removes version entries only and relies on `gc_enabled` to reclaim
+their blobs. At the cap a restore keeps the restored entry and drops the oldest
+other one; at `max_versions = 1` the replaced content is not kept.
 
 ## 9. Observability
 
@@ -337,9 +348,9 @@ the driver in both implementations).
 | `Shutdown` | ✅ | ✅ | KVFS stops GC loop + closes NATS conn |
 | `ListStorageSpaces` | ✅ | ✅ | Personal + project; share spaces via `sharesstorageprovider` |
 | `GetQuota` | ✅ | ✅ | Tree-size derived |
-| `GetMD` | ✅ | ✅ | Permission-gated |
+| `GetMD` | ✅ | ✅ | Permission-gated; revision keys address versions |
 | `ListFolder` | ✅ | ✅ | Batched node hydration (50-way) |
-| `Download` | ✅ | ✅ | Direct S3 stream |
+| `Download` | ✅ | ✅ | Direct S3 stream; revision keys address versions |
 | `GetPathByID` | ✅ | ✅ | Walks ancestor chain |
 | `CreateReference` | ✅ | ❌ | Symlinks not supported |
 | `CreateDir` | ✅ | ✅ | CAS-retried |
@@ -349,8 +360,8 @@ the driver in both implementations).
 | `InitiateUpload` | ✅ | ✅ | TUS + S3 multipart |
 | `Upload` | ✅ | ✅ | Simple PUT path |
 | `ListRevisions` | ✅ | ✅ | |
-| `DownloadRevision` | ✅ | ✅ | |
-| `RestoreRevision` | ✅ | ✅ | Trims to `MaxVersions` |
+| `DownloadRevision` | ✅ | ✅ | Revision and bare keys |
+| `RestoreRevision` | ✅ | ✅ | Restored entry stays listed; trims entries after the commit |
 | `ListRecycle` | ✅ | ✅ | |
 | `RestoreRecycleItem` | ✅ | ✅ | Idempotent; supports `restoreRef` move-on-restore |
 | `PurgeRecycleItem` | ✅ | ✅ | Idempotent; deletes blob |
@@ -420,9 +431,9 @@ upstream-PR transparency.
 
 ## 12. Testing
 
-15 test files (~5450 LOC, 169 tests) live alongside the driver. They run
-against an in-memory KV mock (`mockStore`) and an in-memory blob mock so the
-suite has no external dependencies.
+The test files live alongside the driver. They run against an in-memory KV
+mock (`mockStore`) and an in-memory blob mock so the suite has no external
+dependencies.
 
 | File | Coverage |
 |---|---|
@@ -440,7 +451,8 @@ suite has no external dependencies.
 | [`space_test.go`](space_test.go) | Space lifecycle |
 | [`treesize_test.go`](treesize_test.go) | Ancestor sum updates, drift counter |
 | [`upload_test.go`](upload_test.go) | Simple + TUS, multipart parts, deferred length |
-| [`versions_test.go`](versions_test.go) | Revision creation, restore, trim |
+| [`revisions_test.go`](revisions_test.go) | Revision keys: stat, download and restore by key, node scoping, permissions |
+| [`versions_test.go`](versions_test.go) | Version snapshots, entries-only trim, restore/trim interplay, GC reclamation of trimmed blobs |
 
 Run from this directory:
 
