@@ -88,6 +88,18 @@ func TestOptionsParseMaxDeleteDepth(t *testing.T) {
 	}
 }
 
+func TestOptionsParseMountID(t *testing.T) {
+	m := minimalConfig()
+	m["mount_id"] = "mnt-1"
+	opts, err := parseConfig(m)
+	if err != nil {
+		t.Fatalf("parseConfig failed: %v", err)
+	}
+	if opts.MountID != "mnt-1" {
+		t.Errorf("expected MountID=mnt-1, got %q", opts.MountID)
+	}
+}
+
 // An omitted max_delete_depth must default to defaultMaxDeleteDepth via
 // init(); an explicit zero must be normalised the same way.
 func TestOptionsDefaultMaxDeleteDepth(t *testing.T) {

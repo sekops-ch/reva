@@ -680,7 +680,7 @@ func TestUpload_FailedOverwriteDoesNotTrim(t *testing.T) {
 	setPutNodeErr(store, nil)
 
 	if versions, _ := store.ListVersions("s1", "f1"); len(versions) != 3 {
-		t.Errorf("versions = %d, want 3 (first-try snapshot kept, no trim)", len(versions))
+		t.Errorf("versions = %d, want 3 (the snapshot stays, no trim)", len(versions))
 	}
 	if _, err := store.GetVersion("s1", "f1", oldKey); err != nil {
 		t.Error("a failed overwrite must not trim the oldest entry")
@@ -711,7 +711,7 @@ func TestUpload_CASRetrySnapshotsOnceAndTrimsAfterCommit(t *testing.T) {
 		}
 	}
 	if n != 1 {
-		t.Errorf("%d entries snapshot c1, want exactly 1 (first attempt only)", n)
+		t.Errorf("%d entries snapshot c1, want exactly 1 (the retry met the same content)", n)
 	}
 	if len(versions) != 2 {
 		t.Errorf("versions = %d, want 2", len(versions))
@@ -721,6 +721,128 @@ func TestUpload_CASRetrySnapshotsOnceAndTrimsAfterCommit(t *testing.T) {
 	}
 	if _, ok := blob.blobs[BlobKey("s1", "old-blob")]; !ok {
 		t.Error("old-blob must stay stored until GC")
+	}
+}
+
+// racingWriterStore lets another writer commit "racer" to s1/f1 just before the first PutNode of
+// f1, so that commit meets a changed head and its CAS loop retries. failRacerVersion refuses to
+// keep the racer's content as a version.
+type racingWriterStore struct {
+	*mockMetadataStore
+	blob             *mockBlobStore
+	once             sync.Once
+	failRacerVersion bool
+}
+
+func (s *racingWriterStore) PutVersion(v *VersionEntry) error {
+	if s.failRacerVersion && v.BlobID == "racer-blob" {
+		return errors.New("injected version write failure")
+	}
+	return s.mockMetadataStore.PutVersion(v)
+}
+
+func (s *racingWriterStore) PutNode(n *NodeEntry, expectedRev uint64) error {
+	if n.SpaceID == "s1" && n.ID == "f1" {
+		s.once.Do(func() {
+			s.blob.mu.Lock()
+			s.blob.blobs[BlobKey("s1", "racer-blob")] = []byte("racer")
+			s.blob.mu.Unlock()
+			head, rev, err := s.mockMetadataStore.GetNode("s1", "f1")
+			if err != nil {
+				panic(err)
+			}
+			head.BlobID, head.BlobSize, head.Size = "racer-blob", 5, 5
+			head.ETag = "racer-etag"
+			if err := s.mockMetadataStore.PutNode(head, rev); err != nil {
+				panic(err)
+			}
+		})
+	}
+	return s.mockMetadataStore.PutNode(n, expectedRev)
+}
+
+func TestUpload_CASRetryKeepsTheRacingWritersContent(t *testing.T) {
+	d, store, blob := newVersionFixture(5)
+	mustOverwrite(t, d, "c0")
+	d.store = &racingWriterStore{mockMetadataStore: store, blob: blob}
+	mustOverwrite(t, d, "mine")
+
+	if got := readHead(t, d); got != "mine" {
+		t.Errorf("head = %q, want mine", got)
+	}
+	want := map[string]bool{"original": true, "c0": true, "racer": true}
+	got := versionContents(t, store, blob)
+	if len(got) != len(want) || !got["original"] || !got["c0"] || !got["racer"] {
+		t.Errorf("versions hold %v, want %v (the retry keeps the content it replaces)", got, want)
+	}
+	versions, _ := store.ListVersions("s1", "f1")
+	if len(versions) != 3 {
+		t.Errorf("versions = %d, want 3 (one entry per replaced content)", len(versions))
+	}
+	c0, _ := store.GetVersion("s1", "f1", versionKeyFor(t, store, blob, "c0"))
+	racer, _ := store.GetVersion("s1", "f1", versionKeyFor(t, store, blob, "racer"))
+	if racer.takenAt() <= c0.takenAt() {
+		t.Errorf("racer snapshot taken at %d, c0 at %d: the later replacement must sort newer",
+			racer.takenAt(), c0.takenAt())
+	}
+}
+
+func TestUpload_CASRetryAtTheCapKeepsTheLatestReplacedContent(t *testing.T) {
+	d, store, blob := newVersionFixture(1)
+	mustOverwrite(t, d, "c0")
+	d.store = &racingWriterStore{mockMetadataStore: store, blob: blob}
+	mustOverwrite(t, d, "mine")
+
+	got := versionContents(t, store, blob)
+	if len(got) != 1 || !got["racer"] {
+		t.Errorf("versions hold %v, want only racer (the content mine replaced)", got)
+	}
+}
+
+// earlyWriterStore lets another writer replace s1/f1's content with "racer" during the first
+// children read, after a commit started and before it reads the head. That writer keeps the
+// content it replaces as a version, as every commit does.
+type earlyWriterStore struct {
+	*mockMetadataStore
+	blob *mockBlobStore
+	once sync.Once
+}
+
+func (s *earlyWriterStore) GetChildren(spaceID, parentID string) (ChildMap, uint64, error) {
+	s.once.Do(func() {
+		s.blob.mu.Lock()
+		s.blob.blobs[BlobKey("s1", "racer-blob")] = []byte("racer")
+		s.blob.mu.Unlock()
+		head, rev, err := s.mockMetadataStore.GetNode("s1", "f1")
+		if err != nil {
+			panic(err)
+		}
+		if err := s.mockMetadataStore.PutVersion(&VersionEntry{
+			Key: "early-writer", NodeID: "f1", SpaceID: "s1", BlobID: head.BlobID, BlobSize: head.BlobSize,
+			Size: head.Size, MTime: head.MTime, ETag: head.ETag, SnapshotTime: time.Now().UnixNano(),
+		}); err != nil {
+			panic(err)
+		}
+		head.BlobID, head.BlobSize, head.Size, head.ETag = "racer-blob", 5, 5, "racer-etag"
+		if err := s.mockMetadataStore.PutNode(head, rev); err != nil {
+			panic(err)
+		}
+	})
+	return s.mockMetadataStore.GetChildren(spaceID, parentID)
+}
+
+func TestCommit_SnapshotSortsAfterTheReplacedHeadsOwnVersion(t *testing.T) {
+	d, store, blob := newVersionFixture(1)
+	d.store = &earlyWriterStore{mockMetadataStore: store, blob: blob}
+	blob.blobs[BlobKey("s1", "mine-blob")] = []byte("mine")
+	if _, err := d.commitFileNode(testContext(), commitFileParams{
+		SpaceID: "s1", ParentID: "root", Name: "file.txt", BlobID: "mine-blob", Size: 4,
+		Checksum: "sha1:mine", MimeType: "text/plain", OwnerID: "test-user-id",
+	}); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	if got := versionContents(t, store, blob); len(got) != 1 || !got["racer"] {
+		t.Errorf("versions hold %v, want only racer (the content the commit replaced)", got)
 	}
 }
 

@@ -254,6 +254,23 @@ func (m *mockMetadataStore) allocRev() uint64 {
 	return m.nextRev
 }
 
+// copyNode copies n with its lock, so a lock change becomes visible only through PutNode, as
+// with the real store, which decodes a fresh entry on every read.
+func copyNode(n *NodeEntry) *NodeEntry {
+	cp := *n
+	if n.Lock != nil {
+		lock := *n.Lock
+		if n.Lock.Meta != nil {
+			lock.Meta = make(map[string]string, len(n.Lock.Meta))
+			for k, v := range n.Lock.Meta {
+				lock.Meta[k] = v
+			}
+		}
+		cp.Lock = &lock
+	}
+	return &cp
+}
+
 func (m *mockMetadataStore) GetNode(spaceID, nodeID string) (*NodeEntry, uint64, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -262,8 +279,7 @@ func (m *mockMetadataStore) GetNode(spaceID, nodeID string) (*NodeEntry, uint64,
 	if !ok {
 		return nil, 0, ErrNodeNotFound
 	}
-	cp := *n
-	return &cp, m.nodeRevs[key], nil
+	return copyNode(n), m.nodeRevs[key], nil
 }
 
 func (m *mockMetadataStore) PutNode(n *NodeEntry, expectedRev uint64) error {
@@ -286,8 +302,7 @@ func (m *mockMetadataStore) PutNode(n *NodeEntry, expectedRev uint64) error {
 			return ErrCASConflict
 		}
 	}
-	cp := *n
-	m.nodes[key] = &cp
+	m.nodes[key] = copyNode(n)
 	m.nodeRevs[key] = m.allocRev()
 	return nil
 }
@@ -549,8 +564,7 @@ func (m *mockMetadataStore) GetNodes(spaceID string, nodeIDs []string) (map[stri
 	for _, id := range nodeIDs {
 		key := spaceID + "." + id
 		if n, ok := m.nodes[key]; ok {
-			cp := *n
-			nodes[id] = &cp
+			nodes[id] = copyNode(n)
 		}
 	}
 	return nodes, nil
@@ -845,8 +859,13 @@ func TestGetInfo(t *testing.T) {
 	if info.MetaData["foo"] != "bar" {
 		t.Errorf("MetaData[foo] = %q, want %q", info.MetaData["foo"], "bar")
 	}
-	if info.Storage["SpaceRoot"] != "space-1" {
-		t.Errorf("Storage[SpaceRoot] = %q, want %q", info.Storage["SpaceRoot"], "space-1")
+	for _, k := range []string{"SpaceRoot", "NodeId", "providerID"} {
+		if v, ok := info.Storage[k]; ok {
+			t.Errorf("Storage[%s] = %q, want absent: the TUS handler would turn it into OC-FileId", k, v)
+		}
+	}
+	if id := tusReplyFileID(info); id != "" {
+		t.Errorf("TUS reply OC-FileId = %q, want empty so ocdav stats the uploaded path", id)
 	}
 	if info.Storage["BlobId"] != "blob-123" {
 		t.Errorf("Storage[BlobId] = %q, want %q", info.Storage["BlobId"], "blob-123")
@@ -1344,7 +1363,7 @@ func TestCommitNodeCASRetry(t *testing.T) {
 	// Inject 2 CAS failures; commitNode should retry and succeed on attempt 3
 	store.injectCASFailures(2)
 
-	err := u.commitNode(ctx, "")
+	err := u.commitNode(ctx, "", "")
 	if err != nil {
 		t.Fatalf("commitNode should succeed after CAS retries: %v", err)
 	}
@@ -1371,7 +1390,7 @@ func TestCommitNodeCASExhausted(t *testing.T) {
 	// Inject more CAS failures than maxRetries (10)
 	store.injectCASFailures(20)
 
-	err := u.commitNode(ctx, "")
+	err := u.commitNode(ctx, "", "")
 	if err == nil {
 		t.Fatal("commitNode should fail after exhausting CAS retries")
 	}
@@ -1475,7 +1494,7 @@ func TestCreateTUSSession(t *testing.T) {
 	d := testDriver(store, blob)
 	ctx := testContext()
 
-	sessionID, err := d.createTUSSession(ctx, "space-1", "parent-1", "upload.bin", 4096, false, "")
+	sessionID, err := d.createTUSSession(ctx, tusSessionParams{SpaceID: "space-1", ParentID: "parent-1", Name: "upload.bin", Size: 4096})
 	if err != nil {
 		t.Fatalf("createTUSSession: %v", err)
 	}
@@ -1525,7 +1544,7 @@ func TestCreateTUSSessionDeferred(t *testing.T) {
 	d := testDriver(store, blob)
 	ctx := testContext()
 
-	sessionID, err := d.createTUSSession(ctx, "space-1", "parent-1", "big.bin", 0, true, "")
+	sessionID, err := d.createTUSSession(ctx, tusSessionParams{SpaceID: "space-1", ParentID: "parent-1", Name: "big.bin", Size: 0, SizeIsDeferred: true})
 	if err != nil {
 		t.Fatalf("createTUSSession: %v", err)
 	}
@@ -1545,7 +1564,7 @@ func TestCreateTUSSessionWithIfMatch(t *testing.T) {
 	d := testDriver(store, blob)
 	ctx := testContext()
 
-	sessionID, err := d.createTUSSession(ctx, "space-1", "parent-1", "file.txt", 100, false, "expected-etag")
+	sessionID, err := d.createTUSSession(ctx, tusSessionParams{SpaceID: "space-1", ParentID: "parent-1", Name: "file.txt", Size: 100, IfMatch: "expected-etag"})
 	if err != nil {
 		t.Fatalf("createTUSSession: %v", err)
 	}
@@ -1566,7 +1585,7 @@ func TestCreateTUSSession_NoS3DependencyAtSessionOpen(t *testing.T) {
 	d := testDriver(store, blob)
 	ctx := testContext()
 
-	sid, err := d.createTUSSession(ctx, "space-1", "parent-1", "file.txt", 100, false, "")
+	sid, err := d.createTUSSession(ctx, tusSessionParams{SpaceID: "space-1", ParentID: "parent-1", Name: "file.txt", Size: 100})
 	if err != nil {
 		t.Fatalf("createTUSSession should NOT depend on S3 at open time; got: %v", err)
 	}
@@ -1682,7 +1701,7 @@ func TestTUSEndToEndFlow(t *testing.T) {
 	setupSpaceEmpty(store, "space-1", "parent-1")
 
 	// 1. Create TUS session
-	sessionID, err := d.createTUSSession(ctx, "space-1", "parent-1", "e2e-file.txt", 20, false, "")
+	sessionID, err := d.createTUSSession(ctx, tusSessionParams{SpaceID: "space-1", ParentID: "parent-1", Name: "e2e-file.txt", Size: 20})
 	if err != nil {
 		t.Fatalf("createTUSSession: %v", err)
 	}
@@ -1752,7 +1771,7 @@ func TestTUSOverwriteEndToEnd(t *testing.T) {
 
 	setupSpaceWithFile(store, "space-1", "parent-1", "existing-node", "overwrite.txt")
 
-	sessionID, err := d.createTUSSession(ctx, "space-1", "parent-1", "overwrite.txt", 5, false, "")
+	sessionID, err := d.createTUSSession(ctx, tusSessionParams{SpaceID: "space-1", ParentID: "parent-1", Name: "overwrite.txt", Size: 5})
 	if err != nil {
 		t.Fatalf("createTUSSession: %v", err)
 	}

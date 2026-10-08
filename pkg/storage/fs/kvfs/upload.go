@@ -91,13 +91,12 @@ func (u *kvfsUpload) GetInfo(ctx context.Context) (tusd.FileInfo, error) {
 		SizeIsDeferred: u.session.SizeIsDeferred,
 		Offset:         u.session.Offset,
 		MetaData:       u.session.Storage,
+		// No space or node id: the TUS data handler turns them into OC-FileId, and ocdav then
+		// stats that id instead of the uploaded path (a bare space id is the space root).
 		Storage: map[string]string{
-			"SpaceRoot":  u.session.SpaceID,
-			"NodeId":     u.session.NodeID,
-			"BlobId":     u.session.BlobID,
-			"ParentId":   u.session.ParentID,
-			"Filename":   u.session.Filename,
-			"providerID": u.session.SpaceID,
+			"BlobId":   u.session.BlobID,
+			"ParentId": u.session.ParentID,
+			"Filename": u.session.Filename,
 		},
 	}, nil
 }
@@ -155,12 +154,14 @@ func (u *kvfsUpload) FinishUpload(ctx context.Context) error {
 	// timeout in the commit phase, S3 errors, commitNode CAS exhaustion)
 	// the session lives until either the next retry commits it or the
 	// uploadSessionTTL reaper clears it.
-	var commitSucceeded bool
+	var commitSucceeded, discarded bool
 	defer func() {
 		if !commitSucceeded {
-			u.driver.log.Warn().
-				Str("session_id", u.session.ID).
-				Msg("kvfs: FinishUpload did not commit — session + cache preserved for retry")
+			if !discarded {
+				u.driver.log.Warn().
+					Str("session_id", u.session.ID).
+					Msg("kvfs: FinishUpload did not commit — session + cache preserved for retry")
+			}
 			return
 		}
 		if err := u.driver.uploadCache.Drop(u.session.ID); err != nil {
@@ -223,7 +224,11 @@ func (u *kvfsUpload) FinishUpload(ctx context.Context) error {
 	}
 
 	commitStart := time.Now()
-	err := u.commitNode(commitCtx, checksum)
+	lockID, _ := ctxpkg.ContextGetLockID(ctx)
+	if lockID == "" {
+		lockID = u.session.LockID
+	}
+	err := u.commitNode(commitCtx, checksum, lockID)
 	commitDur := time.Since(commitStart)
 	TUSPhaseDuration.WithLabelValues("commit_node").Observe(commitDur.Seconds())
 	if err != nil {
@@ -236,6 +241,12 @@ func (u *kvfsUpload) FinishUpload(ctx context.Context) error {
 		// raw errtypes.InsufficientStorage falls through to 500.
 		if _, ok := err.(errtypes.InsufficientStorage); ok {
 			return tusd.NewError("ERR_QUOTA_EXCEEDED", err.Error(), 507)
+		}
+		// A kept session holds all its bytes, so the client's HEAD would take the save as done.
+		if _, ok := err.(errtypes.IsLocked); ok {
+			_ = u.Terminate(commitCtx)
+			discarded = true
+			return tusd.NewError("ERR_LOCKED", "resource is locked", 423)
 		}
 		return err
 	}
@@ -296,7 +307,7 @@ func (u *kvfsUpload) DeclareLength(ctx context.Context, length int64) error {
 // commitNode creates or updates the file node in the KV store after the
 // blob upload is complete. Unchanged from the previous design — the
 // metadata-commit phase is orthogonal to the body-staging refactor.
-func (u *kvfsUpload) commitNode(ctx context.Context, checksum string) error {
+func (u *kvfsUpload) commitNode(ctx context.Context, checksum, lockID string) error {
 	spaceID := u.session.SpaceID
 	parentID := u.session.ParentID
 	name := u.session.Filename
@@ -333,6 +344,8 @@ func (u *kvfsUpload) commitNode(ctx context.Context, checksum string) error {
 		MimeType:    mimeType,
 		IfMatchEtag: u.session.IfMatchEtag,
 		OwnerID:     u.session.OwnerID,
+		ClientMTime: u.session.ClientMTime,
+		LockID:      lockID,
 	})
 	return err
 }
@@ -389,10 +402,20 @@ func (d *kvfsDriver) AsLengthDeclarableUpload(upload tusd.Upload) tusd.LengthDec
 	return upload.(*kvfsUpload)
 }
 
+// tusSessionParams describe the upload a new TUS session accepts.
+type tusSessionParams struct {
+	SpaceID, ParentID, Name string
+	Size                    int64
+	SizeIsDeferred          bool
+	IfMatch                 string
+	ClientMTime             string
+	LockID                  string
+}
+
 // createTUSSession allocates a new TUS upload session. No S3 multipart
 // state is created up front — the body is staged in the upload cache by
 // WriteChunk and pushed to S3 once at FinishUpload.
-func (d *kvfsDriver) createTUSSession(ctx context.Context, spaceID, parentID, name string, size int64, sizeIsDeferred bool, ifMatchEtag string) (string, error) {
+func (d *kvfsDriver) createTUSSession(ctx context.Context, p tusSessionParams) (string, error) {
 	start := time.Now()
 	defer func() { TUSPhaseDuration.WithLabelValues("initiate").Observe(time.Since(start).Seconds()) }()
 
@@ -402,19 +425,21 @@ func (d *kvfsDriver) createTUSSession(ctx context.Context, spaceID, parentID, na
 
 	session := &UploadSession{
 		ID:             sessionID,
-		SpaceID:        spaceID,
-		Filename:       name,
-		ParentID:       parentID,
-		Size:           size,
+		SpaceID:        p.SpaceID,
+		Filename:       p.Name,
+		ParentID:       p.ParentID,
+		Size:           p.Size,
 		Offset:         0,
 		Storage:        map[string]string{},
 		Expires:        time.Now().Add(uploadSessionTTL).Unix(),
 		BlobID:         blobID,
 		S3MultipartID:  "", // populated only by legacy pre-disk-cache sessions
 		Parts:          nil,
-		SizeIsDeferred: sizeIsDeferred,
-		IfMatchEtag:    ifMatchEtag,
+		SizeIsDeferred: p.SizeIsDeferred,
+		IfMatchEtag:    p.IfMatch,
 		OwnerID:        u.Id.OpaqueId,
+		ClientMTime:    p.ClientMTime,
+		LockID:         p.LockID,
 	}
 
 	if err := d.store.PutUpload(session); err != nil {
@@ -422,6 +447,6 @@ func (d *kvfsDriver) createTUSSession(ctx context.Context, spaceID, parentID, na
 	}
 
 	UploadInFlight.WithLabelValues("tus").Inc()
-	d.log.Debug().Str("session_id", sessionID).Str("blob_id", blobID).Str("space_id", spaceID).Str("name", name).Int64("size", size).Msg("TUS upload session created")
+	d.log.Debug().Str("session_id", sessionID).Str("blob_id", blobID).Str("space_id", p.SpaceID).Str("name", p.Name).Int64("size", p.Size).Msg("TUS upload session created")
 	return sessionID, nil
 }

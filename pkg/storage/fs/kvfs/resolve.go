@@ -54,50 +54,117 @@ func (d *kvfsDriver) resolveRef(ctx context.Context, ref *provider.Reference) (s
 	return "", "", errtypes.BadRequest("kvfs: reference must have resource ID")
 }
 
-// resolveParentRef resolves a reference to its parent's (spaceID, parentID, childName).
-func (d *kvfsDriver) resolveParentRef(ctx context.Context, ref *provider.Reference) (string, string, string, error) {
+// resolveParent resolves ref to the folder that holds its target and the target's name. A path
+// is relative to the referenced node (the space root when the reference names none), and path
+// "." names the referenced node itself.
+func (d *kvfsDriver) resolveParent(ctx context.Context, ref *provider.Reference) (string, *NodeEntry, string, error) {
 	rid := ref.GetResourceId()
 	if rid == nil || rid.SpaceId == "" {
-		return "", "", "", errtypes.BadRequest("missing space ID in reference")
+		return "", nil, "", errtypes.BadRequest("missing space ID in reference")
 	}
-
 	spaceID := rid.SpaceId
-	refPath := ref.Path
-	if refPath == "" {
-		return "", "", "", errtypes.BadRequest("missing path in reference")
-	}
-
-	refPath = filepath.Clean(refPath)
-
-	// When OpaqueId points directly to a file and path is "." (e.g. from
-	// sharesstorageprovider for file-level shares), resolve the parent from
-	// the node's own metadata instead of path-walking.
-	if (refPath == "." || refPath == "/") && rid.OpaqueId != "" && rid.OpaqueId != rid.SpaceId {
-		node, _, err := d.store.GetNode(spaceID, rid.OpaqueId)
-		if err == nil && node.Type == NodeTypeFile && node.ParentID != "" {
-			return spaceID, node.ParentID, node.Name, nil
+	baseID := rid.OpaqueId
+	if baseID == "" {
+		space, _, err := d.store.GetSpace(spaceID)
+		if err != nil {
+			if err == ErrSpaceNotFound {
+				return "", nil, "", errtypes.NotFound(ref.String())
+			}
+			return "", nil, "", err
 		}
+		baseID = space.RootID
 	}
 
-	parentPath := filepath.Dir(refPath)
-	name := filepath.Base(refPath)
+	if err := d.refuseTrashed(ref); err != nil {
+		return "", nil, "", err
+	}
 
-	parentID, err := d.resolvePathToNodeID(ctx, spaceID, parentPath)
+	refPath := filepath.Clean("./" + ref.GetPath())
+	var parentID, name string
+	if refPath == "." {
+		node, _, err := d.store.GetNode(spaceID, baseID)
+		switch {
+		case err == ErrNodeNotFound:
+			return "", nil, "", errtypes.NotFound(ref.String())
+		case err != nil:
+			return "", nil, "", err
+		case node.ParentID == "":
+			return "", nil, "", errtypes.BadRequest("kvfs: the space root has no parent")
+		}
+		parentID, name = node.ParentID, node.Name
+	} else {
+		var err error
+		if parentID, err = d.resolveRelativePath(ctx, spaceID, baseID, filepath.Dir(refPath)); err != nil {
+			if err == ErrNodeNotFound {
+				return "", nil, "", errtypes.NotFound("parent directory not found: " + filepath.Dir(refPath))
+			}
+			return "", nil, "", err
+		}
+		name = filepath.Base(refPath)
+	}
+	if name == "" || name == "." || name == ".." || name == "/" {
+		return "", nil, "", errtypes.BadRequest("kvfs: invalid name " + name)
+	}
+
+	parent, _, err := d.store.GetNode(spaceID, parentID)
+	switch {
+	case err == ErrNodeNotFound:
+		return "", nil, "", errtypes.NotFound(ref.String())
+	case err != nil:
+		return "", nil, "", err
+	case parent.Type != NodeTypeDir:
+		// Only who may see the file learns that it is one; anyone else gets a missing parent.
+		if !d.assemblePermissions(ctx, spaceID, parent).Stat {
+			return "", nil, "", errtypes.NotFound(ref.String())
+		}
+		return "", nil, "", errtypes.PreconditionFailed("kvfs: parent is not a folder")
+	}
+	return spaceID, parent, name, nil
+}
+
+// refuseTrashed answers NotFound when ref addresses a node in a trashed directory through its
+// node id: a trashed subtree stays in KV only for a restore, as decomposedfs's leaves the tree. A
+// path from the space root resolves through listed children only.
+func (d *kvfsDriver) refuseTrashed(ref *provider.Reference) error {
+	rid := ref.GetResourceId()
+	if rid.GetSpaceId() == "" || rid.GetOpaqueId() == "" {
+		return nil
+	}
+	trashed, err := d.inTrash(rid.GetSpaceId(), rid.GetOpaqueId())
 	if err != nil {
-		// If parent starts from the space root, resolve from root
-		parentID = rid.OpaqueId
-		if parentPath != "." && parentPath != "/" {
-			parentID, err = d.resolveRelativePath(ctx, spaceID, rid.OpaqueId, parentPath)
+		return err
+	}
+	if trashed {
+		return errtypes.NotFound(ref.String())
+	}
+	return nil
+}
+
+// inTrash reports whether nodeID or one of its ancestors is a trashed directory. The mark is
+// confirmed against the parent's listing, since racing renames, moves or restores can leave it on
+// a folder that is back in the tree. A missing node is not in the trash; the callers' own reads
+// report it.
+func (d *kvfsDriver) inTrash(spaceID, nodeID string) (bool, error) {
+	for depth := 0; nodeID != "" && depth <= resolveMaxDeleteDepth(d.opts); depth++ {
+		node, _, err := d.store.GetNode(spaceID, nodeID)
+		switch {
+		case err == ErrNodeNotFound:
+			return false, nil
+		case err != nil:
+			return false, err
+		}
+		if node.Trashed {
+			children, _, err := d.store.GetChildren(spaceID, node.ParentID)
 			if err != nil {
-				if err == ErrNodeNotFound {
-					return "", "", "", errtypes.NotFound("parent directory not found: " + parentPath)
-				}
-				return "", "", "", err
+				return false, err
+			}
+			if children[node.Name] != node.ID {
+				return true, nil
 			}
 		}
+		nodeID = node.ParentID
 	}
-
-	return spaceID, parentID, name, nil
+	return false, nil
 }
 
 // resolveRelativePath resolves a relative path from a starting node.

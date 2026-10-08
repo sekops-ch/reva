@@ -16,12 +16,15 @@
 package kvfs
 
 import (
+	"encoding/xml"
 	"strings"
 	"time"
 
 	user "github.com/cs3org/go-cs3apis/cs3/identity/user/v1beta1"
 	provider "github.com/cs3org/go-cs3apis/cs3/storage/provider/v1beta1"
 	types "github.com/cs3org/go-cs3apis/cs3/types/v1beta1"
+
+	"github.com/opencloud-eu/reva/v2/pkg/utils"
 )
 
 // NodeType distinguishes files from directories.
@@ -69,6 +72,9 @@ type NodeEntry struct {
 
 	// Processing flag (set during upload)
 	Processing bool `msgpack:"proc,omitempty"`
+
+	// Trashed marks a directory in the trash; its subtree stays in KV only for a restore.
+	Trashed bool `msgpack:"trash,omitempty"`
 }
 
 // GrantEntry represents an ACL grant stored inline in a node.
@@ -85,6 +91,11 @@ type LockEntry struct {
 	UserID  string `msgpack:"uid"`
 	AppName string `msgpack:"app,omitempty"`
 	Expiry  int64  `msgpack:"exp,omitempty"` // unix timestamp
+
+	// The holder's identity provider and the lock's plain opaque entries (ocdav's lockownername
+	// and locktime), kept for lock discovery.
+	UserIdp string            `msgpack:"idp,omitempty"`
+	Meta    map[string]string `msgpack:"meta,omitempty"`
 }
 
 // SpaceEntry represents a storage space (personal, project, etc.).
@@ -112,15 +123,18 @@ type TrashEntry struct {
 
 // VersionEntry represents a file revision.
 type VersionEntry struct {
-	Key      string `msgpack:"k"`    // version key
-	NodeID   string `msgpack:"nid"`  // node this version belongs to
-	SpaceID  string `msgpack:"sid"`  // space ID
-	BlobID   string `msgpack:"bid"`  // S3 blob key for this version
-	BlobSize int64  `msgpack:"bs"`   // blob size
-	MTime    int64  `msgpack:"mt"`   // modification time
-	ETag     string `msgpack:"et"`   // etag of this version
-	Size     int64  `msgpack:"sz"`   // file size
+	Key      string `msgpack:"k"`   // version key
+	NodeID   string `msgpack:"nid"` // node this version belongs to
+	SpaceID  string `msgpack:"sid"` // space ID
+	BlobID   string `msgpack:"bid"` // S3 blob key for this version
+	BlobSize int64  `msgpack:"bs"`  // blob size
+	MTime    int64  `msgpack:"mt"`  // modification time
+	ETag     string `msgpack:"et"`  // etag of this version
+	Size     int64  `msgpack:"sz"`  // file size
 	Checksum string `msgpack:"cksum"`
+	// SnapshotTime is when the entry was taken (Unix ns), 0 when unrecorded; MTime is the
+	// content's date, which a client can set to any time.
+	SnapshotTime int64 `msgpack:"st,omitempty"`
 }
 
 // UploadSession represents a TUS upload session stored in KV.
@@ -136,12 +150,14 @@ type UploadSession struct {
 	Expires  int64             `msgpack:"exp"`  // expiry unix timestamp
 
 	// S3 multipart upload state
-	BlobID          string     `msgpack:"bid"`   // target blob ID in S3
-	S3MultipartID   string     `msgpack:"s3mid"` // S3 multipart upload ID
-	Parts           []PartInfo `msgpack:"parts"` // completed parts
-	SizeIsDeferred  bool       `msgpack:"sdef"`  // true if total size is not yet known
-	IfMatchEtag     string     `msgpack:"ifm"`   // if-match etag for CAS semantics
-	OwnerID         string     `msgpack:"own"`   // uploading user ID
+	BlobID         string     `msgpack:"bid"`           // target blob ID in S3
+	S3MultipartID  string     `msgpack:"s3mid"`         // S3 multipart upload ID
+	Parts          []PartInfo `msgpack:"parts"`         // completed parts
+	SizeIsDeferred bool       `msgpack:"sdef"`          // true if total size is not yet known
+	IfMatchEtag    string     `msgpack:"ifm"`           // if-match etag for CAS semantics
+	OwnerID        string     `msgpack:"own"`           // uploading user ID
+	ClientMTime    string     `msgpack:"cmt,omitempty"` // the client's modification time; "" when absent
+	LockID         string     `msgpack:"lid,omitempty"` // the lock id the upload was initiated with
 }
 
 // --- Conversion helpers ---
@@ -156,7 +172,7 @@ func (n *NodeEntry) ToResourceInfo(path string) *provider.ResourceInfo {
 		Path:     path,
 		Name:     n.Name,
 		MimeType: n.MimeType,
-		Etag:     n.ETag,
+		Etag:     quotedEtag(n.ETag),
 		Size:     uint64(n.Size),
 		Mtime: &types.Timestamp{
 			Seconds: uint64(n.MTime / int64(time.Second)),
@@ -190,9 +206,42 @@ func (n *NodeEntry) ToResourceInfo(path string) *provider.ResourceInfo {
 		},
 	}
 
-	ri.Lock = n.ToLock()
+	if lock := n.ToLock(); lock != nil {
+		ri.Lock = lock
+		// ocdav renders lock discovery from this entry, which decomposedfs fills the same way.
+		ri.Opaque = utils.AppendJSONToOpaque(ri.Opaque, "lock", n.discoveryLock())
+	}
 
 	return ri
+}
+
+// discoveryLock is the lock as ocdav's lock discovery reads it. ocdav writes the lock's plain
+// opaque entries (lockownername, locktime) into PROPFIND XML unescaped, so they are escaped here.
+func (n *NodeEntry) discoveryLock() *provider.Lock {
+	lock := n.ToLock()
+	for _, e := range lock.GetOpaque().GetMap() {
+		if e.GetDecoder() == "plain" {
+			var b strings.Builder
+			_ = xml.EscapeText(&b, e.GetValue())
+			e.Value = []byte(b.String())
+		}
+	}
+	return lock
+}
+
+// lockMeta returns the plain entries of a lock's opaque map, nil when there are none.
+func lockMeta(o *types.Opaque) map[string]string {
+	var meta map[string]string
+	for k, e := range o.GetMap() {
+		if e.GetDecoder() != "plain" {
+			continue
+		}
+		if meta == nil {
+			meta = map[string]string{}
+		}
+		meta[k] = string(e.GetValue())
+	}
+	return meta
 }
 
 // ToLock converts a LockEntry to a CS3 Lock. Returns nil for expired or absent locks.
@@ -209,7 +258,10 @@ func (n *NodeEntry) ToLock() *provider.Lock {
 		AppName: n.Lock.AppName,
 	}
 	if n.Lock.UserID != "" {
-		lock.User = &user.UserId{OpaqueId: n.Lock.UserID}
+		lock.User = &user.UserId{OpaqueId: n.Lock.UserID, Idp: n.Lock.UserIdp}
+	}
+	for k, v := range n.Lock.Meta {
+		lock.Opaque = utils.AppendPlainToOpaque(lock.Opaque, k, v)
 	}
 	if n.Lock.Expiry > 0 {
 		lock.Expiration = &types.Timestamp{

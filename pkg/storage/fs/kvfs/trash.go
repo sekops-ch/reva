@@ -129,59 +129,91 @@ func (d *kvfsDriver) RestoreRecycleItem(ctx context.Context, ref *provider.Refer
 
 	now := time.Now().UnixNano()
 	restoreName := filepath.Base(restorePath)
+	// A name that maps to another node is refused before any write; the parent update re-checks it.
+	if children, _, err := d.store.GetChildren(spaceID, parentID); err == nil {
+		if id, ok := children[restoreName]; ok && id != trashItem.NodeID {
+			return errtypes.AlreadyExists(restoreName)
+		}
+	}
 	var restoredNodeID string
 	var restoredSize int64
+	var undo func() error // reverts the node write; the item stays in the trash
 
-	// For directories: the node and its entire subtree are still alive in KV
-	// (Delete keeps them for restorability). Update the live node in place.
-	// For files (or old-format trash where the node was deleted): re-create
-	// from the snapshot stored in the trash entry.
+	// A file keeps its date and etag from the trash snapshot, so clients that kept a copy
+	// download nothing; a live directory keeps its date and gets a fresh etag, so clients list
+	// it again. Locks are dropped, as decomposedfs drops them on delete.
 	if trashItem.Node.Type == NodeTypeDir {
 		liveNode, rev, gerr := d.store.GetNode(spaceID, trashItem.NodeID)
 		if gerr == nil {
+			trashed := *liveNode
+			undo = func() error {
+				return d.putNodeWithCAS(spaceID, trashed.ID, func(n *NodeEntry) {
+					n.ParentID, n.Name, n.ETag, n.Trashed = trashed.ParentID, trashed.Name, trashed.ETag, trashed.Trashed
+				})
+			}
 			liveNode.ParentID = parentID
 			liveNode.Name = restoreName
-			liveNode.MTime = now
 			liveNode.ETag = calculateEtag(liveNode.ID, now)
+			liveNode.Lock = nil
+			liveNode.Trashed = false
 			if err := d.store.PutNode(liveNode, rev); err != nil {
 				return errors.Wrap(err, "kvfs: failed to update restored directory node")
 			}
 			restoredNodeID = liveNode.ID
 			restoredSize = liveNode.Size
 		} else {
-			// Fallback for old trash entries where nodes were already deleted:
-			// re-create from snapshot (restores as empty directory)
+			// Old trash entries lost the subtree: the directory comes back empty, with a fresh
+			// date and etag and no size.
 			restoredNode := trashItem.Node
 			restoredNode.ParentID = parentID
 			restoredNode.Name = restoreName
 			restoredNode.MTime = now
 			restoredNode.ETag = calculateEtag(restoredNode.ID, now)
+			restoredNode.Size = 0
+			restoredNode.Lock = nil
+			restoredNode.Trashed = false
 			if err := d.store.PutNode(&restoredNode, 0); err != nil {
 				return err
 			}
+			createdChildren := true
 			if err := d.store.PutChildren(spaceID, restoredNode.ID, ChildMap{}, 0); err != nil {
+				createdChildren = false
 				d.log.Warn().Err(err).Str("node_id", restoredNode.ID).Msg("RestoreRecycleItem: failed to create children map for old-format directory")
+			}
+			undo = func() error {
+				if createdChildren {
+					if err := d.store.DeleteChildren(spaceID, restoredNode.ID); err != nil {
+						return err
+					}
+				}
+				return d.store.DeleteNode(spaceID, restoredNode.ID)
 			}
 			restoredNodeID = restoredNode.ID
 			restoredSize = restoredNode.Size
 		}
 	} else {
-		// File: re-create from snapshot (node was deleted at trash time)
 		restoredNode := trashItem.Node
 		restoredNode.ParentID = parentID
 		restoredNode.Name = restoreName
-		restoredNode.MTime = now
-		restoredNode.ETag = calculateEtag(restoredNode.ID, now)
+		restoredNode.Lock = nil
 		if err := d.store.PutNode(&restoredNode, 0); err != nil {
 			return err
 		}
+		undo = func() error { return d.store.DeleteNode(spaceID, restoredNode.ID) }
 		restoredNodeID = restoredNode.ID
 		restoredSize = restoredNode.Size
 	}
 
-	if err := d.updateChildrenWithCAS(spaceID, parentID, func(children ChildMap) {
+	if err := d.updateChildrenWithCASCheck(spaceID, parentID, func(children ChildMap) error {
+		if id, ok := children[restoreName]; ok && id != restoredNodeID {
+			return errtypes.AlreadyExists(restoreName)
+		}
 		children[restoreName] = restoredNodeID
+		return nil
 	}); err != nil {
+		if uerr := undo(); uerr != nil {
+			d.log.Error().Err(uerr).Str("space_id", spaceID).Str("node_id", restoredNodeID).Msg("RestoreRecycleItem: failed to revert the node write")
+		}
 		return err
 	}
 

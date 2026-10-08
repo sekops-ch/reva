@@ -452,7 +452,7 @@ func (d *kvfsDriver) spaceToCS3(space *SpaceEntry, rootNode *NodeEntry) *provide
 			QuotaMaxFiles:  0,
 			RemainingBytes: remainingBytes,
 		}
-		ss.Opaque = utils.AppendPlainToOpaque(ss.Opaque, "etag", rootNode.ETag)
+		ss.Opaque = utils.AppendPlainToOpaque(ss.Opaque, "etag", quotedEtag(rootNode.ETag))
 
 		// Populate grants in Opaque (required for Graph API member display)
 		if len(rootNode.Grants) > 0 {

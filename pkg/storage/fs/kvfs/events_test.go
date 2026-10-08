@@ -990,33 +990,28 @@ func TestDelete_NoUserInContext_Denied(t *testing.T) {
 
 // --- TouchFile must update parent ETag and publish event ---
 
-func TestTouchFile_ExistingFile_UpdatesParentETag(t *testing.T) {
+func TestTouchFile_ExistingFile_ChangesNothing(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
 	stream := newMockStream()
 	d := testDriverWithStream(store, blob, stream)
 
 	setupSpaceWithFile(store, "space-1", "root-1", "file-1", "test.txt")
-	parentBefore := store.nodes["space-1.root-1"]
-	origETag := parentBefore.ETag
+	origETag := store.nodes["space-1.root-1"].ETag
 
 	ctx := eventTestContext()
 	ref := &provider.Reference{
 		ResourceId: &provider.ResourceId{SpaceId: "space-1", OpaqueId: "file-1"},
 	}
 
-	err := d.TouchFile(ctx, ref, false, "")
-	if err != nil {
-		t.Fatalf("TouchFile failed: %v", err)
+	if err := d.TouchFile(ctx, ref, false, ""); !isAlreadyExists(err) {
+		t.Fatalf("TouchFile on an existing file = %v, want AlreadyExists", err)
 	}
-
-	parentAfter := store.nodes["space-1.root-1"]
-	if parentAfter.ETag == origETag {
-		t.Error("parent directory ETag did not change after TouchFile on existing file")
+	if store.nodes["space-1.root-1"].ETag != origETag {
+		t.Error("parent directory ETag changed")
 	}
-
-	if stream.eventCount() != 1 {
-		t.Errorf("expected 1 event, got %d", stream.eventCount())
+	if stream.eventCount() != 0 {
+		t.Errorf("expected no event, got %d", stream.eventCount())
 	}
 }
 

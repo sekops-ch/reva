@@ -40,6 +40,10 @@ type Options struct {
 	// KV bucket prefix (allows multiple instances to share a NATS cluster)
 	BucketPrefix string `mapstructure:"bucket_prefix"`
 
+	// MountID is the storage provider's mount id. Stat and listing replies get it from the
+	// provider; the simple-upload reply bypasses the provider, so the driver adds it there.
+	MountID string `mapstructure:"mount_id"`
+
 	// ChildrenMaxValueSize sets the per-value size cap on the children bucket
 	// in bytes. A single ChildMap (msgpack-encoded map of name -> nodeID) is
 	// stored per directory. With 36-char UUIDs and short filenames the default

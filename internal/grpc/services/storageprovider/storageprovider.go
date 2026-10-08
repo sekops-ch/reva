@@ -441,6 +441,8 @@ func (s *Service) InitiateFileUpload(ctx context.Context, req *provider.Initiate
 			st = status.NewFailedPrecondition(ctx, err, "failed precondition")
 		case errtypes.Locked:
 			st = status.NewLocked(ctx, "locked")
+		case errtypes.Aborted:
+			st = status.NewAborted(ctx, err, "aborted")
 		default:
 			st = status.NewInternal(ctx, "error getting upload id: "+err.Error())
 		}

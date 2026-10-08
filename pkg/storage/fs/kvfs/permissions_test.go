@@ -1398,3 +1398,54 @@ func TestLockOps_OwnerAllowed(t *testing.T) {
 		t.Fatalf("owner Unlock should succeed: %v", err)
 	}
 }
+
+// Delete checks the node's lock as decomposedfs does: a locked node needs its lock id, and a
+// lock id on an unlocked node is refused.
+func TestDelete_HonoursLocks(t *testing.T) {
+	locked := func(err error) bool { _, ok := err.(errtypes.IsLocked); return ok }
+	aborted := func(err error) bool { _, ok := err.(errtypes.IsAborted); return ok }
+	for _, c := range []struct {
+		name    string
+		lock    bool
+		lockID  string
+		refused func(error) bool
+	}{
+		{"locked without a lock id", true, "", locked},
+		{"locked with its lock id", true, "lock-123", nil},
+		{"locked with another lock id", true, "lock-456", aborted},
+		{"unlocked with a lock id", false, "lock-123", aborted},
+		{"unlocked without a lock id", false, "", nil},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			store := newMockMetadataStore()
+			d := testDriver(store, newMockBlobStore())
+			setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
+			if c.lock {
+				store.nodes["s1.f1"].Lock = &LockEntry{LockID: "lock-123", Type: 1, UserID: "alice"}
+			}
+			ctx := testContextWithUser("test-user-id", nil)
+			if c.lockID != "" {
+				ctx = contextWithLockID(ctx, c.lockID)
+			}
+
+			err := d.Delete(ctx, &provider.Reference{ResourceId: &provider.ResourceId{SpaceId: "s1", OpaqueId: "f1"}})
+			children, _, _ := store.GetChildren("s1", "root")
+			trash, _ := store.ListTrash("s1")
+			if c.refused == nil {
+				if err != nil {
+					t.Fatalf("Delete: %v", err)
+				}
+				if _, listed := children["file.txt"]; listed || len(trash) != 1 {
+					t.Errorf("after Delete: children %v, trash entries %d; want unlisted and trashed", children, len(trash))
+				}
+				return
+			}
+			if !c.refused(err) {
+				t.Fatalf("Delete = %v (%T), want it refused", err, err)
+			}
+			if children["file.txt"] != "f1" || len(trash) != 0 {
+				t.Errorf("a refused Delete changed the tree: children %v, trash entries %d", children, len(trash))
+			}
+		})
+	}
+}

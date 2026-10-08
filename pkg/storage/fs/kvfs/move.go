@@ -17,7 +17,6 @@ package kvfs
 
 import (
 	"context"
-	"time"
 
 	provider "github.com/cs3org/go-cs3apis/cs3/storage/provider/v1beta1"
 
@@ -30,6 +29,9 @@ import (
 func (d *kvfsDriver) Move(ctx context.Context, oldRef, newRef *provider.Reference) error {
 	// Phase 1: Validate (read-only, no mutations)
 
+	if err := d.refuseTrashed(oldRef); err != nil {
+		return err
+	}
 	spaceID, nodeID, node, _, err := d.resolveAndAuthorize(ctx, oldRef, func(rp *provider.ResourcePermissions) bool { return rp.Move })
 	if err != nil {
 		return err
@@ -46,21 +48,17 @@ func (d *kvfsDriver) Move(ctx context.Context, oldRef, newRef *provider.Referenc
 	oldParentID := node.ParentID
 	oldName := node.Name
 
-	destSpaceID, newParentID, newName, err := d.resolveParentRef(ctx, newRef)
+	destSpaceID, destParentNode, newName, err := d.resolveParent(ctx, newRef)
 	if err != nil {
 		return err
 	}
+	newParentID := destParentNode.ID
 
 	if destSpaceID != spaceID {
 		return errtypes.BadRequest("cross-space move is not supported")
 	}
-
-	destParentNode, _, err := d.store.GetNode(spaceID, newParentID)
-	if err != nil {
-		if err == ErrNodeNotFound {
-			return errtypes.NotFound("destination parent not found")
-		}
-		return err
+	if newParentID == oldParentID && newName == oldName {
+		return nil
 	}
 
 	drp := d.assemblePermissions(ctx, spaceID, destParentNode)
@@ -88,14 +86,11 @@ func (d *kvfsDriver) Move(ctx context.Context, oldRef, newRef *provider.Referenc
 	commitCtx, cancel := d.commitPhase(ctx)
 	defer cancel()
 
-	now := time.Now().UnixNano()
-	newETag := calculateEtag(nodeID, now)
-
+	// The node keeps its date and etag: its content is unchanged, and the parents' propagation
+	// below is what tells clients about the move.
 	if err := d.putNodeWithCAS(spaceID, nodeID, func(n *NodeEntry) {
 		n.ParentID = newParentID
 		n.Name = newName
-		n.MTime = now
-		n.ETag = newETag
 	}); err != nil {
 		return err
 	}
@@ -110,8 +105,6 @@ func (d *kvfsDriver) Move(ctx context.Context, oldRef, newRef *provider.Referenc
 		revertErr := d.putNodeWithCAS(spaceID, nodeID, func(n *NodeEntry) {
 			n.ParentID = oldParentID
 			n.Name = oldName
-			n.MTime = now
-			n.ETag = calculateEtag(nodeID, now)
 		})
 		if revertErr != nil {
 			d.log.Error().Err(revertErr).
@@ -122,7 +115,9 @@ func (d *kvfsDriver) Move(ctx context.Context, oldRef, newRef *provider.Referenc
 	}
 
 	if err := d.updateChildrenWithCAS(spaceID, oldParentID, func(children ChildMap) {
-		delete(children, oldName)
+		if children[oldName] == nodeID { // another node may have taken the name since
+			delete(children, oldName)
+		}
 	}); err != nil {
 		d.log.Warn().Err(err).
 			Str("space_id", spaceID).Str("node_id", nodeID).

@@ -343,12 +343,12 @@ func TestInitiateUpload_QuotaOK(t *testing.T) {
 	}
 }
 
-func TestInitiateUpload_DeferredLength(t *testing.T) {
+func TestInitiateUpload_EmptyUploadSkipsQuota(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
 	d := testDriver(store, blob)
 	setupSpaceEmpty(store, "s1", "root")
-	setQuota(store, "s1", 500, 400)
+	setQuota(store, "s1", 500, 500)
 
 	ctx := testContext()
 	ref := &provider.Reference{
@@ -356,12 +356,18 @@ func TestInitiateUpload_DeferredLength(t *testing.T) {
 		Path:       "./newfile.txt",
 	}
 
-	// uploadLength=0 means deferred length — cannot check quota
+	// An empty upload commits at initiation and adds no bytes, so a full quota does not stop it.
 	result, err := d.InitiateUpload(ctx, ref, 0, map[string]string{})
 	if err != nil {
-		t.Fatalf("deferred-length InitiateUpload should not check quota: %v", err)
+		t.Fatalf("empty InitiateUpload on a full quota: %v", err)
 	}
-	if _, ok := result["simple"]; !ok {
-		t.Error("result should contain 'simple' protocol")
+	if _, ok := result["simple"]; !ok || result["tus"] != "" {
+		t.Errorf("result = %v, want the simple protocol only", result)
+	}
+	if children, _, _ := store.GetChildren("s1", "root"); children["newfile.txt"] == "" {
+		t.Error("the empty file was not created")
+	}
+	if len(store.uploads) != 0 {
+		t.Errorf("%d upload sessions, want none", len(store.uploads))
 	}
 }

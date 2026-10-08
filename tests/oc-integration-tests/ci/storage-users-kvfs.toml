@@ -41,6 +41,7 @@ temp_folder = "/woodpecker/src/reva/tmp"
 [http.services.dataprovider.drivers.kvfs]
 nats_nodes = ["nats://nats:4222"]
 bucket_prefix = "kvfs-ci"
+mount_id = "1284d238-aa92-42ce-bdc4-0b0000009157"
 "s3.endpoint" = "http://ceph:8080"
 "s3.region" = "default"
 "s3.bucket" = "test"

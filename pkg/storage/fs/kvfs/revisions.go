@@ -92,6 +92,23 @@ func revisionOwnerRef(ref *provider.Reference) (*provider.Reference, string, err
 	}}, key, nil
 }
 
+// versionOwnerRef returns the reference to authorize for a version key: the node the key names,
+// in the reference's space, as in decomposedfs (the web restores through the parent folder's id).
+// A bare entry key keeps the reference's node.
+func versionOwnerRef(ref *provider.Reference, key string) (*provider.Reference, error) {
+	nodeID, _, err := splitRevisionKey(key)
+	if err != nil {
+		return nil, err
+	}
+	if nodeID == "" {
+		return ref, nil
+	}
+	rid := ref.GetResourceId()
+	return &provider.Reference{ResourceId: &provider.ResourceId{
+		StorageId: rid.GetStorageId(), SpaceId: rid.GetSpaceId(), OpaqueId: nodeID,
+	}}, nil
+}
+
 // lookupVersion returns nodeID's entry for a revision or bare key. A revision
 // key naming another node is NotFound: the caller authorized nodeID only.
 func (d *kvfsDriver) lookupVersion(spaceID, nodeID, key string) (*VersionEntry, error) {
@@ -121,7 +138,7 @@ func versionResourceInfo(node *NodeEntry, v *VersionEntry, path string) *provide
 		Path:     path,
 		Name:     node.Name,
 		MimeType: node.MimeType,
-		Etag:     v.ETag,
+		Etag:     quotedEtag(v.ETag),
 		Size:     uint64(v.Size),
 		Mtime: &types.Timestamp{
 			Seconds: uint64(v.MTime / int64(time.Second)),
@@ -186,14 +203,18 @@ func (d *kvfsDriver) ListRevisions(ctx context.Context, ref *provider.Reference)
 			Key:   revisionKey(nodeID, v.Key),
 			Size:  uint64(v.Size),
 			Mtime: uint64(v.MTime / int64(time.Second)),
-			Etag:  v.ETag,
+			Etag:  quotedEtag(v.ETag),
 		})
 	}
 	return result, nil
 }
 
 func (d *kvfsDriver) DownloadRevision(ctx context.Context, ref *provider.Reference, key string, openReaderFunc func(*provider.ResourceInfo) bool) (*provider.ResourceInfo, io.ReadCloser, error) {
-	spaceID, nodeID, node, _, err := d.resolveAndAuthorize(ctx, ref, func(rp *provider.ResourcePermissions) bool {
+	nodeRef, err := versionOwnerRef(ref, key)
+	if err != nil {
+		return nil, nil, err
+	}
+	spaceID, nodeID, node, _, err := d.resolveAndAuthorize(ctx, nodeRef, func(rp *provider.ResourcePermissions) bool {
 		return rp.ListFileVersions && rp.InitiateFileDownload
 	})
 	if err != nil {
@@ -210,6 +231,9 @@ func (d *kvfsDriver) DownloadRevision(ctx context.Context, ref *provider.Referen
 		return ri, nil, nil
 	}
 
+	if version.BlobID == "" { // empty content has no blob
+		return ri, io.NopCloser(strings.NewReader("")), nil
+	}
 	reader, err := d.blob.Download(ctx, BlobKey(spaceID, version.BlobID))
 	if err != nil {
 		return nil, nil, fmt.Errorf("kvfs: download version %q of node %s: %w", version.Key, nodeID, err)
@@ -221,7 +245,11 @@ func (d *kvfsDriver) DownloadRevision(ctx context.Context, ref *provider.Referen
 // RestoreRevision makes a version the file's content again; the replaced
 // content becomes a new version and the restored entry stays listed.
 func (d *kvfsDriver) RestoreRevision(ctx context.Context, ref *provider.Reference, key string) error {
-	spaceID, nodeID, authNode, _, err := d.resolveAndAuthorize(ctx, ref, func(rp *provider.ResourcePermissions) bool { return rp.RestoreFileVersion })
+	nodeRef, err := versionOwnerRef(ref, key)
+	if err != nil {
+		return err
+	}
+	spaceID, nodeID, authNode, _, err := d.resolveAndAuthorize(ctx, nodeRef, func(rp *provider.ResourcePermissions) bool { return rp.RestoreFileVersion })
 	if err != nil {
 		return err
 	}
@@ -245,6 +273,7 @@ func (d *kvfsDriver) RestoreRevision(ctx context.Context, ref *provider.Referenc
 	defer cancel()
 
 	// Snapshot before the head moves, so the replaced blob always stays referenced.
+	now := time.Now().UnixNano()
 	if !d.opts.DisableVersioning {
 		currentVersion := &VersionEntry{
 			Key:      uuid.New().String(),
@@ -256,6 +285,8 @@ func (d *kvfsDriver) RestoreRevision(ctx context.Context, ref *provider.Referenc
 			ETag:     node.ETag,
 			Size:     node.Size,
 			Checksum: node.Checksum,
+
+			SnapshotTime: now,
 		}
 		if err := d.store.PutVersion(currentVersion); err != nil {
 			d.log.Warn().Err(err).Str("node_id", nodeID).Msg("failed to create version entry")
@@ -267,8 +298,8 @@ func (d *kvfsDriver) RestoreRevision(ctx context.Context, ref *provider.Referenc
 	node.BlobSize = version.BlobSize
 	node.Size = version.Size
 	node.Checksum = version.Checksum
-	node.MTime = time.Now().UnixNano()
-	node.ETag = calculateEtag(nodeID, node.MTime)
+	node.MTime = now
+	node.ETag = calculateEtag(nodeID, now)
 
 	if err := d.store.PutNode(node, rev); err != nil {
 		return err
@@ -300,6 +331,15 @@ func (d *kvfsDriver) RestoreRevision(ctx context.Context, ref *provider.Referenc
 	return nil
 }
 
+// takenAt orders version entries by when they were taken. An entry without a SnapshotTime falls
+// back to its MTime, which is the commit time unless a client set the date.
+func (v *VersionEntry) takenAt() int64 {
+	if v.SnapshotTime != 0 {
+		return v.SnapshotTime
+	}
+	return v.MTime
+}
+
 // trimVersions caps a node's version entries at MaxVersions, keeping the
 // entries in keep plus the newest others. It deletes entries only: a version's
 // blob can also back the head or another entry, so GC reclaims blobs.
@@ -326,10 +366,10 @@ func (d *kvfsDriver) trimVersions(ctx context.Context, spaceID, nodeID string, k
 		}
 		others = append(others, v)
 	}
-	// Newest first; the key breaks MTime ties so the choice is deterministic.
+	// Newest first; the key breaks ties so the choice is deterministic.
 	sort.Slice(others, func(i, j int) bool {
-		if others[i].MTime != others[j].MTime {
-			return others[i].MTime > others[j].MTime
+		if ti, tj := others[i].takenAt(), others[j].takenAt(); ti != tj {
+			return ti > tj
 		}
 		return others[i].Key < others[j].Key
 	})

@@ -71,8 +71,11 @@ typically run side-by-side in OpenCloud, one for `storage-users` and one for
 
 Components:
 
-- **`kvfsDriver`** ([`kvfs.go`](kvfs.go)) — implements every `storage.FS`
-  method; orchestrates KV + S3.
+- **`kvfsDriver`** ([`kvfs.go`](kvfs.go), with one file per operation group:
+  [`initiate.go`](initiate.go), [`commit.go`](commit.go), [`touch.go`](touch.go),
+  [`upload.go`](upload.go), [`spaces.go`](spaces.go), [`move.go`](move.go),
+  [`revisions.go`](revisions.go), [`trash.go`](trash.go)) — implements every
+  `storage.FS` method; orchestrates KV + S3.
 - **`KVStore`** ([`kvstore.go`](kvstore.go)) — typed wrapper around NATS KV
   with msgpack codec, CAS, and generic list helpers.
 - **`BlobStore`** ([`blobstore.go`](blobstore.go)) — minio-go client; single
@@ -96,8 +99,8 @@ All values are msgpack-encoded; KV revision numbers drive CAS.
 | `<prefix>-children` | `<spaceID>.<parentID>` | [`ChildMap`](kvstore.go) (`map[name]nodeID`) | Directory listing |
 | `<prefix>-spaces` | `<spaceID>` | [`SpaceEntry`](node.go#L90) | Space root (type, owner, name, quota, root nodeID) |
 | `<prefix>-trash` | `<spaceID>.<trashKey>` | [`TrashEntry`](node.go#L101) | Soft-deleted item with full node snapshot + original path |
-| `<prefix>-versions` | `<spaceID>.<nodeID>.<versionKey>` | [`VersionEntry`](node.go#L113) | File revision: blob ID (shared with the head after a restore), size, etag, checksum |
-| `<prefix>-uploads` | `<uploadID>` | [`UploadSession`](node.go#L126) | TUS multipart upload state (S3 multipart ID, parts, offset, expiry, if-match) |
+| `<prefix>-versions` | `<spaceID>.<nodeID>.<versionKey>` | [`VersionEntry`](node.go#L113) | File revision: blob ID (shared with the head after a restore), size, etag, checksum, content date, snapshot time |
+| `<prefix>-uploads` | `<uploadID>` | [`UploadSession`](node.go#L126) | TUS multipart upload state (S3 multipart ID, parts, offset, expiry, if-match, client modification time, lock id) |
 | `<prefix>-locks` | `<lockKey>` (e.g. `gc-sweep`) | JSON `kvLockEntry` | Distributed locks for cross-pod coordination |
 
 **Why msgpack:** compact, schema-flexible, widely supported. msgpack tags on
@@ -121,21 +124,26 @@ unreferenced.
   spaces (KVFS invariant; see `ToResourceInfo` in [`node.go:184`](node.go#L184)).
 - **Path is derived**, not stored: `buildPath` walks `ParentID` chains from the
   node up to the space root.
+- **References**: a path in a reference is relative to the referenced node (the
+  space root when the reference names none), and path `.` names the referenced
+  node itself; writes refuse a parent that is not a folder (NotFound to callers who
+  may not see it), and creates, uploads, moves and deletes refuse a referenced node in
+  a trashed directory (NotFound).
 
 ## 4. Operations — `storage.FS` mapping
 
 How each interface method translates to backend operations. "CAS-retried" means
-the operation runs in a `defaultMaxCASRetries = 10` loop with exponential
-backoff (1–50 ms + jitter); see [`kvfs.go:54`](kvfs.go#L54).
+the operation runs in a loop of up to `MaxCASRetries` attempts (100 by default)
+with exponential backoff (1–50 ms + jitter); see [`cas.go`](cas.go).
 
 ### 4.1 Namespace
 
 | Method | KV ops | S3 ops | Notes |
 |---|---|---|---|
 | `CreateDir` | CAS `nodes` create + CAS `children` of parent + tree-size propagation | — | MTime + ETag propagated to space root via `propagateTreeSize` |
-| `TouchFile` | CAS `nodes` create or update + CAS `children` of parent | — | Optional `processing` flag for async upload pipelines |
-| `Move` | CAS update of (old parent `children`, new parent `children`, node `ParentID`) — 3-phase | — | Same-name overwrite supported; emits `ItemMoved` |
-| `Delete` | Snapshot to `trash` + remove from parent `children` | — | Soft delete; emits `ItemTrashed`. Blob deletion deferred until `PurgeRecycleItem` |
+| `TouchFile` | CAS `nodes` create + CAS-checked `children` of parent | — | Creates an empty file that keeps the client's modification time; an existing node is `AlreadyExists` (callers then upload the empty content); `markprocessing` only flags an existing node |
+| `Move` | CAS update of (old parent `children`, new parent `children`, node `ParentID`) — 3-phase | — | The node keeps its MTime and ETag; the parents and their ancestors propagate; emits `ItemMoved`. A move onto the node's own name is a no-op |
+| `Delete` | Snapshot to `trash` + remove from parent `children` | — | Soft delete; a locked node needs its lock id; a directory stays in KV marked `Trashed`, and nothing below it can be created, uploaded, moved or deleted by id until restored (uploads already in flight still commit); emits `ItemTrashed`. Blob deletion deferred until `PurgeRecycleItem` |
 | `CreateReference` | — | — | **Not supported** — symlinks are out of scope |
 | `GetPathByID` | Walk `ParentID` via `nodes` reads | — | |
 | `GetMD` | `nodes` get | — | Permission-gated; a revision key `<nodeID>.REV.<key>` as opaque ID stats that version (Stat + ListFileVersions) |
@@ -145,12 +153,12 @@ backoff (1–50 ms + jitter); see [`kvfs.go:54`](kvfs.go#L54).
 
 | Method | KV ops | S3 ops | Notes |
 |---|---|---|---|
-| `Upload` (simple PUT) | `commitFileNode` CAS-retry | `PUT` (single object) | Streams body → S3 while computing SHA-1; emits `FileUploaded` |
-| `InitiateUpload` (TUS) | `PutUpload` (new session) | `InitiateMultipartUpload` | Returns TUS session ID in storage map |
+| `Upload` (simple PUT) | `commitFileNode` CAS-retry | `PUT` (single object) | Streams body → S3 while computing SHA-1; the file keeps the client's modification time (`X-OC-Mtime`, TUS `mtime`); an overwrite checks the lock again with `X-Lock-Id` or the lock id from initiation; emits `FileUploaded` |
+| `InitiateUpload` (TUS) | `PutUpload` (new session) | `InitiateMultipartUpload` | Returns TUS session ID in storage map; sessions only after the permission check; a missing parent of a non-empty upload gets the simple protocol only, other errors are returned; a folder target is `PreconditionFailed`; an existing file's lock is checked (a locked file needs its lock id); an empty upload commits here and keeps the replaced content as a version or fails |
 | `WriteChunk` (TUS) | `PutUpload` (offset++) | `UploadPart` | Per-chunk; gauge `kvfs_upload_in_flight{protocol="tus"}` |
-| `FinishUpload` (TUS) | `commitNode` CAS-retry + `DeleteUpload` | `CompleteMultipartUpload` | Computes SHA-1 from concatenation; emits `FileUploaded` |
+| `FinishUpload` (TUS) | `commitNode` CAS-retry + `DeleteUpload` | `CompleteMultipartUpload` | Computes SHA-1 from concatenation; an overwrite checks the lock with the lock id from initiation, and a refusal by the lock discards the session (423); emits `FileUploaded` |
 | `Terminate` (TUS) | `DeleteUpload` | `AbortMultipartUpload` | |
-| `Download` | `nodes` get | `GET` (stream) | A revision key as opaque ID streams that version (ListFileVersions + InitiateFileDownload) |
+| `Download` | `nodes` get | `GET` (stream) | A revision key as opaque ID streams that version (ListFileVersions + InitiateFileDownload); empty content has no blob and reads as nothing |
 
 ### 4.3 Spaces
 
@@ -168,16 +176,16 @@ backoff (1–50 ms + jitter); see [`kvfs.go:54`](kvfs.go#L54).
 | Method | KV ops | S3 ops | Notes |
 |---|---|---|---|
 | `ListRecycle` | `ListTrash(spaceID)` | — | |
-| `RestoreRecycleItem` | `PutNode` + parent `children` update + `DeleteTrash` | — | `restoreRef` supports move-on-restore; idempotent (`NotFound` on missing key) |
+| `RestoreRecycleItem` | `PutNode` + CAS-checked parent `children` update + `DeleteTrash` | — | `restoreRef` supports move-on-restore; idempotent (`NotFound` on missing key); a file keeps its MTime and ETag, a directory its MTime with a fresh ETag; the restored item carries no lock; a name that maps to another node is `AlreadyExists` and the item stays in the trash |
 | `PurgeRecycleItem` | `DeleteTrash` | `Delete` (blob) | Idempotent |
 | `EmptyRecycle` | Bulk `DeleteTrash` | Bulk `Delete` | |
 | `ListRevisions` | `ListVersions(spaceID, nodeID)` | — | Keys are revision keys (decomposedfs/posix format), so ocdav can address a version |
-| `DownloadRevision` | `GetVersion` | `GET` | Accepts revision and bare keys; a key naming another node is NotFound |
-| `RestoreRevision` | `PutVersion` (current → new entry) + CAS `PutNode` + trim | — (blob re-pointed, not copied) | Restored entry stays listed; trimming runs after the head commit and never drops it |
+| `DownloadRevision` | `GetVersion` | `GET` | Accepts revision and bare keys; a revision key's node is authorized in the reference's space (as in decomposedfs), a bare key uses the reference's node |
+| `RestoreRevision` | `PutVersion` (current → new entry) + CAS `PutNode` + trim | — (blob re-pointed, not copied) | Restores the node the key names, as `DownloadRevision` resolves it; the restored entry stays listed; trimming runs after the head commit and never drops it |
 | `AddGrant` / `RemoveGrant` / `UpdateGrant` | CAS update of `NodeEntry.Grants` | — | Inline ACL; CAS-retried |
 | `DenyGrant` | — | — | **Not supported** |
 | `ListGrants` | `nodes` get | — | Populates `Opaque` with role metadata |
-| `GetLock` / `SetLock` / `RefreshLock` / `Unlock` | CAS update of `NodeEntry.Lock` | — | Inline lock with TTL; expired locks treated as absent |
+| `GetLock` / `SetLock` / `RefreshLock` / `Unlock` | CAS update of `NodeEntry.Lock` | — | Inline lock with TTL; expired locks treated as absent; a live lock is also in resource infos (opaque `lock`, JSON) for WebDAV lock discovery, with its owner's identity provider and plain opaque entries (ocdav's `lockownername`, `locktime`, XML-escaped there because ocdav writes them into PROPFIND unescaped). As in decomposedfs: locking a locked node is `PreconditionFailed`; a refresh names the lock by `existingLockID` or its own id and replaces it as given; refresh and unlock need the holder (same app, and for a user's lock that user calling), except for shared locks |
 | `SetArbitraryMetadata` / `UnsetArbitraryMetadata` | CAS update of `NodeEntry.Metadata` | — | |
 | `AddLabel` / `RemoveLabel` (favorites) | CAS update of `NodeEntry.Favorites` | — | Only `"favorite"` label supported (parity with decomposedfs); other labels return `BadRequest` |
 
@@ -190,8 +198,8 @@ revision numbers. There are no cross-key transactions.
 - **Update** uses the revision returned by the most recent `Get` as
   `expectedRev`. Mismatch yields `ErrCASConflict`.
 - **Retry**: every CAS-bound mutation runs in a loop bounded by
-  `defaultMaxCASRetries = 10`, with exponential backoff + jitter capped at
-  50 ms (`casBackoff` in [`kvfs.go`](kvfs.go)).
+  `MaxCASRetries` (100 by default), with exponential backoff + jitter capped at
+  50 ms (`casBackoff` in [`cas.go`](cas.go)).
 - **Conflict resolution for `PutChildren`**: on a create conflict, the helper
   re-reads, merges the new entry into the existing children map, and retries.
   This handles the common "two creates race" case without escalating an error.
@@ -217,7 +225,7 @@ client ── PUT body ──▶ kvfs.Upload
                           ├─▶ checkQuota
                           ├─▶ blob.Upload (S3 single PUT, hashing SHA-1 inline)
                           └─▶ commitFileNode (CAS-retried)
-                                   ├─ overwrite: snapshot the previous head into a VersionEntry (first attempt only)
+                                   ├─ overwrite: snapshot the replaced head into a VersionEntry (a CAS retry also keeps a racing writer's content)
                                    ├─ create: add the node to the parent children map
                                    ├─ CAS update of NodeEntry (with new BlobID)
                                    ├─ propagate tree size
@@ -225,6 +233,10 @@ client ── PUT body ──▶ kvfs.Upload
 ```
 
 Emits `events.FileUploaded`.
+
+The simple-upload id that `InitiateUpload` hands out is `<ref>/<path>?<query>` (`if-match`,
+`tus-sibling`, `mtime`, `lock-id`). The query is always present and is read from the last `?`, so file names may
+contain `?`, `&` or `=`.
 
 ### 6.2 TUS resumable (`InitiateUpload` / `WriteChunk` / `FinishUpload`)
 
@@ -290,6 +302,7 @@ All fields are loadable from a `map[string]interface{}` via `mapstructure`
 | `S3Bucket` | `s3.bucket` | — | Bucket for blobs |
 | `S3AccessKey` / `S3SecretKey` | `s3.access_key` / `s3.secret_key` | — | S3 credentials |
 | `BucketPrefix` | `bucket_prefix` | `oc` | KV bucket name prefix |
+| `MountID` | `mount_id` | — | Storage provider mount id (set by the provider); prefixes the simple-upload reply id |
 | `DisableVersioning` | `disable_versioning` | `false` | Skip version creation on overwrite |
 | `MaxVersions` | `max_versions` | `0` (unlimited) | Per-file cap on version entries |
 | `GCEnabled` | `gc_enabled` | `false` | Run the GC loop |
@@ -299,8 +312,9 @@ All fields are loadable from a `map[string]interface{}` via `mapstructure`
 | `GCRunOnStart` | `gc_run_on_start` | `false` | Immediate sweep at boot |
 
 Trimming removes version entries only and relies on `gc_enabled` to reclaim
-their blobs. At the cap a restore keeps the restored entry and drops the oldest
-other one; at `max_versions = 1` the replaced content is not kept.
+their blobs. Entries are ordered by when they were taken, not by their content
+dates, which clients set. At the cap a restore keeps the restored entry and drops
+the oldest other one; at `max_versions = 1` the replaced content is not kept.
 
 ## 9. Observability
 
@@ -385,7 +399,7 @@ the driver in both implementations).
 | TUS resumable upload | ✅ | ✅ | `Core` + `Terminater` + `LengthDeferrer` |
 | TUS concatenation | ✅ | ❌ | Not implemented |
 | Tree-size propagation | ✅ (sync/async) | ⚠️ | Synchronous, best-effort; drift counter exposes failures |
-| ETag computation | ✅ | ✅ | SHA-256(nodeID + mtime), first 8 bytes |
+| ETag computation | ✅ | ✅ | SHA-256(nodeID + commit time), first 8 bytes; stored bare, handed out in double quotes; If-Match matches with or without the quotes |
 | MIME detection | ✅ | ✅ | reva `mime` package |
 | Storage spaces (personal/project) | ✅ | ✅ | |
 | Share spaces | ✅ | ➖ | `sharesstorageprovider` in both |
@@ -439,19 +453,29 @@ dependencies.
 |---|---|
 | [`cas_test.go`](cas_test.go) | CAS conflict handling, retries, merge logic |
 | [`checksum_test.go`](checksum_test.go) | SHA-1 computation in upload paths |
+| [`emptysave_test.go`](emptysave_test.go) | Empty saves: touch semantics, empty commits with versions and If-Match, folder targets, empty reads |
+| [`etag_test.go`](etag_test.go) | Quoted etags on every hand-out, If-Match with or without quotes, bare If-Match in upload ids and sessions |
 | [`events_test.go`](events_test.go) | Event publishing for all 8 event types |
 | [`gc_test.go`](gc_test.go) | Orphan detection, distributed lock, dry-run |
 | [`kvstore_test.go`](kvstore_test.go) | KV CAS semantics, list helpers |
+| [`initiate_test.go`](initiate_test.go) | `InitiateUpload` fails closed: read errors, invalid targets, session write errors |
+| [`lockops_test.go`](lockops_test.go) | Lock operations as in decomposedfs: conflicts, refresh shapes (WebDAV, WOPI), holder checks |
+| [`lockdiscovery_test.go`](lockdiscovery_test.go) | Locks in resource infos for lock discovery: WebDAV and app locks, expiry, unlock, refresh, msgpack compatibility |
 | [`listfolder_test.go`](listfolder_test.go) | Listing + permission filtering |
 | [`metrics_test.go`](metrics_test.go) | Prometheus metric recording |
 | [`move_test.go`](move_test.go) | Rename + cross-directory move |
 | [`permissions_test.go`](permissions_test.go) | Grant assembly, group walks, ACL gating |
 | [`quota_test.go`](quota_test.go) | Tree-size propagation, quota enforcement |
-| [`recycle_test.go`](recycle_test.go) | Trash → restore / purge / empty |
+| [`recycle_test.go`](recycle_test.go) | Trash → restore / purge / empty; restored dates; name clashes and undo |
+| [`resolve_test.go`](resolve_test.go) | Reference resolution: folder-relative paths, `.` targets, invalid names, parents that are files, hidden files below a path |
+| [`clientmtime_test.go`](clientmtime_test.go) | Client modification times: simple, TUS and touch; unusable values; snapshot order; msgpack compatibility |
+| [`simpleid_test.go`](simpleid_test.go) | Simple-upload ids: names with `?`, `&`, `=`, `%` round-trip; earlier ids parse |
 | [`space_test.go`](space_test.go) | Space lifecycle |
 | [`treesize_test.go`](treesize_test.go) | Ancestor sum updates, drift counter |
 | [`upload_test.go`](upload_test.go) | Simple + TUS, multipart parts, deferred length |
+| [`uploadreply_test.go`](uploadreply_test.go) | Upload replies name the uploaded file: no ids in the TUS info, the mount id on the simple reply |
 | [`revisions_test.go`](revisions_test.go) | Revision keys: stat, download and restore by key, node scoping, permissions |
+| [`uploadlock_test.go`](uploadlock_test.go) | Locks on uploads: initiation, simple and TUS commits, the session discard on Locked |
 | [`versions_test.go`](versions_test.go) | Version snapshots, entries-only trim, restore/trim interplay, GC reclamation of trimmed blobs |
 
 Run from this directory:

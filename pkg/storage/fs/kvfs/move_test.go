@@ -350,6 +350,9 @@ func TestMove_CollisionReturnsAlreadyExists(t *testing.T) {
 	if node.ParentID != "da" || node.Name != "file.txt" {
 		t.Errorf("node metadata should be reverted: got parent=%s name=%s", node.ParentID, node.Name)
 	}
+	if node.MTime != 1000 || node.ETag != "old-etag" {
+		t.Errorf("a failed move leaves the node's date and etag: got MTime=%d ETag=%q", node.MTime, node.ETag)
+	}
 }
 
 func TestMove_SameNodeRenameSucceeds(t *testing.T) {
@@ -403,6 +406,53 @@ func TestMove_OverwriteSelfNoCollision(t *testing.T) {
 	err := d.Move(ctx, oldRef, newRef)
 	if err != nil {
 		t.Fatalf("self-move should succeed: %v", err)
+	}
+	if children, _, _ := store.GetChildren("s1", "root"); children["file.txt"] != "f1" {
+		t.Errorf("a move onto its own name must keep the node listed; children = %v", children)
+	}
+	if node, _, _ := store.GetNode("s1", "f1"); node.ETag != "old-etag" {
+		t.Errorf("a no-op move changes nothing; ETag = %q", node.ETag)
+	}
+}
+
+// WOPI renames a document by name relative to its folder, also to the unchanged name.
+func TestMove_OntoOwnNameInSubfolder(t *testing.T) {
+	store := newMockMetadataStore()
+	d := testDriver(store, newMockBlobStore())
+	setupTwoFolders(store)
+	ctx := testContextWithUser("test-user-id", nil)
+
+	err := d.Move(ctx,
+		&provider.Reference{ResourceId: &provider.ResourceId{SpaceId: "s1", OpaqueId: "f1"}},
+		&provider.Reference{ResourceId: &provider.ResourceId{SpaceId: "s1", OpaqueId: "da"}, Path: "./file.txt"})
+	if err != nil {
+		t.Fatalf("rename to the unchanged name: %v", err)
+	}
+	if children, _, _ := store.GetChildren("s1", "da"); children["file.txt"] != "f1" {
+		t.Errorf("the document must stay listed in its folder; children = %v", children)
+	}
+}
+
+// The old name is removed only while it still names the moved node: another node may have
+// taken it between the node update and the old-parent update.
+func TestMove_KeepsAnOldNameTakenByAnotherNode(t *testing.T) {
+	store := newMockMetadataStore()
+	d := testDriver(store, newMockBlobStore())
+	setupTwoFolders(store)
+	store.nodes["s1.f9"] = &NodeEntry{ID: "f9", SpaceID: "s1", ParentID: "da", Name: "file.txt",
+		Type: NodeTypeFile, Owner: "test-user-id"}
+	store.nodeRevs["s1.f9"] = 1
+	store.children["s1.da"] = ChildMap{"file.txt": "f9"}
+	ctx := testContextWithUser("test-user-id", nil)
+
+	err := d.Move(ctx,
+		&provider.Reference{ResourceId: &provider.ResourceId{SpaceId: "s1", OpaqueId: "f1"}},
+		&provider.Reference{ResourceId: &provider.ResourceId{SpaceId: "s1", OpaqueId: "db"}, Path: "./moved.txt"})
+	if err != nil {
+		t.Fatalf("Move: %v", err)
+	}
+	if children, _, _ := store.GetChildren("s1", "da"); children["file.txt"] != "f9" {
+		t.Errorf("another node's entry under the old name was removed; children = %v", children)
 	}
 }
 
@@ -477,11 +527,11 @@ func TestMove_RenameInPlace(t *testing.T) {
 	if node.ParentID != "root" {
 		t.Errorf("parent should stay 'root', got %q", node.ParentID)
 	}
-	if node.MTime == 1000 {
-		t.Error("MTime should be updated")
+	if node.MTime != 1000 || node.ETag != "old-etag" {
+		t.Errorf("a rename keeps the node's date and etag: got MTime=%d ETag=%q", node.MTime, node.ETag)
 	}
-	if node.ETag == "old-etag" {
-		t.Error("ETag should be updated")
+	if root, _, _ := store.GetNode("s1", "root"); root.ETag == "" || root.MTime == 0 {
+		t.Error("the parent's etag and date should change so clients see the rename")
 	}
 
 	children, _, _ := store.GetChildren("s1", "root")
@@ -529,5 +579,39 @@ func TestMove_AcrossDirectories(t *testing.T) {
 	newChildren, _, _ := store.GetChildren("s1", "db")
 	if newChildren["moved-file.txt"] != "f1" {
 		t.Error("file should appear in new parent")
+	}
+
+	if node.MTime != 1000 || node.ETag != "old-etag" {
+		t.Errorf("a move keeps the node's date and etag: got MTime=%d ETag=%q", node.MTime, node.ETag)
+	}
+	for _, id := range []string{"da", "db", "root"} {
+		if n, _, _ := store.GetNode("s1", id); n.ETag == "" || n.MTime == 0 {
+			t.Errorf("%s should get a new etag and date from the move", id)
+		}
+	}
+}
+
+func TestMove_FolderKeepsItsEtagAndDate(t *testing.T) {
+	store := newMockMetadataStore()
+	d := testDriver(store, newMockBlobStore())
+	setupTwoFolders(store)
+	store.nodes["s1.da"].MTime, store.nodes["s1.da"].ETag = 500, "da-etag"
+	ctx := testContextWithUser("test-user-id", nil)
+	folder := &provider.Reference{ResourceId: &provider.ResourceId{SpaceId: "s1", OpaqueId: "da"}}
+
+	steps := []*provider.Reference{
+		{ResourceId: &provider.ResourceId{SpaceId: "s1", OpaqueId: "root"}, Path: "./folder-renamed"},
+		{ResourceId: &provider.ResourceId{SpaceId: "s1", OpaqueId: "root"}, Path: "./folder-b/folder-renamed"},
+	}
+	for i, dest := range steps {
+		if err := d.Move(ctx, folder, dest); err != nil {
+			t.Fatalf("step %d: %v", i, err)
+		}
+		if n, _, _ := store.GetNode("s1", "da"); n.MTime != 500 || n.ETag != "da-etag" {
+			t.Errorf("step %d: the moved folder keeps its date and etag: got MTime=%d ETag=%q", i, n.MTime, n.ETag)
+		}
+	}
+	if n, _, _ := store.GetNode("s1", "db"); n.ETag == "" {
+		t.Error("the destination folder should get a new etag")
 	}
 }
