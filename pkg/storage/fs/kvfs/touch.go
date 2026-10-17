@@ -25,7 +25,6 @@ import (
 
 	ctxpkg "github.com/opencloud-eu/reva/v2/pkg/ctx"
 	"github.com/opencloud-eu/reva/v2/pkg/errtypes"
-	"github.com/opencloud-eu/reva/v2/pkg/events"
 	"github.com/opencloud-eu/reva/v2/pkg/mime"
 )
 
@@ -118,16 +117,6 @@ func (d *kvfsDriver) createEmptyFile(ctx context.Context, spaceID, parentID, nam
 	}
 
 	d.propagateTreeSize(commitCtx, spaceID, parentID, 0)
-
-	d.publishEvent(commitCtx, func() interface{} {
-		return events.FileUploaded{
-			SpaceOwner: u.Id,
-			Executant:  u.Id,
-			Ref:        spaceRef(spaceID, newID),
-			Owner:      u.Id,
-			Timestamp:  nowTimestamp(),
-		}
-	})
 
 	return nil
 }

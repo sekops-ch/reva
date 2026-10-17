@@ -243,22 +243,11 @@ func (d *kvfsDriver) Upload(ctx context.Context, req storage.UploadRequest, uff 
 		}
 	})
 
-	// NATS JetStream KV's materialized view can lag the stream commit by a
-	// short window under hot-parent concurrent writes. Without this retry
-	// the next line dereferences a nil node and per-request recover()
-	// returns 500 with a panic stack trace — clean error is better.
+	// GetNode confirms any direct-read miss with one authoritative leader
+	// read, so a not-found here is real — no retry needed to shield the
+	// ResourceInfo below from replica lag.
 	node, _, err := d.store.GetNode(spaceID, nodeID)
-	if err != nil || node == nil {
-		for retry := 0; retry < 5; retry++ {
-			time.Sleep(time.Duration(10*(1<<retry)) * time.Millisecond)
-			if n, _, e := d.store.GetNode(spaceID, nodeID); e == nil && n != nil {
-				node = n
-				err = nil
-				break
-			}
-		}
-	}
-	if node == nil {
+	if err != nil {
 		return nil, errors.Wrap(err, "kvfs: node not visible after commit")
 	}
 	ri := node.ToResourceInfo(name)

@@ -23,9 +23,7 @@ import (
 	provider "github.com/cs3org/go-cs3apis/cs3/storage/provider/v1beta1"
 	types "github.com/cs3org/go-cs3apis/cs3/types/v1beta1"
 
-	ctxpkg "github.com/opencloud-eu/reva/v2/pkg/ctx"
 	"github.com/opencloud-eu/reva/v2/pkg/errtypes"
-	"github.com/opencloud-eu/reva/v2/pkg/events"
 	"github.com/pkg/errors"
 )
 
@@ -223,22 +221,6 @@ func (d *kvfsDriver) RestoreRecycleItem(ctx context.Context, ref *provider.Refer
 
 	d.propagateTreeSize(commitCtx, spaceID, parentID, restoredSize)
 
-	executant, _ := ctxpkg.ContextGetUser(ctx)
-	d.publishEvent(commitCtx, func() interface{} {
-		if executant == nil {
-			return nil
-		}
-		return events.ItemRestored{
-			SpaceOwner: executant.Id,
-			Executant:  executant.Id,
-			ID:         spaceResourceID(spaceID, restoredNodeID),
-			Ref:        spaceRef(spaceID, restoredNodeID),
-			Owner:      executant.Id,
-			Key:        key,
-			Timestamp:  nowTimestamp(),
-		}
-	})
-
 	return nil
 }
 
@@ -280,20 +262,6 @@ func (d *kvfsDriver) PurgeRecycleItem(ctx context.Context, ref *provider.Referen
 		return err
 	}
 
-	executant, _ := ctxpkg.ContextGetUser(ctx)
-	d.publishEvent(commitCtx, func() interface{} {
-		if executant == nil {
-			return nil
-		}
-		return events.ItemPurged{
-			Executant: executant.Id,
-			ID:        spaceResourceID(spaceID, trashItem.NodeID),
-			Ref:       spaceRef(spaceID, trashItem.NodeID),
-			Owner:     executant.Id,
-			Timestamp: nowTimestamp(),
-		}
-	})
-
 	return nil
 }
 
@@ -330,19 +298,6 @@ func (d *kvfsDriver) EmptyRecycle(ctx context.Context, ref *provider.Reference) 
 		}
 		d.store.DeleteTrash(spaceID, t.Key)
 	}
-
-	d.publishEvent(commitCtx, func() interface{} {
-		u, ok := ctxpkg.ContextGetUser(ctx)
-		if !ok {
-			return nil
-		}
-		return events.TrashbinPurged{
-			Executant: u.Id,
-			Ref:       ref,
-			Owner:     u.Id,
-			Timestamp: nowTimestamp(),
-		}
-	})
 
 	return nil
 }

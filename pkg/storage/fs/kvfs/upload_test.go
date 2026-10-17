@@ -331,6 +331,10 @@ func (m *mockMetadataStore) GetChildren(spaceID, parentID string) (ChildMap, uin
 	return cp, m.childRevs[key], nil
 }
 
+func (m *mockMetadataStore) GetChildrenAuthoritative(spaceID, parentID string) (ChildMap, uint64, error) {
+	return m.GetChildren(spaceID, parentID) // single in-memory map: always authoritative
+}
+
 func (m *mockMetadataStore) PutChildren(spaceID, parentID string, children ChildMap, expectedRev uint64) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

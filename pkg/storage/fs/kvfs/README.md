@@ -337,12 +337,21 @@ the oldest other one; at `max_versions = 1` the replaced content is not kept.
 
 ### 9.2 Events
 
-Published to the configured event stream via `publishEvent`:
+The driver publishes ONLY the events reva's gRPC eventsmiddleware cannot see,
+via `publishEvent`:
 
-`ContainerCreated`, `FileUploaded`, `FileDownloaded`, `FileVersionRestored`,
-`ItemMoved`, `ItemTrashed`, `ItemRestored`, `ItemPurged`.
+- `FileUploaded` — simple PUT, empty-file commit, TUS FinishUpload (there is
+  no `InitiateFileUpload` case in the middleware, and the datatx `uff`
+  callback path does not apply to this driver)
+- `ItemMoved` — the middleware has no Move case; decomposedfs also
+  self-publishes it
 
-These are the standard reva storage events consumed by OpenCloud's
+Every operation the middleware observes on its gRPC response keeps a single
+publisher there: `ContainerCreated`, `FileDownloaded` (on
+`InitiateFileDownload`), `ItemTrashed`, `ItemRestored`, `ItemPurged`,
+`TrashbinPurged`, `FileVersionRestored`, and `FileTouched` for `TouchFile`.
+A driver-side copy of any of these double-counts every operation on the event
+stream. These are the standard reva storage events consumed by OpenCloud's
 notifications, audit, and search services.
 
 ## 10. Feature parity vs decomposedfs / posix
@@ -405,7 +414,7 @@ the driver in both implementations).
 | Share spaces | ✅ | ➖ | `sharesstorageprovider` in both |
 | Quota enforcement | ✅ | ✅ | Pre-upload check |
 | Async postprocessing (antivirus, …) | ✅ | ❌ | Postprocessing event hooks not wired |
-| Event emission | ✅ | ✅ | 8 event types (§9.2) |
+| Event emission | ✅ | ✅ | driver-only events; the rest come from the eventsmiddleware (§9.2) |
 | Prometheus metrics | ⚠️ minimal | ✅ | KVFS exports 12 collectors (§9.1) |
 | GC of orphaned blobs | ❌ (delete-cascade only) | ✅ | Distributed-lock sweep with dry-run |
 | Cleanup of expired upload sessions | ✅ | ✅ | Aborts S3 multipart + removes session |
@@ -455,7 +464,7 @@ dependencies.
 | [`checksum_test.go`](checksum_test.go) | SHA-1 computation in upload paths |
 | [`emptysave_test.go`](emptysave_test.go) | Empty saves: touch semantics, empty commits with versions and If-Match, folder targets, empty reads |
 | [`etag_test.go`](etag_test.go) | Quoted etags on every hand-out, If-Match with or without quotes, bare If-Match in upload ids and sessions |
-| [`events_test.go`](events_test.go) | Event publishing for all 8 event types |
+| [`events_test.go`](events_test.go) | Driver-only event publishing; middleware-covered operations stay silent |
 | [`gc_test.go`](gc_test.go) | Orphan detection, distributed lock, dry-run |
 | [`kvstore_test.go`](kvstore_test.go) | KV CAS semantics, list helpers |
 | [`initiate_test.go`](initiate_test.go) | `InitiateUpload` fails closed: read errors, invalid targets, session write errors |

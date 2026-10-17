@@ -144,7 +144,7 @@ func New(m map[string]interface{}, stream events.Stream, log *zerolog.Logger) (s
 		return nil, err
 	}
 
-	blob, err := NewS3Blobstore(opts.S3Endpoint, opts.S3Region, opts.S3Bucket, opts.S3AccessKey, opts.S3SecretKey, opts.BucketPrefix)
+	blob, err := NewS3Blobstore(opts.S3Endpoint, opts.S3Region, opts.S3Bucket, opts.S3AccessKey, opts.S3SecretKey, opts.BucketPrefix, log)
 	if err != nil {
 		store.Close()
 		return nil, err
@@ -584,19 +584,6 @@ func (d *kvfsDriver) Download(ctx context.Context, ref *provider.Reference, open
 		}
 	}
 
-	executant, _ := ctxpkg.ContextGetUser(ctx)
-	d.publishEvent(ctx, func() interface{} {
-		if executant == nil {
-			return nil
-		}
-		return events.FileDownloaded{
-			Executant: executant.Id,
-			Ref:       spaceRef(spaceID, node.ID),
-			Owner:     executant.Id,
-			Timestamp: nowTimestamp(),
-		}
-	})
-
 	return ri, reader, nil
 }
 
@@ -744,17 +731,6 @@ func (d *kvfsDriver) CreateDir(ctx context.Context, ref *provider.Reference) err
 
 	d.propagateTreeSize(commitCtx, spaceID, parentID, 0)
 
-	d.publishEvent(commitCtx, func() interface{} {
-		return events.ContainerCreated{
-			SpaceOwner: u.Id,
-			Executant:  u.Id,
-			Ref:        spaceRef(spaceID, newID),
-			ParentID:   spaceResourceID(spaceID, parentID),
-			Owner:      u.Id,
-			Timestamp:  nowTimestamp(),
-		}
-	})
-
 	return nil
 }
 
@@ -830,21 +806,6 @@ func (d *kvfsDriver) Delete(ctx context.Context, ref *provider.Reference) error 
 
 	// Propagate size decrease + MTime/ETag to all ancestors.
 	d.propagateTreeSize(commitCtx, spaceID, node.ParentID, -node.Size)
-
-	executant, _ := ctxpkg.ContextGetUser(ctx)
-	d.publishEvent(commitCtx, func() interface{} {
-		if executant == nil {
-			return nil
-		}
-		return events.ItemTrashed{
-			SpaceOwner: executant.Id,
-			Executant:  executant.Id,
-			ID:         spaceResourceID(spaceID, nodeID),
-			Ref:        spaceRef(spaceID, nodeID),
-			Owner:      executant.Id,
-			Timestamp:  nowTimestamp(),
-		}
-	})
 
 	return nil
 }
@@ -1096,6 +1057,16 @@ func checkLockID(lockID string, node *NodeEntry) error {
 // publishEvent enqueues an event for the async publisher worker. The
 // event is constructed lazily via evf — on a no-stream driver or a
 // dropped overflow, the constructor never runs.
+//
+// Publisher inventory: the driver publishes ONLY what reva's gRPC
+// eventsmiddleware cannot observe — FileUploaded (simple PUT, empty-file
+// commit, TUS FinishUpload; the middleware has no InitiateFileUpload case and
+// the datatx uff callback path does not apply here) and ItemMoved (no Move
+// case in the middleware; decomposedfs self-publishes it too). Everything the
+// middleware emits on its gRPC responses (ContainerCreated, FileDownloaded,
+// ItemTrashed, ItemRestored, ItemPurged, TrashbinPurged, FileVersionRestored,
+// FileTouched) must NOT gain a driver-side copy: it double-counts every
+// operation on the event stream. See README §9.2.
 //
 // Previously this was synchronous (events.Publish ACK blocked the upload
 // response). Under burst load the event stream backed up and that latency

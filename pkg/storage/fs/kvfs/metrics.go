@@ -56,6 +56,13 @@ var (
 		Help: "Effective MaxDeleteDepth bound per kvfs instance (labeled by bucket prefix)",
 	}, []string{"prefix"})
 
+	// KVAuthoritativeReads counts leader reads confirming a direct KV miss:
+	// "hit" = the leader had a key a replica's view missed, "absent" = real miss.
+	KVAuthoritativeReads = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "kvfs_kv_authoritative_reads_total",
+		Help: "Authoritative leader reads confirming a direct KV miss, by bucket and outcome (hit = replica lag caught, absent = real miss).",
+	}, []string{"bucket", "outcome"})
+
 	// KVOperationDuration observes the duration of NATS KV operations.
 	KVOperationDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "kvfs_kv_operation_duration_seconds",

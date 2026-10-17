@@ -88,13 +88,13 @@ type mockKVStatus struct {
 	replicas int
 }
 
-func (s *mockKVStatus) Bucket() string            { return s.bucket }
-func (s *mockKVStatus) Values() uint64             { return 0 }
-func (s *mockKVStatus) History() int64             { return 1 }
-func (s *mockKVStatus) TTL() time.Duration         { return 0 }
-func (s *mockKVStatus) BackingStore() string       { return "JetStream" }
-func (s *mockKVStatus) Bytes() uint64              { return 0 }
-func (s *mockKVStatus) IsCompressed() bool         { return false }
+func (s *mockKVStatus) Bucket() string       { return s.bucket }
+func (s *mockKVStatus) Values() uint64       { return 0 }
+func (s *mockKVStatus) History() int64       { return 1 }
+func (s *mockKVStatus) TTL() time.Duration   { return 0 }
+func (s *mockKVStatus) BackingStore() string { return "JetStream" }
+func (s *mockKVStatus) Bytes() uint64        { return 0 }
+func (s *mockKVStatus) IsCompressed() bool   { return false }
 func (s *mockKVStatus) Config() nats.KeyValueConfig {
 	return nats.KeyValueConfig{Bucket: s.bucket, Replicas: s.replicas}
 }

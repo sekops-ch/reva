@@ -23,7 +23,6 @@ import (
 	provider "github.com/cs3org/go-cs3apis/cs3/storage/provider/v1beta1"
 
 	"github.com/opencloud-eu/reva/v2/pkg/errtypes"
-	revaevents "github.com/opencloud-eu/reva/v2/pkg/events"
 )
 
 // Revision keys are spelled out literally so the tests pin the wire format.
@@ -487,7 +486,7 @@ func TestRevisionKey_Permissions(t *testing.T) {
 	})
 }
 
-func TestRestoreRevision_EventKeyIsKeyAsReceived(t *testing.T) {
+func TestRestoreRevision_AcceptsBothKeyForms_DriverSilent(t *testing.T) {
 	for _, key := range []string{"ver-key-1", "file-1.REV.ver-key-1"} {
 		t.Run(key, func(t *testing.T) {
 			store := newMockMetadataStore()
@@ -504,12 +503,11 @@ func TestRestoreRevision_EventKeyIsKeyAsReceived(t *testing.T) {
 			if err := d.RestoreRevision(eventTestContext(), ref, key); err != nil {
 				t.Fatalf("RestoreRevision(%q): %v", key, err)
 			}
-			if stream.eventCount() != 1 {
-				t.Fatalf("events = %d, want 1", stream.eventCount())
-			}
-			fvr, ok := stream.lastEvent().payload.(revaevents.FileVersionRestored)
-			if !ok || fvr.Key != key {
-				t.Errorf("event = %#v, want FileVersionRestored with key %q", stream.lastEvent().payload, key)
+			// The eventsmiddleware publishes FileVersionRestored; the driver
+			// stays silent.
+			if n := stream.eventCount(); n != 0 {
+				t.Fatalf("driver published %d event(s) for RestoreRevision, want 0: %v",
+					n, stream.eventTypes())
 			}
 		})
 	}

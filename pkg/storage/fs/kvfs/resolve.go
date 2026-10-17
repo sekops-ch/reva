@@ -186,7 +186,17 @@ func (d *kvfsDriver) resolveRelativePath(ctx context.Context, spaceID, startNode
 		}
 		childID, exists := children[part]
 		if !exists {
-			return "", ErrNodeNotFound
+			// A replica's children map can trail a just-committed write, and a
+			// stale-but-present map is not a KV miss. Confirm the absent name
+			// once with the leader before answering not-found (the Stat that
+			// follows an upload resolves by name through here).
+			fresh, _, aerr := d.store.GetChildrenAuthoritative(spaceID, currentID)
+			if aerr != nil {
+				return "", errors.Wrapf(aerr, "kvfs: failed to confirm children of %s", currentID)
+			}
+			if childID, exists = fresh[part]; !exists {
+				return "", ErrNodeNotFound
+			}
 		}
 		currentID = childID
 	}

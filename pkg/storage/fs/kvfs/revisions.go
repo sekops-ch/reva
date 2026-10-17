@@ -30,9 +30,7 @@ import (
 	provider "github.com/cs3org/go-cs3apis/cs3/storage/provider/v1beta1"
 	types "github.com/cs3org/go-cs3apis/cs3/types/v1beta1"
 
-	ctxpkg "github.com/opencloud-eu/reva/v2/pkg/ctx"
 	"github.com/opencloud-eu/reva/v2/pkg/errtypes"
-	"github.com/opencloud-eu/reva/v2/pkg/events"
 )
 
 // revisionKeyDelimiter joins a node ID and a version-entry key; decomposedfs
@@ -312,21 +310,6 @@ func (d *kvfsDriver) RestoreRevision(ctx context.Context, ref *provider.Referenc
 	if !d.opts.DisableVersioning {
 		d.trimVersions(commitCtx, spaceID, nodeID, version.Key)
 	}
-
-	executant, _ := ctxpkg.ContextGetUser(ctx)
-	d.publishEvent(commitCtx, func() interface{} {
-		if executant == nil {
-			return nil
-		}
-		return events.FileVersionRestored{
-			SpaceOwner: executant.Id,
-			Executant:  executant.Id,
-			Ref:        spaceRef(spaceID, nodeID),
-			Owner:      executant.Id,
-			Key:        key,
-			Timestamp:  nowTimestamp(),
-		}
-	})
 
 	return nil
 }

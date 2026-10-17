@@ -132,7 +132,7 @@ func eventTestContext() context.Context {
 
 // --- CreateDir events ---
 
-func TestCreateDir_PublishesContainerCreated(t *testing.T) {
+func TestCreateDir_DriverStaysSilent(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
 	stream := newMockStream()
@@ -151,33 +151,11 @@ func TestCreateDir_PublishesContainerCreated(t *testing.T) {
 		t.Fatalf("CreateDir failed: %v", err)
 	}
 
-	if stream.eventCount() != 1 {
-		t.Fatalf("expected 1 event, got %d", stream.eventCount())
-	}
-
-	ev := stream.lastEvent()
-	cc, ok := ev.payload.(revaevents.ContainerCreated)
-	if !ok {
-		t.Fatalf("expected ContainerCreated, got %T", ev.payload)
-	}
-
-	if cc.Executant.OpaqueId != "test-user-id" {
-		t.Errorf("expected executant test-user-id, got %s", cc.Executant.OpaqueId)
-	}
-	if cc.SpaceOwner.OpaqueId != "test-user-id" {
-		t.Errorf("expected space owner test-user-id, got %s", cc.SpaceOwner.OpaqueId)
-	}
-	if cc.Ref == nil || cc.Ref.ResourceId == nil {
-		t.Fatal("expected non-nil ref with resource ID")
-	}
-	if cc.Ref.ResourceId.SpaceId != "space-1" {
-		t.Errorf("expected space-1 in ref, got %s", cc.Ref.ResourceId.SpaceId)
-	}
-	if cc.ParentID == nil || cc.ParentID.OpaqueId != "root-1" {
-		t.Error("expected ParentID to reference root-1")
-	}
-	if cc.Timestamp == nil {
-		t.Error("expected non-nil timestamp")
+	// The eventsmiddleware publishes ContainerCreated on the CreateContainer
+	// response; a driver copy would double-count every mkdir.
+	if n := stream.eventCount(); n != 0 {
+		t.Fatalf("driver published %d event(s) for CreateDir, want 0 (middleware covers it): %v",
+			n, stream.eventTypes())
 	}
 }
 
@@ -286,7 +264,7 @@ func TestUpload_Overwrite_PublishesFileUploaded(t *testing.T) {
 
 // --- Delete events ---
 
-func TestDelete_PublishesItemTrashed(t *testing.T) {
+func TestDelete_DriverStaysSilent(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
 	stream := newMockStream()
@@ -304,24 +282,10 @@ func TestDelete_PublishesItemTrashed(t *testing.T) {
 		t.Fatalf("Delete failed: %v", err)
 	}
 
-	if stream.eventCount() != 1 {
-		t.Fatalf("expected 1 event, got %d", stream.eventCount())
-	}
-
-	ev := stream.lastEvent()
-	it, ok := ev.payload.(revaevents.ItemTrashed)
-	if !ok {
-		t.Fatalf("expected ItemTrashed, got %T", ev.payload)
-	}
-
-	if it.Executant.OpaqueId != "test-user-id" {
-		t.Errorf("expected executant test-user-id, got %s", it.Executant.OpaqueId)
-	}
-	if it.ID == nil || it.ID.SpaceId != "space-1" || it.ID.OpaqueId != "file-1" {
-		t.Error("expected resource ID to match deleted file")
-	}
-	if it.Timestamp == nil {
-		t.Error("expected non-nil timestamp")
+	// The eventsmiddleware publishes ItemTrashed on the Delete response.
+	if n := stream.eventCount(); n != 0 {
+		t.Fatalf("driver published %d event(s) for Delete, want 0 (middleware covers it): %v",
+			n, stream.eventTypes())
 	}
 }
 
@@ -375,7 +339,7 @@ func TestMove_PublishesItemMoved(t *testing.T) {
 
 // --- RestoreRevision events ---
 
-func TestRestoreRevision_PublishesFileVersionRestored(t *testing.T) {
+func TestRestoreRevision_DriverStaysSilent(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
 	stream := newMockStream()
@@ -406,30 +370,17 @@ func TestRestoreRevision_PublishesFileVersionRestored(t *testing.T) {
 		t.Fatalf("RestoreRevision failed: %v", err)
 	}
 
-	if stream.eventCount() != 1 {
-		t.Fatalf("expected 1 event, got %d", stream.eventCount())
-	}
-
-	ev := stream.lastEvent()
-	fvr, ok := ev.payload.(revaevents.FileVersionRestored)
-	if !ok {
-		t.Fatalf("expected FileVersionRestored, got %T", ev.payload)
-	}
-
-	if fvr.Key != "ver-key-1" {
-		t.Errorf("expected key ver-key-1, got %s", fvr.Key)
-	}
-	if fvr.Ref == nil || fvr.Ref.ResourceId.OpaqueId != "file-1" {
-		t.Error("expected ref to point to file-1")
-	}
-	if fvr.Timestamp == nil {
-		t.Error("expected non-nil timestamp")
+	// The eventsmiddleware publishes FileVersionRestored on the
+	// RestoreFileVersion response.
+	if n := stream.eventCount(); n != 0 {
+		t.Fatalf("driver published %d event(s) for RestoreRevision, want 0 (middleware covers it): %v",
+			n, stream.eventTypes())
 	}
 }
 
 // --- RestoreRecycleItem events ---
 
-func TestRestoreRecycleItem_PublishesItemRestored(t *testing.T) {
+func TestRestoreRecycleItem_DriverStaysSilent(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
 	stream := newMockStream()
@@ -463,30 +414,17 @@ func TestRestoreRecycleItem_PublishesItemRestored(t *testing.T) {
 		t.Fatalf("RestoreRecycleItem failed: %v", err)
 	}
 
-	if stream.eventCount() != 1 {
-		t.Fatalf("expected 1 event, got %d", stream.eventCount())
-	}
-
-	ev := stream.lastEvent()
-	ir, ok := ev.payload.(revaevents.ItemRestored)
-	if !ok {
-		t.Fatalf("expected ItemRestored, got %T", ev.payload)
-	}
-
-	if ir.Key != "trash-key-1" {
-		t.Errorf("expected key trash-key-1, got %s", ir.Key)
-	}
-	if ir.ID == nil || ir.ID.OpaqueId != "trashed-node" {
-		t.Error("expected ID to match trashed node")
-	}
-	if ir.Timestamp == nil {
-		t.Error("expected non-nil timestamp")
+	// The eventsmiddleware publishes ItemRestored on the RestoreRecycleItem
+	// response.
+	if n := stream.eventCount(); n != 0 {
+		t.Fatalf("driver published %d event(s) for RestoreRecycleItem, want 0 (middleware covers it): %v",
+			n, stream.eventTypes())
 	}
 }
 
 // --- PurgeRecycleItem events ---
 
-func TestPurgeRecycleItem_PublishesItemPurged(t *testing.T) {
+func TestPurgeRecycleItem_DriverStaysSilent(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
 	stream := newMockStream()
@@ -517,30 +455,16 @@ func TestPurgeRecycleItem_PublishesItemPurged(t *testing.T) {
 		t.Fatalf("PurgeRecycleItem failed: %v", err)
 	}
 
-	if stream.eventCount() != 1 {
-		t.Fatalf("expected 1 event, got %d", stream.eventCount())
-	}
-
-	ev := stream.lastEvent()
-	ip, ok := ev.payload.(revaevents.ItemPurged)
-	if !ok {
-		t.Fatalf("expected ItemPurged, got %T", ev.payload)
-	}
-
-	if ip.ID == nil || ip.ID.OpaqueId != "purge-node" {
-		t.Error("expected ID to match purged node")
-	}
-	if ip.Executant.OpaqueId != "test-user-id" {
-		t.Errorf("expected executant test-user-id, got %s", ip.Executant.OpaqueId)
-	}
-	if ip.Timestamp == nil {
-		t.Error("expected non-nil timestamp")
+	// The eventsmiddleware publishes ItemPurged on the PurgeRecycle response.
+	if n := stream.eventCount(); n != 0 {
+		t.Fatalf("driver published %d event(s) for PurgeRecycleItem, want 0 (middleware covers it): %v",
+			n, stream.eventTypes())
 	}
 }
 
 // --- EmptyRecycle events ---
 
-func TestEmptyRecycle_PublishesTrashbinPurged(t *testing.T) {
+func TestEmptyRecycle_DriverStaysSilent(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
 	stream := newMockStream()
@@ -568,24 +492,11 @@ func TestEmptyRecycle_PublishesTrashbinPurged(t *testing.T) {
 		t.Fatalf("EmptyRecycle failed: %v", err)
 	}
 
-	if stream.eventCount() != 1 {
-		t.Fatalf("expected 1 TrashbinPurged event, got %d", stream.eventCount())
-	}
-
-	ev := stream.lastEvent()
-	tp, ok := ev.payload.(revaevents.TrashbinPurged)
-	if !ok {
-		t.Fatalf("expected TrashbinPurged, got %T", ev.payload)
-	}
-
-	if tp.Executant.OpaqueId != "test-user-id" {
-		t.Errorf("expected executant test-user-id, got %s", tp.Executant.OpaqueId)
-	}
-	if tp.Ref != ref {
-		t.Error("expected ref to match the passed reference")
-	}
-	if tp.Timestamp == nil {
-		t.Error("expected non-nil timestamp")
+	// The eventsmiddleware publishes TrashbinPurged (or ItemPurged) on the
+	// PurgeRecycle response.
+	if n := stream.eventCount(); n != 0 {
+		t.Fatalf("driver published %d event(s) for EmptyRecycle, want 0 (middleware covers it): %v",
+			n, stream.eventTypes())
 	}
 }
 
@@ -720,12 +631,18 @@ func TestEvent_HasCorrectTopic(t *testing.T) {
 	setupSpaceEmpty(store, "space-1", "root-1")
 
 	ctx := eventTestContext()
-	ref := &provider.Reference{
-		ResourceId: &provider.ResourceId{SpaceId: "space-1", OpaqueId: "root-1"},
-		Path:       "./topictest",
+	// Uploads are a driver-published event (no eventsmiddleware counterpart).
+	_, err := d.Upload(ctx, storage.UploadRequest{
+		Ref: &provider.Reference{
+			ResourceId: &provider.ResourceId{SpaceId: "space-1", OpaqueId: "root-1"},
+			Path:       "./topictest.txt",
+		},
+		Body:   io.NopCloser(bytes.NewReader([]byte("data"))),
+		Length: 4,
+	}, nil)
+	if err != nil {
+		t.Fatalf("Upload failed: %v", err)
 	}
-
-	d.CreateDir(ctx, ref)
 
 	ev := stream.lastEvent()
 	if ev.topic != revaevents.MainQueueName {
@@ -776,15 +693,12 @@ func TestMultipleOperations_EventSequence(t *testing.T) {
 		ResourceId: &provider.ResourceId{SpaceId: "space-1", OpaqueId: fileNodeID},
 	})
 
+	// Of the three operations only the upload has no eventsmiddleware
+	// counterpart, so it is the only driver publish in the sequence.
 	types := stream.eventTypes()
-	if len(types) != 3 {
-		t.Fatalf("expected 3 events, got %d: %v", len(types), types)
-	}
-
-	expected := []string{
-		"events.ContainerCreated",
-		"events.FileUploaded",
-		"events.ItemTrashed",
+	expected := []string{"events.FileUploaded"}
+	if len(types) != len(expected) {
+		t.Fatalf("expected %d event(s), got %d: %v", len(expected), len(types), types)
 	}
 	for i, exp := range expected {
 		if types[i] != exp {
@@ -825,23 +739,16 @@ func TestDeleteDir_PublishesItemTrashed(t *testing.T) {
 		t.Fatalf("Delete dir failed: %v", err)
 	}
 
-	if stream.eventCount() != 1 {
-		t.Fatalf("expected 1 event, got %d", stream.eventCount())
-	}
-
-	ev := stream.lastEvent()
-	it, ok := ev.payload.(revaevents.ItemTrashed)
-	if !ok {
-		t.Fatalf("expected ItemTrashed for directory, got %T", ev.payload)
-	}
-	if it.ID.OpaqueId != dirID {
-		t.Errorf("expected trashed ID %s, got %s", dirID, it.ID.OpaqueId)
+	// Directory deletes are covered by the eventsmiddleware too.
+	if n := stream.eventCount(); n != 0 {
+		t.Fatalf("driver published %d event(s) for a directory Delete, want 0 (middleware covers it): %v",
+			n, stream.eventTypes())
 	}
 }
 
 // --- EmptyRecycle with no items ---
 
-func TestEmptyRecycle_NoItems_StillPublishes(t *testing.T) {
+func TestEmptyRecycle_NoItems_DriverStaysSilent(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
 	stream := newMockStream()
@@ -859,13 +766,9 @@ func TestEmptyRecycle_NoItems_StillPublishes(t *testing.T) {
 		t.Fatalf("EmptyRecycle failed: %v", err)
 	}
 
-	if stream.eventCount() != 1 {
-		t.Fatalf("expected 1 TrashbinPurged event even with no items, got %d", stream.eventCount())
-	}
-
-	_, ok := stream.lastEvent().payload.(revaevents.TrashbinPurged)
-	if !ok {
-		t.Fatalf("expected TrashbinPurged, got %T", stream.lastEvent().payload)
+	if n := stream.eventCount(); n != 0 {
+		t.Fatalf("driver published %d event(s) for an empty EmptyRecycle, want 0: %v",
+			n, stream.eventTypes())
 	}
 }
 
@@ -906,13 +809,10 @@ func TestPurgeRecycleItem_DeletesBlob_AndPublishes(t *testing.T) {
 		t.Error("expected blob to be deleted from S3")
 	}
 
-	// Event should still be published
-	if stream.eventCount() != 1 {
-		t.Fatalf("expected 1 event, got %d", stream.eventCount())
-	}
-	_, ok := stream.lastEvent().payload.(revaevents.ItemPurged)
-	if !ok {
-		t.Fatalf("expected ItemPurged, got %T", stream.lastEvent().payload)
+	// The eventsmiddleware publishes ItemPurged; the driver stays silent.
+	if n := stream.eventCount(); n != 0 {
+		t.Fatalf("driver published %d event(s) for PurgeRecycleItem, want 0: %v",
+			n, stream.eventTypes())
 	}
 }
 
@@ -950,16 +850,10 @@ func TestRestoreRecycleItem_CustomPath_PublishesItemRestored(t *testing.T) {
 		t.Fatalf("RestoreRecycleItem failed: %v", err)
 	}
 
-	if stream.eventCount() != 1 {
-		t.Fatalf("expected 1 event, got %d", stream.eventCount())
-	}
-
-	ir, ok := stream.lastEvent().payload.(revaevents.ItemRestored)
-	if !ok {
-		t.Fatalf("expected ItemRestored, got %T", stream.lastEvent().payload)
-	}
-	if ir.Key != "trash-custom" {
-		t.Errorf("expected key trash-custom, got %s", ir.Key)
+	// The eventsmiddleware publishes ItemRestored; the driver stays silent.
+	if n := stream.eventCount(); n != 0 {
+		t.Fatalf("driver published %d event(s) for a custom-path restore, want 0: %v",
+			n, stream.eventTypes())
 	}
 }
 
@@ -1046,8 +940,11 @@ func TestTouchFile_NewFile_UpdatesParentETag(t *testing.T) {
 		t.Error("parent directory ETag did not change after TouchFile creating new file")
 	}
 
-	if stream.eventCount() != 1 {
-		t.Errorf("expected 1 event, got %d", stream.eventCount())
+	// The eventsmiddleware publishes FileTouched for TouchFile, as with
+	// decomposedfs; a driver FileUploaded here double-counted uploads.
+	if n := stream.eventCount(); n != 0 {
+		t.Errorf("driver published %d event(s) for TouchFile, want 0: %v",
+			n, stream.eventTypes())
 	}
 }
 

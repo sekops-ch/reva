@@ -16,6 +16,7 @@
 package kvfs
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -26,6 +27,7 @@ import (
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/pkg/errors"
+	"github.com/rs/zerolog"
 )
 
 // BlobInfo holds metadata about a blob object in S3.
@@ -67,13 +69,14 @@ type S3Blobstore struct {
 	core   minio.Core
 	bucket string
 	prefix string // instance blob namespace (e.g. "oc" / "sys-"); "" = no namespacing
+	log    *zerolog.Logger
 }
 
 // NewS3Blobstore creates a new S3 blob store. blobPrefix namespaces this
 // instance's objects within a (possibly shared) bucket; pass the kvfs
 // BucketPrefix so two instances never collide. An empty blobPrefix disables
 // namespacing (legacy bare "<spaceID>/" layout).
-func NewS3Blobstore(endpoint, region, bucket, accessKey, secretKey, blobPrefix string) (*S3Blobstore, error) {
+func NewS3Blobstore(endpoint, region, bucket, accessKey, secretKey, blobPrefix string, log *zerolog.Logger) (*S3Blobstore, error) {
 	u, err := url.Parse(endpoint)
 	if err != nil {
 		return nil, errors.Wrap(err, "kvfs: failed to parse S3 endpoint")
@@ -89,11 +92,16 @@ func NewS3Blobstore(endpoint, region, bucket, accessKey, secretKey, blobPrefix s
 		return nil, errors.Wrap(err, "kvfs: failed to create S3 client")
 	}
 
+	if log == nil {
+		l := zerolog.Nop()
+		log = &l
+	}
 	return &S3Blobstore{
 		client: client,
 		core:   minio.Core{Client: client},
 		bucket: bucket,
 		prefix: blobPrefix,
+		log:    log,
 	}, nil
 }
 
@@ -137,13 +145,63 @@ func parseSpacePrefix(commonPrefix, blobPrefix string) (string, bool) {
 	return id, true
 }
 
-// Upload stores data from a reader into S3 under the given key. PutObject
-// in minio-go switches to multipart for objects > 5 MiB automatically; we
-// pass through directly so the SDK picks the strategy from `size`.
-// SmallFileThreshold is honored at the kvfs upload-flow layer, not here.
+// smallBodyBufferLimit matches minio-go's single-PUT threshold (minPartSize,
+// 16 MiB with PutObjectOptions.PartSize unset): bodies at or below it are sent
+// in one PUT whose retry rewinds and re-reads the body. Larger bodies go
+// multipart, where minio-go buffers each part itself.
+const smallBodyBufferLimit = 16 << 20
+
+// rewindLogReader is a seekable body that logs when a consumed body is rewound
+// to its start — the visible trace of an S3-level retry whose first-attempt
+// error minio-go otherwise swallows.
+type rewindLogReader struct {
+	*bytes.Reader
+	key      string
+	size     int64
+	consumed bool
+	log      *zerolog.Logger
+}
+
+func (r *rewindLogReader) Read(p []byte) (int, error) {
+	n, err := r.Reader.Read(p)
+	if n > 0 {
+		r.consumed = true
+	}
+	return n, err
+}
+
+func (r *rewindLogReader) Seek(offset int64, whence int) (int64, error) {
+	if r.consumed && offset == 0 && whence == io.SeekStart {
+		r.log.Warn().Str("blob_key", r.key).Int64("size", r.size).
+			Msg("kvfs: blob upload body rewound (S3 request retried)")
+		r.consumed = false
+	}
+	return r.Reader.Seek(offset, whence)
+}
+
+// Upload stores data from a reader into S3 under the given key. Bodies at or
+// below the single-PUT threshold are buffered to a seekable reader first:
+// minio-go retries a failed PUT by rewinding the body, and a plain stream
+// silently "rewinds" to nothing, so the retry would announce ContentLength
+// bytes and send an empty body while the first attempt's error is lost. The
+// buffer makes retries resend the real content, a short read from the staging
+// layer fails loudly before S3 is touched, and a rewind after consumption is
+// logged as the trace of the retried attempt. Larger bodies stream: minio-go
+// switches to multipart and buffers each part itself.
 func (bs *S3Blobstore) Upload(ctx context.Context, key string, reader io.Reader, size int64) error {
 	start := time.Now()
-	_, err := bs.client.PutObject(ctx, bs.bucket, bs.physicalKey(key), reader, size, minio.PutObjectOptions{
+	body := reader
+	if size >= 0 && size <= smallBodyBufferLimit {
+		buf, err := io.ReadAll(io.LimitReader(reader, size+1))
+		if err != nil {
+			return errors.Wrapf(err, "kvfs: failed to stage blob %s", key)
+		}
+		if int64(len(buf)) != size {
+			return errors.Errorf("kvfs: staged blob %s has %d bytes, expected %d", key, len(buf), size)
+		}
+		body = &rewindLogReader{Reader: bytes.NewReader(buf), key: key, size: size, log: bs.log}
+	}
+	_, err := bs.client.PutObject(ctx, bs.bucket, bs.physicalKey(key), body, size, minio.PutObjectOptions{
 		ContentType: "application/octet-stream",
 	})
 	BlobOperationDuration.WithLabelValues("upload").Observe(time.Since(start).Seconds())

@@ -300,4 +300,3 @@ func setupTwoFoldersForCrashSafe(store *mockMetadataStore) {
 	}
 	store.nodeRevs["s1.f1"] = 1
 }
-

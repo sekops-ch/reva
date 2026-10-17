@@ -354,8 +354,8 @@ func TestSetLock_CASRetry(t *testing.T) {
 		ResourceId: &provider.ResourceId{SpaceId: "s1", OpaqueId: "f1"},
 	}
 	lock := &provider.Lock{
-		LockId: "lock-1",
-		Type:   provider.LockType_LOCK_TYPE_EXCL,
+		LockId:     "lock-1",
+		Type:       provider.LockType_LOCK_TYPE_EXCL,
 		Expiration: &typesv1.Timestamp{Seconds: uint64(time.Now().Add(time.Hour).Unix())},
 	}
 
