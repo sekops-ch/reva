@@ -75,7 +75,7 @@ func setupTwoFolders(store *mockMetadataStore) {
 
 func TestMove_SourceNonMemberDenied(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
 
 	ctx := testContextWithUser("stranger", nil)
@@ -98,7 +98,7 @@ func TestMove_SourceNonMemberDenied(t *testing.T) {
 
 func TestMove_SourceReadOnlyDenied(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
 
 	rootNode := store.nodes["s1.root"]
@@ -128,7 +128,7 @@ func TestMove_SourceReadOnlyDenied(t *testing.T) {
 
 func TestMove_DestDirNoCreateContainerDenied(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceWithDir(store, "s1", "root", "d1", "mydir", nil)
 
 	// Grant bob Move + Stat on root (source auth), but NOT CreateContainer on root (dest auth)
@@ -159,7 +159,7 @@ func TestMove_DestDirNoCreateContainerDenied(t *testing.T) {
 
 func TestMove_DestFileNoUploadDenied(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupTwoFolders(store)
 
 	rootNode := store.nodes["s1.root"]
@@ -189,7 +189,7 @@ func TestMove_DestFileNoUploadDenied(t *testing.T) {
 
 func TestMove_OwnerAllowed(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
 
 	ctx := testContextWithUser("test-user-id", nil)
@@ -216,7 +216,7 @@ func TestMove_OwnerAllowed(t *testing.T) {
 
 func TestMove_SpaceRootRejected(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
 
 	ctx := testContextWithUser("test-user-id", nil)
@@ -239,7 +239,7 @@ func TestMove_SpaceRootRejected(t *testing.T) {
 
 func TestMove_LockedFileRejected(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
 
 	node := store.nodes["s1.f1"]
@@ -265,7 +265,7 @@ func TestMove_LockedFileRejected(t *testing.T) {
 
 func TestMove_LockedFileWithCorrectLockID(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
 
 	node := store.nodes["s1.f1"]
@@ -289,7 +289,7 @@ func TestMove_LockedFileWithCorrectLockID(t *testing.T) {
 
 func TestMove_CrossSpaceRejected(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
 	setupSpaceEmpty(store, "s2", "root2")
 
@@ -315,7 +315,7 @@ func TestMove_CrossSpaceRejected(t *testing.T) {
 
 func TestMove_CollisionReturnsAlreadyExists(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupTwoFolders(store)
 
 	// Add a file "existing.txt" in folder-b
@@ -357,7 +357,7 @@ func TestMove_CollisionReturnsAlreadyExists(t *testing.T) {
 
 func TestMove_SameNodeRenameSucceeds(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
 
 	ctx := testContextWithUser("test-user-id", nil)
@@ -390,7 +390,7 @@ func TestMove_SameNodeRenameSucceeds(t *testing.T) {
 
 func TestMove_OverwriteSelfNoCollision(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
 
 	ctx := testContextWithUser("test-user-id", nil)
@@ -418,7 +418,7 @@ func TestMove_OverwriteSelfNoCollision(t *testing.T) {
 // WOPI renames a document by name relative to its folder, also to the unchanged name.
 func TestMove_OntoOwnNameInSubfolder(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupTwoFolders(store)
 	ctx := testContextWithUser("test-user-id", nil)
 
@@ -437,7 +437,7 @@ func TestMove_OntoOwnNameInSubfolder(t *testing.T) {
 // taken it between the node update and the old-parent update.
 func TestMove_KeepsAnOldNameTakenByAnotherNode(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupTwoFolders(store)
 	store.nodes["s1.f9"] = &NodeEntry{ID: "f9", SpaceID: "s1", ParentID: "da", Name: "file.txt",
 		Type: NodeTypeFile, Owner: "test-user-id"}
@@ -460,7 +460,7 @@ func TestMove_KeepsAnOldNameTakenByAnotherNode(t *testing.T) {
 
 func TestMove_NodeUpdatedBeforeChildrenMap(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupTwoFolders(store)
 
 	ctx := testContextWithUser("test-user-id", nil)
@@ -503,7 +503,7 @@ func TestMove_NodeUpdatedBeforeChildrenMap(t *testing.T) {
 
 func TestMove_RenameInPlace(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceWithFile(store, "s1", "root", "f1", "old-name.txt")
 
 	ctx := testContextWithUser("test-user-id", nil)
@@ -545,7 +545,7 @@ func TestMove_RenameInPlace(t *testing.T) {
 
 func TestMove_AcrossDirectories(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupTwoFolders(store)
 
 	ctx := testContextWithUser("test-user-id", nil)
@@ -593,7 +593,7 @@ func TestMove_AcrossDirectories(t *testing.T) {
 
 func TestMove_FolderKeepsItsEtagAndDate(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupTwoFolders(store)
 	store.nodes["s1.da"].MTime, store.nodes["s1.da"].ETag = 500, "da-etag"
 	ctx := testContextWithUser("test-user-id", nil)

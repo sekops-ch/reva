@@ -47,7 +47,7 @@ func preCanceledCtx() context.Context {
 func TestCrashSafe_Upload_SimpleCommitsAfterCancel(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 	setupSpaceEmpty(store, "s1", "root")
 
 	ctx := preCanceledCtx()
@@ -80,7 +80,7 @@ func TestCrashSafe_Upload_SimpleCommitsAfterCancel(t *testing.T) {
 
 func TestCrashSafe_Move_CompletesAfterCancel(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupTwoFoldersForCrashSafe(store)
 
 	ctx := preCanceledCtx()
@@ -114,7 +114,7 @@ func TestCrashSafe_Move_CompletesAfterCancel(t *testing.T) {
 
 func TestCrashSafe_Delete_CompletesAfterCancel(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceWithFile(store, "s1", "root", "f1", "victim.txt")
 
 	ctx := preCanceledCtx()
@@ -143,7 +143,7 @@ func TestCrashSafe_Delete_CompletesAfterCancel(t *testing.T) {
 
 func TestCrashSafe_CreateDir_CompletesAfterCancel(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceEmpty(store, "s1", "root")
 
 	ctx := preCanceledCtx()
@@ -168,7 +168,7 @@ func TestCrashSafe_CreateDir_CompletesAfterCancel(t *testing.T) {
 func TestCrashSafe_PurgeRecycleItem_CompletesAfterCancel(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 	setupSpaceWithFile(store, "s1", "root", "f1", "trashed.txt")
 
 	// Pre-populate trash to skip the delete step (we want to test purge in isolation).
@@ -207,7 +207,7 @@ func TestCrashSafe_PurgeRecycleItem_CompletesAfterCancel(t *testing.T) {
 
 func TestCrashSafe_RestoreRecycleItem_CompletesAfterCancel(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceEmpty(store, "s1", "root")
 
 	// Pre-populate trash with a file snapshot.

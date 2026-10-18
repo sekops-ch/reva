@@ -40,7 +40,7 @@ func deleteSpaceRequest(spaceID string) *provider.DeleteStorageSpaceRequest {
 func TestDeleteStorageSpace_MissingSpaceID(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 
 	err := d.DeleteStorageSpace(context.Background(), &provider.DeleteStorageSpaceRequest{})
 	if err == nil {
@@ -51,7 +51,7 @@ func TestDeleteStorageSpace_MissingSpaceID(t *testing.T) {
 func TestDeleteStorageSpace_EmptySpace(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 
 	setupSpaceEmpty(store, "space-1", "root-1")
 
@@ -71,7 +71,7 @@ func TestDeleteStorageSpace_EmptySpace(t *testing.T) {
 func TestDeleteStorageSpace_CleansUpNodes(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 
 	setupSpaceWithFile(store, "space-1", "root-1", "file-1", "test.txt")
 
@@ -91,7 +91,7 @@ func TestDeleteStorageSpace_CleansUpNodes(t *testing.T) {
 func TestDeleteStorageSpace_CleansUpBlobs(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 
 	setupSpaceWithFile(store, "space-1", "root-1", "file-1", "test.txt")
 	blobKey := BlobKey("space-1", "old-blob")
@@ -110,7 +110,7 @@ func TestDeleteStorageSpace_CleansUpBlobs(t *testing.T) {
 func TestDeleteStorageSpace_CleansUpTrash(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 
 	setupSpaceEmpty(store, "space-1", "root-1")
 
@@ -143,7 +143,7 @@ func TestDeleteStorageSpace_CleansUpTrash(t *testing.T) {
 func TestDeleteStorageSpace_CleansUpVersions(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 
 	setupSpaceWithFile(store, "space-1", "root-1", "file-1", "test.txt")
 
@@ -182,7 +182,7 @@ func TestDeleteStorageSpace_CleansUpVersions(t *testing.T) {
 func TestDeleteStorageSpace_CleansUpUploads(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 
 	setupSpaceEmpty(store, "space-1", "root-1")
 
@@ -224,7 +224,7 @@ func TestDeleteStorageSpace_CleansUpUploads(t *testing.T) {
 func TestDeleteStorageSpace_NestedDirectories(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 
 	setupSpaceEmpty(store, "space-1", "root-1")
 
@@ -279,7 +279,7 @@ func TestDeleteStorageSpace_NestedDirectories(t *testing.T) {
 func TestUpload_DisableVersioning_NoVersionCreated(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 	d.opts.DisableVersioning = true
 
 	setupSpaceWithFile(store, "space-1", "root-1", "file-1", "test.txt")
@@ -308,7 +308,7 @@ func TestUpload_DisableVersioning_NoVersionCreated(t *testing.T) {
 func TestDeleteStorageSpace_DoesNotAffectOtherSpaces(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 
 	setupSpaceWithFile(store, "space-1", "root-1", "file-1", "test.txt")
 	setupSpaceWithFile(store, "space-2", "root-2", "file-2", "other.txt")
@@ -410,7 +410,7 @@ func TestListUploadsBySpace_FiltersCorrectly(t *testing.T) {
 func TestDeleteSpaceContents_PerSpaceCleanup(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 
 	setupSpaceWithFile(store, "s1", "r1", "f1", "a.txt")
 	setupSpaceWithFile(store, "s2", "r2", "f2", "b.txt")
@@ -544,7 +544,7 @@ func setupProjectSpaceFor(store *mockMetadataStore, spaceID, ownerID string, gra
 
 func TestListStorageSpaces_UserFilter_OwnerMatch(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupPersonalSpaceFor(store, "space-alice", "alice")
 	setupPersonalSpaceFor(store, "space-bob", "bob")
 
@@ -563,7 +563,7 @@ func TestListStorageSpaces_UserFilter_OwnerMatch(t *testing.T) {
 
 func TestListStorageSpaces_UserFilter_GrantMatch(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupProjectSpaceFor(store, "proj-1", "alice", map[string]*GrantEntry{
 		"u:bob": {GranteeType: "user", GranteeID: "bob", Permissions: permissionsToUint32(&provider.ResourcePermissions{
 			Stat: true, InitiateFileDownload: true, ListContainer: true,
@@ -586,7 +586,7 @@ func TestListStorageSpaces_UserFilter_GrantMatch(t *testing.T) {
 
 func TestListStorageSpaces_UserFilter_GroupGrantMatch(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupProjectSpaceFor(store, "proj-1", "alice", map[string]*GrantEntry{
 		"g:engineering": {GranteeType: "group", GranteeID: "engineering", Permissions: permissionsToUint32(&provider.ResourcePermissions{
 			Stat: true, InitiateFileDownload: true, ListContainer: true,
@@ -609,7 +609,7 @@ func TestListStorageSpaces_UserFilter_GroupGrantMatch(t *testing.T) {
 
 func TestListStorageSpaces_UserFilter_NoMatch(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupPersonalSpaceFor(store, "space-alice", "alice")
 
 	ctx := testContextWithUser("bob", nil)
@@ -624,7 +624,7 @@ func TestListStorageSpaces_UserFilter_NoMatch(t *testing.T) {
 
 func TestListStorageSpaces_UserFilter_CombinedWithSpaceType(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupPersonalSpaceFor(store, "space-alice", "alice")
 	setupProjectSpaceFor(store, "proj-alice", "alice", nil)
 	setupPersonalSpaceFor(store, "space-bob", "bob")
@@ -654,7 +654,7 @@ func TestListStorageSpaces_UserFilter_ReplacesUnfilteredBehaviour(t *testing.T) 
 	// /users/{id}/drive to 500 with "expected to find a single drive but
 	// fetched more".
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupPersonalSpaceFor(store, "space-alice", "alice")
 	setupPersonalSpaceFor(store, "space-bob", "bob")
 
@@ -676,7 +676,7 @@ func TestListStorageSpaces_OwnerFilter_StillStricter(t *testing.T) {
 	// but is a grantee on bob's project. Filter OWNER=alice -> empty;
 	// filter USER=alice -> bob's project.
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupProjectSpaceFor(store, "proj-bob", "bob", map[string]*GrantEntry{
 		"u:alice": {GranteeType: "user", GranteeID: "alice", Permissions: permissionsToUint32(&provider.ResourcePermissions{
 			Stat: true, ListContainer: true,
@@ -735,7 +735,7 @@ func createProjectReqWithSpaceID(name, opaqueKey, hint string) *provider.CreateS
 
 func TestCreateStorageSpace_PersonalIsDeterministic(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	ctx := userCtxWithDisplayName("alice", "Alice")
 
 	first, err := d.CreateStorageSpace(ctx, createPersonalReq("Alice"))
@@ -763,7 +763,7 @@ func TestCreateStorageSpace_PersonalIsDeterministic(t *testing.T) {
 
 func TestCreateStorageSpace_PersonalIDEqualsOwner(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	ctx := userCtxWithDisplayName("alice-uuid-1234", "Alice")
 
 	resp, err := d.CreateStorageSpace(ctx, createPersonalReq("Alice"))
@@ -782,7 +782,7 @@ func TestCreateStorageSpace_PersonalRaceProducesOne(t *testing.T) {
 	// Reduces the parallel sign-in race that historically produced
 	// duplicate personal spaces to a unit-test fixture.
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	ctx := userCtxWithDisplayName("alice", "Alice")
 
 	const N = 20
@@ -837,7 +837,7 @@ func TestCreateStorageSpace_PersonalRaceProducesOne(t *testing.T) {
 
 func TestCreateStorageSpace_AcceptsSpaceIdOpaqueKey(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	ctx := userCtxWithDisplayName("alice", "Alice")
 
 	// "space_id" — the gateway / CreateHome convention.
@@ -852,7 +852,7 @@ func TestCreateStorageSpace_AcceptsSpaceIdOpaqueKey(t *testing.T) {
 
 func TestCreateStorageSpace_AcceptsSpaceidOpaqueKey(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	ctx := userCtxWithDisplayName("alice", "Alice")
 
 	// "spaceid" — the legacy / decomposedfs convention.
@@ -869,7 +869,7 @@ func TestCreateStorageSpace_PersonalIgnoresOpaqueIdHint(t *testing.T) {
 	// Pin the rule: personal-type ALWAYS uses owner-derived ID. A future
 	// caller passing an opaque hint must not be able to reopen the race.
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	ctx := userCtxWithDisplayName("alice", "Alice")
 
 	req := createPersonalReq("Alice")

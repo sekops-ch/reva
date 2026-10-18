@@ -68,7 +68,7 @@ func setupSpaceWithDir(store *mockMetadataStore, spaceID, rootID, dirID, dirName
 func TestDeleteDir_KeepsNodesAlive(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 
 	files := map[string]string{"a.txt": "f1", "b.txt": "f2"}
 	setupSpaceWithDir(store, "s1", "root", "dir1", "mydir", files)
@@ -138,7 +138,7 @@ func TestDeleteDir_KeepsNodesAlive(t *testing.T) {
 func TestDeleteDir_RestorePreservesChildren(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 
 	files := map[string]string{"a.txt": "f1", "b.txt": "f2"}
 	setupSpaceWithDir(store, "s1", "root", "dir1", "mydir", files)
@@ -225,7 +225,7 @@ func TestDeleteDir_RestorePreservesChildren(t *testing.T) {
 func TestDeleteDir_NestedRestore(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 
 	// Create: root/parent/child/file.txt
 	setupSpaceEmpty(store, "s1", "root")
@@ -313,7 +313,7 @@ func TestDeleteDir_NestedRestore(t *testing.T) {
 func TestPurgeDir_CleansDescendants(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 
 	files := map[string]string{"a.txt": "f1", "b.txt": "f2"}
 	setupSpaceWithDir(store, "s1", "root", "dir1", "mydir", files)
@@ -373,7 +373,7 @@ func TestPurgeDir_CleansDescendants(t *testing.T) {
 func TestEmptyRecycle_CleansDirectoryDescendants(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 
 	files := map[string]string{"a.txt": "f1"}
 	setupSpaceWithDir(store, "s1", "root", "dir1", "mydir", files)
@@ -415,7 +415,7 @@ func TestEmptyRecycle_CleansDirectoryDescendants(t *testing.T) {
 func TestDeleteFile_StillDeletesNode(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 
 	setupSpaceWithFile(store, "s1", "root", "f1", "test.txt")
 	blob.blobs[BlobKey("s1", "old-blob")] = []byte("content")
@@ -453,7 +453,7 @@ func TestDeleteFile_StillDeletesNode(t *testing.T) {
 func TestTrashOrderingSafety(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 
 	setupSpaceWithFile(store, "s1", "root", "f1", "test.txt")
 
@@ -483,7 +483,7 @@ func TestTrashOrderingSafety(t *testing.T) {
 func TestRestoreDir_OldFormatFallback(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 
 	setupSpaceEmpty(store, "s1", "root")
 
@@ -562,7 +562,7 @@ func TestRestoreFile_KeepsDateAndEtag(t *testing.T) {
 	for _, target := range []string{"", "/renamed.txt"} {
 		t.Run("target="+target, func(t *testing.T) {
 			store := newMockMetadataStore()
-			d := testDriver(store, newMockBlobStore())
+			d := testDriver(t, store, newMockBlobStore())
 			setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
 			ctx := testContext()
 			if err := d.Delete(ctx, f1Ref()); err != nil {
@@ -597,7 +597,7 @@ func TestRestoreFile_KeepsDateAndEtag(t *testing.T) {
 // files keep theirs.
 func TestRestoreDir_KeepsDateFreshEtag(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceWithDir(store, "s1", "root", "dir1", "mydir", map[string]string{"a.txt": "f1"})
 	store.nodes["s1.dir1"].MTime, store.nodes["s1.dir1"].ETag = 1000, "dir-etag"
 	store.nodes["s1.f1"].MTime, store.nodes["s1.f1"].ETag = 2000, "f1-etag"
@@ -627,7 +627,7 @@ func TestRestoreDir_KeepsDateFreshEtag(t *testing.T) {
 func TestDeleteSpaceContents_CleansUpTrashedDirNodes(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 
 	files := map[string]string{"a.txt": "f1"}
 	setupSpaceWithDir(store, "s1", "root", "dir1", "mydir", files)
@@ -795,7 +795,7 @@ func TestRestore_NameTakenByAnotherNode(t *testing.T) {
 		for _, c := range trashCases() {
 			t.Run(fmt.Sprintf("%s/late=%v", c.name, late), func(t *testing.T) {
 				store := newMockMetadataStore()
-				d := testDriver(store, newMockBlobStore())
+				d := testDriver(t, store, newMockBlobStore())
 				key, name := c.setup(store, d)
 				if late {
 					d.store = &lateClashStore{mockMetadataStore: store, parentID: "root", name: name, otherID: "f9"}
@@ -830,7 +830,7 @@ func TestRestore_ParentUpdateFailureUndoesTheNode(t *testing.T) {
 	for _, c := range trashCases() {
 		t.Run(c.name, func(t *testing.T) {
 			store := newMockMetadataStore()
-			d := testDriver(store, newMockBlobStore())
+			d := testDriver(t, store, newMockBlobStore())
 			key, name := c.setup(store, d)
 			store.putChildrenErr = errors.New("children bucket unavailable")
 
@@ -859,7 +859,7 @@ func TestRestore_DropsTheLock(t *testing.T) {
 	for _, c := range trashCases() {
 		t.Run(c.name, func(t *testing.T) {
 			store := newMockMetadataStore()
-			d := testDriver(store, newMockBlobStore())
+			d := testDriver(t, store, newMockBlobStore())
 			key, _ := c.setup(store, d)
 			if tr := store.trash["s1."+key]; tr != nil {
 				tr.Node.Lock = lock()
@@ -887,7 +887,7 @@ func TestRestore_DropsTheLock(t *testing.T) {
 func trashedShareFixture(t *testing.T) (*kvfsDriver, *mockMetadataStore) {
 	t.Helper()
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceWithDir(store, "s1", "root", "F", "F", map[string]string{"a.txt": "fa"})
 	store.nodes["s1.sub"] = &NodeEntry{ID: "sub", SpaceID: "s1", ParentID: "F", Name: "sub", Type: NodeTypeDir, Owner: "test-user-id"}
 	store.nodeRevs["s1.sub"] = 1
@@ -1053,7 +1053,7 @@ func (s *renameDuringDeleteStore) PutTrash(t *TrashEntry) error {
 // Delete marks only the folder it unlinked: one renamed meanwhile stays live and unmarked.
 func TestDelete_MarksOnlyTheUnlinkedFolder(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceWithDir(store, "s1", "root", "F", "F", map[string]string{"a.txt": "fa"})
 	d.store = &renameDuringDeleteStore{mockMetadataStore: store}
 	if err := d.Delete(testContext(), fRef()); err != nil {
@@ -1070,7 +1070,7 @@ func TestDelete_MarksOnlyTheUnlinkedFolder(t *testing.T) {
 // An old-format restore never brings a mark back.
 func TestRestoreDir_OldFormatClearsTheMark(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceEmpty(store, "s1", "root")
 	store.trash["s1.old-trash"] = &TrashEntry{
 		Key: "old-trash", NodeID: "dead-dir", SpaceID: "s1", OriginalPath: "/old-dir", DeletionTime: 1000,
@@ -1089,7 +1089,7 @@ func TestRestoreDir_OldFormatClearsTheMark(t *testing.T) {
 // back in the tree. A marked folder that its parent still lists is live.
 func TestStaleTrashMark_OnALiveFolderIsIgnored(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceWithDir(store, "s1", "root", "F", "F", map[string]string{"a.txt": "fa"})
 	store.nodes["s1.F"].Trashed = true // stale: F is still listed in root
 	bob := testContextWithUser("bob", nil)

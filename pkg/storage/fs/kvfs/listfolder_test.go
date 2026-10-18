@@ -106,7 +106,7 @@ func TestGetNodes_CrossSpaceIsolation(t *testing.T) {
 func TestListFolder_BatchFetch(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 	setupSpaceEmpty(store, "s1", "root")
 
 	children := make(ChildMap)
@@ -155,7 +155,7 @@ func TestListFolder_BatchFetch(t *testing.T) {
 func TestListFolder_MissingChild(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 	setupSpaceEmpty(store, "s1", "root")
 
 	store.nodes["s1.f1"] = &NodeEntry{
@@ -190,7 +190,7 @@ func TestListFolder_MissingChild(t *testing.T) {
 func TestListFolder_EmptyDirectory(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 	setupSpaceEmpty(store, "s1", "root")
 
 	ctx := testContext()
@@ -211,7 +211,7 @@ func TestListFolder_EmptyDirectory(t *testing.T) {
 func TestListFolder_MixedTypes(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 	setupSpaceEmpty(store, "s1", "root")
 
 	store.nodes["s1.f1"] = &NodeEntry{

@@ -21,7 +21,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -34,6 +33,7 @@ import (
 
 	ctxpkg "github.com/opencloud-eu/reva/v2/pkg/ctx"
 	tusd "github.com/tus/tusd/v2/pkg/handler"
+	"github.com/vmihailenco/msgpack/v5"
 )
 
 // --- Mock BlobStore ---
@@ -331,8 +331,13 @@ func (m *mockMetadataStore) GetChildren(spaceID, parentID string) (ChildMap, uin
 	return cp, m.childRevs[key], nil
 }
 
-func (m *mockMetadataStore) GetChildrenAuthoritative(spaceID, parentID string) (ChildMap, uint64, error) {
-	return m.GetChildren(spaceID, parentID) // single in-memory map: always authoritative
+func (m *mockMetadataStore) ConfirmChildAuthoritative(spaceID, parentID, name string) (string, bool, error) {
+	children, _, err := m.GetChildren(spaceID, parentID) // single in-memory map: always authoritative
+	if err != nil {
+		return "", false, err
+	}
+	id, ok := children[name]
+	return id, ok, nil
 }
 
 func (m *mockMetadataStore) PutChildren(spaceID, parentID string, children ChildMap, expectedRev uint64) error {
@@ -764,20 +769,43 @@ func testContext() context.Context {
 	})
 }
 
-func testDriver(store *mockMetadataStore, blob *mockBlobStore) *kvfsDriver {
+func testDriver(t testing.TB, store *mockMetadataStore, blob *mockBlobStore) *kvfsDriver {
+	t.Helper()
 	log := zerolog.Nop()
 	// uploadCache is required for any WriteChunk / FinishUpload test.
-	// Use a per-process temp dir so concurrent tests don't collide.
-	tmpDir, err := os.MkdirTemp("", "kvfs-test-*")
-	if err != nil {
-		panic(err)
-	}
 	return &kvfsDriver{
 		store:       store,
 		blob:        blob,
 		opts:        &Options{},
 		log:         &log,
-		uploadCache: newDiskUploadCache(tmpDir),
+		uploadCache: newDiskUploadCache(t.TempDir()),
+	}
+}
+
+// TestUploadSessionIdentityRoundTrip proves the stored identity survives the
+// msgpack round trip the real KV store performs — the mock store only
+// shallow-copies sessions, so field loss there would go unseen.
+func TestUploadSessionIdentityRoundTrip(t *testing.T) {
+	in := &UploadSession{
+		ID: "s", SpaceID: "sp", Filename: "f", ParentID: "p",
+		Storage:     map[string]string{},
+		OwnerID:     "owner-1",
+		OwnerIDP:    "https://idp.test",
+		OwnerType:   1,
+		InitiatorID: "init-7",
+	}
+	raw, err := msgpack.Marshal(in)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var out UploadSession
+	if err := msgpack.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if out.OwnerID != in.OwnerID || out.OwnerIDP != in.OwnerIDP ||
+		out.OwnerType != in.OwnerType || out.InitiatorID != in.InitiatorID {
+		t.Errorf("identity fields lost: got %q/%q/%d/%q",
+			out.OwnerID, out.OwnerIDP, out.OwnerType, out.InitiatorID)
 	}
 }
 
@@ -885,7 +913,7 @@ func TestGetInfo(t *testing.T) {
 func TestWriteChunk(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 
 	session := makeSession("space-1", "parent-1", "test.txt")
 	session.Size = 1024
@@ -924,7 +952,7 @@ func TestWriteChunk(t *testing.T) {
 func TestWriteChunk_NoMultipartID(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 
 	session := makeSession("space-1", "parent-1", "test.txt")
 	session.Size = 4
@@ -947,7 +975,7 @@ func TestWriteChunk_NoMultipartID(t *testing.T) {
 func TestWriteChunkMultipleChunks(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 
 	session := makeSession("space-1", "parent-1", "test.txt")
 	session.Size = 100
@@ -991,7 +1019,7 @@ func TestGetReaderIncomplete(t *testing.T) {
 func TestGetReaderComplete(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 
 	blobKey := BlobKey("space-1", "blob-123")
 	blob.blobs[blobKey] = []byte("file content")
@@ -1018,7 +1046,7 @@ func TestGetReaderComplete(t *testing.T) {
 func TestGetReaderDeferredLength(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 
 	blobKey := BlobKey("space-1", "blob-123")
 	blob.blobs[blobKey] = []byte("deferred content")
@@ -1043,7 +1071,7 @@ func TestGetReaderDeferredLength(t *testing.T) {
 func TestDeclareLength(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 
 	session := makeSession("space-1", "parent-1", "test.txt")
 	session.SizeIsDeferred = true
@@ -1071,7 +1099,7 @@ func TestDeclareLength(t *testing.T) {
 func TestTerminate(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 
 	session := makeSession("space-1", "parent-1", "test.txt")
 	store.uploads[session.ID] = session
@@ -1098,7 +1126,7 @@ func TestTerminate(t *testing.T) {
 func TestTerminateNoMultipartID(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 
 	session := makeSession("space-1", "parent-1", "test.txt")
 	session.S3MultipartID = ""
@@ -1118,7 +1146,7 @@ func TestTerminateNoMultipartID(t *testing.T) {
 func TestFinishUploadNewFile(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 	ctx := testContext()
 
 	setupSpaceEmpty(store, "space-1", "parent-1")
@@ -1175,7 +1203,7 @@ func TestFinishUploadNewFile(t *testing.T) {
 func TestFinishUploadOverwriteExisting(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 	ctx := testContext()
 
 	setupSpaceWithFile(store, "space-1", "parent-1", "existing-node", "test.txt")
@@ -1217,7 +1245,7 @@ func TestFinishUploadOverwriteExisting(t *testing.T) {
 func TestFinishUploadOverwriteVersioningDisabled(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 	d.opts.DisableVersioning = true
 	ctx := testContext()
 
@@ -1244,7 +1272,7 @@ func TestFinishUploadOverwriteVersioningDisabled(t *testing.T) {
 func TestFinishUploadIfMatchEtagMismatch(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 	ctx := testContext()
 
 	setupSpaceWithFile(store, "space-1", "parent-1", "existing-node", "test.txt")
@@ -1276,7 +1304,7 @@ func TestFinishUploadIfMatchEtagMismatch(t *testing.T) {
 func TestFinishUploadQuotaReturns507(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 	ctx := testContext()
 
 	// Space with quota=1 byte, root node already at size=1 → full.
@@ -1334,7 +1362,7 @@ func TestFinishUploadCompleteMultipartError(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
 	blob.completeErr = io.ErrUnexpectedEOF
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 	ctx := testContext()
 
 	setupSpaceEmpty(store, "space-1", "parent-1")
@@ -1355,7 +1383,7 @@ func TestFinishUploadCompleteMultipartError(t *testing.T) {
 func TestCommitNodeCASRetry(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 	ctx := testContext()
 
 	setupSpaceEmpty(store, "space-1", "parent-1")
@@ -1381,7 +1409,7 @@ func TestCommitNodeCASRetry(t *testing.T) {
 func TestCommitNodeCASExhausted(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 	d.opts.MaxCASRetries = 10
 	ctx := testContext()
 
@@ -1406,7 +1434,7 @@ func TestCommitNodeCASExhausted(t *testing.T) {
 // --- kvfsDriver TUS DataStore interface tests ---
 
 func TestUseIn(t *testing.T) {
-	d := testDriver(newMockMetadataStore(), newMockBlobStore())
+	d := testDriver(t, newMockMetadataStore(), newMockBlobStore())
 	composer := tusd.NewStoreComposer()
 	d.UseIn(composer)
 
@@ -1422,7 +1450,7 @@ func TestUseIn(t *testing.T) {
 }
 
 func TestNewUploadReturnsError(t *testing.T) {
-	d := testDriver(newMockMetadataStore(), newMockBlobStore())
+	d := testDriver(t, newMockMetadataStore(), newMockBlobStore())
 	_, err := d.NewUpload(context.Background(), tusd.FileInfo{})
 	if err == nil {
 		t.Fatal("NewUpload should always return an error")
@@ -1435,7 +1463,7 @@ func TestNewUploadReturnsError(t *testing.T) {
 func TestGetUpload(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 
 	session := makeSession("space-1", "parent-1", "test.txt")
 	store.uploads[session.ID] = session
@@ -1455,7 +1483,7 @@ func TestGetUpload(t *testing.T) {
 }
 
 func TestGetUploadNotFound(t *testing.T) {
-	d := testDriver(newMockMetadataStore(), newMockBlobStore())
+	d := testDriver(t, newMockMetadataStore(), newMockBlobStore())
 	_, err := d.GetUpload(context.Background(), "nonexistent")
 	if !errors.Is(err, tusd.ErrNotFound) {
 		t.Errorf("GetUpload for nonexistent: got %v, want tusd.ErrNotFound", err)
@@ -1463,7 +1491,7 @@ func TestGetUploadNotFound(t *testing.T) {
 }
 
 func TestAsTerminatableUpload(t *testing.T) {
-	d := testDriver(newMockMetadataStore(), newMockBlobStore())
+	d := testDriver(t, newMockMetadataStore(), newMockBlobStore())
 	u := &kvfsUpload{session: makeSession("s", "p", "f"), driver: d}
 
 	tu := d.AsTerminatableUpload(u)
@@ -1477,7 +1505,7 @@ func TestAsTerminatableUpload(t *testing.T) {
 }
 
 func TestAsLengthDeclarableUpload(t *testing.T) {
-	d := testDriver(newMockMetadataStore(), newMockBlobStore())
+	d := testDriver(t, newMockMetadataStore(), newMockBlobStore())
 	u := &kvfsUpload{session: makeSession("s", "p", "f"), driver: d}
 
 	lu := d.AsLengthDeclarableUpload(u)
@@ -1495,7 +1523,7 @@ func TestCreateTUSSession(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
 	blob.nextUploadID = "s3-mp-id"
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 	ctx := testContext()
 
 	sessionID, err := d.createTUSSession(ctx, tusSessionParams{SpaceID: "space-1", ParentID: "parent-1", Name: "upload.bin", Size: 4096})
@@ -1545,7 +1573,7 @@ func TestCreateTUSSession(t *testing.T) {
 func TestCreateTUSSessionDeferred(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 	ctx := testContext()
 
 	sessionID, err := d.createTUSSession(ctx, tusSessionParams{SpaceID: "space-1", ParentID: "parent-1", Name: "big.bin", Size: 0, SizeIsDeferred: true})
@@ -1565,7 +1593,7 @@ func TestCreateTUSSessionDeferred(t *testing.T) {
 func TestCreateTUSSessionWithIfMatch(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 	ctx := testContext()
 
 	sessionID, err := d.createTUSSession(ctx, tusSessionParams{SpaceID: "space-1", ParentID: "parent-1", Name: "file.txt", Size: 100, IfMatch: "expected-etag"})
@@ -1586,7 +1614,7 @@ func TestCreateTUSSession_NoS3DependencyAtSessionOpen(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
 	blob.initErr = io.ErrUnexpectedEOF // would have broken the pre-disk-cache path
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 	ctx := testContext()
 
 	sid, err := d.createTUSSession(ctx, tusSessionParams{SpaceID: "space-1", ParentID: "parent-1", Name: "file.txt", Size: 100})
@@ -1603,7 +1631,7 @@ func TestCreateTUSSession_NoS3DependencyAtSessionOpen(t *testing.T) {
 func TestInitiateUploadReturnsBothProtocols(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 	ctx := testContext()
 
 	setupSpaceEmpty(store, "space-1", "parent-1")
@@ -1632,7 +1660,7 @@ func TestInitiateUpload_AlwaysReturnsBothProtocols(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
 	blob.initErr = io.ErrUnexpectedEOF // pre-disk-cache, this would have suppressed tus
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 	ctx := testContext()
 
 	setupSpaceEmpty(store, "space-1", "parent-1")
@@ -1657,7 +1685,7 @@ func TestInitiateUpload_AlwaysReturnsBothProtocols(t *testing.T) {
 func TestInitiateUploadWithIfMatch(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 	ctx := testContext()
 
 	setupSpaceEmpty(store, "space-1", "parent-1")
@@ -1678,7 +1706,7 @@ func TestInitiateUploadWithIfMatch(t *testing.T) {
 }
 
 func TestInitiateUploadMissingSpaceID(t *testing.T) {
-	d := testDriver(newMockMetadataStore(), newMockBlobStore())
+	d := testDriver(t, newMockMetadataStore(), newMockBlobStore())
 	ref := &provider.Reference{Path: "/some/path"}
 	_, err := d.InitiateUpload(context.Background(), ref, 100, nil)
 	if err == nil {
@@ -1699,7 +1727,7 @@ var (
 func TestTUSEndToEndFlow(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 	ctx := testContext()
 
 	setupSpaceEmpty(store, "space-1", "parent-1")
@@ -1770,7 +1798,7 @@ func TestTUSEndToEndFlow(t *testing.T) {
 func TestTUSOverwriteEndToEnd(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 	ctx := testContext()
 
 	setupSpaceWithFile(store, "space-1", "parent-1", "existing-node", "overwrite.txt")
@@ -1828,7 +1856,7 @@ func TestTUSOverwriteEndToEnd(t *testing.T) {
 func TestFinishUploadCommitFailurePreservesSession(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 	ctx := testContext()
 
 	setupSpaceWithFile(store, "space-1", "parent-1", "existing-node", "test.txt")
@@ -1873,7 +1901,7 @@ func TestFinishUploadCommitFailurePreservesSession(t *testing.T) {
 func TestFinishUploadInjectedCommitFailurePreservesSession(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 	d.commitFailHook = func() error { return errors.New("injected commit failure (test seam)") }
 	ctx := testContext()
 
@@ -1941,7 +1969,7 @@ func TestFinishUploadInjectedCommitFailurePreservesSession(t *testing.T) {
 func TestFinishUploadDetachedCtxSurvivesCancellation(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 
 	setupSpaceEmpty(store, "space-1", "parent-1")
 
@@ -2003,7 +2031,7 @@ func TestFinishUploadDetachedCtxSurvivesCancellation(t *testing.T) {
 func TestFinishUploadIdempotentReCommit(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 	ctx := testContext()
 
 	setupSpaceEmpty(store, "space-1", "parent-1")
@@ -2091,7 +2119,7 @@ func TestFinishUploadIdempotentReCommit(t *testing.T) {
 func TestFinishUploadConcurrentSameSession(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 	ctx := testContext()
 
 	setupSpaceEmpty(store, "space-1", "parent-1")
@@ -2155,7 +2183,7 @@ func TestFinishUploadConcurrentSameSession(t *testing.T) {
 func TestInitiateUploadSimpleIDCarriesTUSSibling(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 	setupSpaceEmpty(store, "s1", "root")
 
 	result, err := d.InitiateUpload(testContext(), &provider.Reference{
@@ -2182,10 +2210,45 @@ func TestInitiateUploadSimpleIDCarriesTUSSibling(t *testing.T) {
 	}
 }
 
+// A refused simple commit — here an If-Match loser, the shape every
+// concurrent metadata writer race produces — must reap its sibling too:
+// pre-fix only the success path reaped, and each racing loser stranded one
+// TUS session for the TTL reaper.
+func TestUploadRefusedCommitReapsSiblingSession(t *testing.T) {
+	store := newMockMetadataStore()
+	blob := newMockBlobStore()
+	d := testDriver(t, store, blob)
+	setupSpaceWithFile(store, "s1", "root", "f1", "newfile.txt")
+
+	ctx := testContext()
+	result, err := d.InitiateUpload(ctx, &provider.Reference{
+		ResourceId: &provider.ResourceId{SpaceId: "s1", OpaqueId: "root"},
+		Path:       "./newfile.txt",
+	}, 5, map[string]string{"if-match": `"stale-etag"`})
+	if err != nil {
+		t.Fatalf("InitiateUpload: %v", err)
+	}
+	tusID := result["tus"]
+
+	content := []byte("hello")
+	_, err = d.Upload(ctx, storage.UploadRequest{
+		Ref:    &provider.Reference{Path: "/" + result["simple"]},
+		Body:   io.NopCloser(bytes.NewReader(content)),
+		Length: int64(len(content)),
+	}, nil)
+	if err == nil {
+		t.Fatal("Upload with a stale If-Match must be refused")
+	}
+
+	if _, err := store.GetUpload(tusID); err != ErrNotFound {
+		t.Errorf("sibling TUS session %s should be reaped after the refused commit, GetUpload err = %v", tusID, err)
+	}
+}
+
 func TestUploadSimpleCommitReapsSiblingSession(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 	setupSpaceEmpty(store, "s1", "root")
 
 	ctx := testContext()
@@ -2221,7 +2284,7 @@ func TestUploadSimpleCommitReapsSiblingSession(t *testing.T) {
 func TestUploadSimpleCommitWithIfMatchParsesBothParams(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 	setupSpaceWithFile(store, "s1", "root", "file-1", "existing.txt")
 
 	ctx := testContext()
@@ -2287,7 +2350,7 @@ func TestUploadSimpleCommitWithIfMatchParsesBothParams(t *testing.T) {
 func TestUploadSimpleCommitFailureKeepsSibling(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 	setupSpaceEmpty(store, "s1", "root")
 
 	ctx := testContext()
@@ -2325,7 +2388,7 @@ func TestUploadSimpleCommitFailureKeepsSibling(t *testing.T) {
 func TestCommitFileNodeIdempotentOverwrite(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 	ctx := testContext()
 
 	setupSpaceWithFile(store, "space-1", "parent-1", "existing-node", "test.txt")
@@ -2369,7 +2432,7 @@ func TestCommitFileNodeIdempotentOverwrite(t *testing.T) {
 func TestCommitFileNodeEtagMismatchDifferentContent(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 	ctx := testContext()
 
 	setupSpaceWithFile(store, "space-1", "parent-1", "existing-node", "test.txt")
@@ -2403,7 +2466,7 @@ func TestCommitFileNodeEtagMismatchDifferentContent(t *testing.T) {
 func TestCommitFileNodeIdempotentGuardNoChecksum(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 	ctx := testContext()
 
 	setupSpaceWithFile(store, "space-1", "parent-1", "existing-node", "test.txt")
@@ -2436,7 +2499,7 @@ func TestCommitFileNodeIdempotentGuardNoChecksum(t *testing.T) {
 func TestCommitFileNodeIdempotentGuardSizeMismatch(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 	ctx := testContext()
 
 	setupSpaceWithFile(store, "space-1", "parent-1", "existing-node", "test.txt")
@@ -2471,7 +2534,7 @@ func TestCommitFileNodeIdempotentGuardSizeMismatch(t *testing.T) {
 func TestFinishUploadIdempotentReplay(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 	ctx := testContext()
 
 	// Simulate the state after the first (successful but lost) commit:

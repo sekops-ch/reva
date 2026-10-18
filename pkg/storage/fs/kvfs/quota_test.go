@@ -37,7 +37,7 @@ func setQuota(store *mockMetadataStore, spaceID string, quota int64, usedSize in
 
 func TestCheckQuota_UnlimitedNeg1(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceEmpty(store, "s1", "root")
 	setQuota(store, "s1", -1, 0)
 
@@ -48,7 +48,7 @@ func TestCheckQuota_UnlimitedNeg1(t *testing.T) {
 
 func TestCheckQuota_UnlimitedZero(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceEmpty(store, "s1", "root")
 	setQuota(store, "s1", 0, 0)
 
@@ -59,7 +59,7 @@ func TestCheckQuota_UnlimitedZero(t *testing.T) {
 
 func TestCheckQuota_NewFileWithinQuota(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceEmpty(store, "s1", "root")
 	setQuota(store, "s1", 1000, 500)
 
@@ -70,7 +70,7 @@ func TestCheckQuota_NewFileWithinQuota(t *testing.T) {
 
 func TestCheckQuota_NewFileExactlyAtLimit(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceEmpty(store, "s1", "root")
 	setQuota(store, "s1", 1000, 500)
 
@@ -81,7 +81,7 @@ func TestCheckQuota_NewFileExactlyAtLimit(t *testing.T) {
 
 func TestCheckQuota_NewFileExceedsByOneByte(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceEmpty(store, "s1", "root")
 	setQuota(store, "s1", 1000, 500)
 
@@ -96,7 +96,7 @@ func TestCheckQuota_NewFileExceedsByOneByte(t *testing.T) {
 
 func TestCheckQuota_OverwriteSmallerOK(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceEmpty(store, "s1", "root")
 	setQuota(store, "s1", 1000, 900)
 
@@ -107,7 +107,7 @@ func TestCheckQuota_OverwriteSmallerOK(t *testing.T) {
 
 func TestCheckQuota_OverwriteLargerOK(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceEmpty(store, "s1", "root")
 	setQuota(store, "s1", 1000, 500)
 
@@ -119,7 +119,7 @@ func TestCheckQuota_OverwriteLargerOK(t *testing.T) {
 
 func TestCheckQuota_OverwriteLargerExceeds(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceEmpty(store, "s1", "root")
 	setQuota(store, "s1", 1000, 900)
 
@@ -135,7 +135,7 @@ func TestCheckQuota_OverwriteLargerExceeds(t *testing.T) {
 
 func TestCheckQuota_UsedExceedsQuota_NewFile(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceEmpty(store, "s1", "root")
 	setQuota(store, "s1", 1000, 1200)
 
@@ -150,7 +150,7 @@ func TestCheckQuota_UsedExceedsQuota_NewFile(t *testing.T) {
 
 func TestCheckQuota_UsedExceedsQuota_ShrinkOK(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceEmpty(store, "s1", "root")
 	setQuota(store, "s1", 1000, 1200)
 
@@ -165,7 +165,7 @@ func TestCheckQuota_UsedExceedsQuota_ShrinkOK(t *testing.T) {
 func TestUpload_QuotaExceeded_NewFile(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 	setupSpaceEmpty(store, "s1", "root")
 	setQuota(store, "s1", 500, 0)
 
@@ -197,7 +197,7 @@ func TestUpload_QuotaExceeded_NewFile(t *testing.T) {
 func TestUpload_QuotaOK_NewFile(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 	setupSpaceEmpty(store, "s1", "root")
 	setQuota(store, "s1", 500, 0)
 
@@ -221,7 +221,7 @@ func TestUpload_QuotaOK_NewFile(t *testing.T) {
 func TestUpload_QuotaExceeded_Overwrite(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 	setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
 	blob.blobs[BlobKey("s1", "old-blob")] = make([]byte, 100)
 	// existing file is 100B, used=200, quota=500
@@ -251,7 +251,7 @@ func TestUpload_QuotaExceeded_Overwrite(t *testing.T) {
 func TestUpload_QuotaOK_Overwrite_Shrink(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 	setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
 	blob.blobs[BlobKey("s1", "old-blob")] = make([]byte, 100)
 	setQuota(store, "s1", 500, 400) // used=400
@@ -276,7 +276,7 @@ func TestUpload_QuotaOK_Overwrite_Shrink(t *testing.T) {
 func TestUpload_QuotaUnlimited(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 	setupSpaceEmpty(store, "s1", "root")
 	setQuota(store, "s1", -1, 0)
 
@@ -302,7 +302,7 @@ func TestUpload_QuotaUnlimited(t *testing.T) {
 func TestInitiateUpload_QuotaExceeded(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 	setupSpaceEmpty(store, "s1", "root")
 	setQuota(store, "s1", 500, 400)
 
@@ -324,7 +324,7 @@ func TestInitiateUpload_QuotaExceeded(t *testing.T) {
 func TestInitiateUpload_QuotaOK(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 	setupSpaceEmpty(store, "s1", "root")
 	setQuota(store, "s1", 500, 400)
 
@@ -346,7 +346,7 @@ func TestInitiateUpload_QuotaOK(t *testing.T) {
 func TestInitiateUpload_EmptyUploadSkipsQuota(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 	setupSpaceEmpty(store, "s1", "root")
 	setQuota(store, "s1", 500, 500)
 

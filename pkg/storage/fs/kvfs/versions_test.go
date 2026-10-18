@@ -36,7 +36,7 @@ import (
 func TestTrimVersions_Unlimited(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 	d.opts.MaxVersions = 0
 
 	setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
@@ -59,7 +59,7 @@ func TestTrimVersions_Unlimited(t *testing.T) {
 func TestTrimVersions_LimitThree(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 	d.opts.MaxVersions = 3
 
 	setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
@@ -102,7 +102,7 @@ func TestTrimVersions_LimitThree(t *testing.T) {
 func TestTrimVersions_UnderLimit(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 	d.opts.MaxVersions = 5
 
 	setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
@@ -125,7 +125,7 @@ func TestTrimVersions_UnderLimit(t *testing.T) {
 func TestTrimVersions_ExactlyAtLimit(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 	d.opts.MaxVersions = 3
 
 	setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
@@ -148,7 +148,7 @@ func TestTrimVersions_ExactlyAtLimit(t *testing.T) {
 func TestTrimVersions_RemovesEntriesOnly(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 	d.opts.MaxVersions = 1
 
 	setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
@@ -184,7 +184,7 @@ func TestTrimVersions_RemovesEntriesOnly(t *testing.T) {
 func TestTrimVersions_IsolatedPerNode(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 	d.opts.MaxVersions = 2
 
 	setupSpaceWithFile(store, "s1", "root", "f1", "a.txt")
@@ -219,7 +219,7 @@ func TestTrimVersions_IsolatedPerNode(t *testing.T) {
 func TestUpload_TrimsVersions(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 	d.opts.MaxVersions = 2
 
 	setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
@@ -253,7 +253,7 @@ func TestUpload_TrimsVersions(t *testing.T) {
 func TestUpload_NoTrimWhenUnlimited(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 	d.opts.MaxVersions = 0
 
 	setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
@@ -299,10 +299,10 @@ func f1Ref() *provider.Reference {
 // newVersionFixture returns a driver with file s1/f1 whose head is blob
 // "old-blob" holding "original" at MTime 1000, so its snapshot is always the
 // oldest entry.
-func newVersionFixture(maxVersions int) (*kvfsDriver, *mockMetadataStore, *mockBlobStore) {
+func newVersionFixture(t testing.TB, maxVersions int) (*kvfsDriver, *mockMetadataStore, *mockBlobStore) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 	d.opts.MaxVersions = maxVersions
 	setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
 	blob.blobs[BlobKey("s1", "old-blob")] = []byte("original")
@@ -446,7 +446,7 @@ func TestTrimVersions_NeverDeletesSharedBlobs(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			d, store, blob := newVersionFixture(1)
+			d, store, blob := newVersionFixture(t, 1)
 			store.versions = append(store.versions,
 				&VersionEntry{Key: "vA", NodeID: "f1", SpaceID: "s1", BlobID: "shared", MTime: 1000},
 				&VersionEntry{Key: "vB", NodeID: "f1", SpaceID: "s1", BlobID: "vb", MTime: 2000})
@@ -467,7 +467,7 @@ func TestTrimVersions_NeverDeletesSharedBlobs(t *testing.T) {
 }
 
 func TestRestoreRevision_AtLimit_PreservesRestoredContent(t *testing.T) {
-	d, store, blob := newVersionFixture(3)
+	d, store, blob := newVersionFixture(t, 3)
 	for _, c := range []string{"c0", "c1", "c2"} {
 		mustOverwrite(t, d, c)
 	}
@@ -490,7 +490,7 @@ func TestRestoreRevision_AtLimit_PreservesRestoredContent(t *testing.T) {
 
 func TestRestoreRevision_AtLimit_KeepsRestoredEntry(t *testing.T) {
 	t.Run("max=3", func(t *testing.T) {
-		d, store, blob := newVersionFixture(3)
+		d, store, blob := newVersionFixture(t, 3)
 		for _, c := range []string{"c0", "c1", "c2"} {
 			mustOverwrite(t, d, c)
 		}
@@ -519,7 +519,7 @@ func TestRestoreRevision_AtLimit_KeepsRestoredEntry(t *testing.T) {
 		}
 	})
 	t.Run("max=1", func(t *testing.T) {
-		d, store, blob := newVersionFixture(1)
+		d, store, blob := newVersionFixture(t, 1)
 		mustOverwrite(t, d, "c0")
 		oldKey := versionKeyFor(t, store, blob, "original")
 
@@ -538,7 +538,7 @@ func TestRestoreRevision_AtLimit_KeepsRestoredEntry(t *testing.T) {
 }
 
 func TestRestoreRevision_UnderLimit_KeepsRestoredEntry(t *testing.T) {
-	d, store, blob := newVersionFixture(5)
+	d, store, blob := newVersionFixture(t, 5)
 	mustOverwrite(t, d, "c0")
 	mustOverwrite(t, d, "c1")
 	oldKey := versionKeyFor(t, store, blob, "original")
@@ -557,7 +557,7 @@ func TestRestoreRevision_UnderLimit_KeepsRestoredEntry(t *testing.T) {
 }
 
 func TestRestoreRevision_ThenOverwrites_KeepReferencedBlobs(t *testing.T) {
-	d, store, blob := newVersionFixture(3)
+	d, store, blob := newVersionFixture(t, 3)
 	mustOverwrite(t, d, "c0")
 	mustOverwrite(t, d, "c1")
 	if err := d.RestoreRevision(testContext(), f1Ref(), versionKeyFor(t, store, blob, "original")); err != nil {
@@ -588,7 +588,7 @@ func TestRestoreRevision_ThenOverwrites_KeepReferencedBlobs(t *testing.T) {
 }
 
 func TestRestoreRevision_Twice_KeepsReferencedBlobs(t *testing.T) {
-	d, store, blob := newVersionFixture(3)
+	d, store, blob := newVersionFixture(t, 3)
 	mustOverwrite(t, d, "c0")
 	mustOverwrite(t, d, "c1")
 	if err := d.RestoreRevision(testContext(), f1Ref(), versionKeyFor(t, store, blob, "original")); err != nil {
@@ -615,7 +615,7 @@ func TestRestoreRevision_Twice_KeepsReferencedBlobs(t *testing.T) {
 }
 
 func TestRestoreRevision_ThenFailedOverwrite_HeadSurvives(t *testing.T) {
-	d, store, blob := newVersionFixture(3)
+	d, store, blob := newVersionFixture(t, 3)
 	mustOverwrite(t, d, "c0")
 	mustOverwrite(t, d, "c1")
 	if err := d.RestoreRevision(testContext(), f1Ref(), versionKeyFor(t, store, blob, "original")); err != nil {
@@ -637,7 +637,7 @@ func TestRestoreRevision_ThenFailedOverwrite_HeadSurvives(t *testing.T) {
 }
 
 func TestRestoreRevision_FailedPutNodeAtLimit_KeepsVersion(t *testing.T) {
-	d, store, blob := newVersionFixture(3)
+	d, store, blob := newVersionFixture(t, 3)
 	for _, c := range []string{"c0", "c1", "c2"} {
 		mustOverwrite(t, d, c)
 	}
@@ -668,7 +668,7 @@ func TestRestoreRevision_FailedPutNodeAtLimit_KeepsVersion(t *testing.T) {
 }
 
 func TestUpload_FailedOverwriteDoesNotTrim(t *testing.T) {
-	d, store, blob := newVersionFixture(2)
+	d, store, blob := newVersionFixture(t, 2)
 	mustOverwrite(t, d, "c0")
 	mustOverwrite(t, d, "c1")
 	oldKey := versionKeyFor(t, store, blob, "original")
@@ -694,7 +694,7 @@ func TestUpload_FailedOverwriteDoesNotTrim(t *testing.T) {
 }
 
 func TestUpload_CASRetrySnapshotsOnceAndTrimsAfterCommit(t *testing.T) {
-	d, store, blob := newVersionFixture(2)
+	d, store, blob := newVersionFixture(t, 2)
 	mustOverwrite(t, d, "c0")
 	mustOverwrite(t, d, "c1")
 	head, _, _ := store.GetNode("s1", "f1")
@@ -762,7 +762,7 @@ func (s *racingWriterStore) PutNode(n *NodeEntry, expectedRev uint64) error {
 }
 
 func TestUpload_CASRetryKeepsTheRacingWritersContent(t *testing.T) {
-	d, store, blob := newVersionFixture(5)
+	d, store, blob := newVersionFixture(t, 5)
 	mustOverwrite(t, d, "c0")
 	d.store = &racingWriterStore{mockMetadataStore: store, blob: blob}
 	mustOverwrite(t, d, "mine")
@@ -788,7 +788,7 @@ func TestUpload_CASRetryKeepsTheRacingWritersContent(t *testing.T) {
 }
 
 func TestUpload_CASRetryAtTheCapKeepsTheLatestReplacedContent(t *testing.T) {
-	d, store, blob := newVersionFixture(1)
+	d, store, blob := newVersionFixture(t, 1)
 	mustOverwrite(t, d, "c0")
 	d.store = &racingWriterStore{mockMetadataStore: store, blob: blob}
 	mustOverwrite(t, d, "mine")
@@ -832,7 +832,7 @@ func (s *earlyWriterStore) GetChildren(spaceID, parentID string) (ChildMap, uint
 }
 
 func TestCommit_SnapshotSortsAfterTheReplacedHeadsOwnVersion(t *testing.T) {
-	d, store, blob := newVersionFixture(1)
+	d, store, blob := newVersionFixture(t, 1)
 	d.store = &earlyWriterStore{mockMetadataStore: store, blob: blob}
 	blob.blobs[BlobKey("s1", "mine-blob")] = []byte("mine")
 	if _, err := d.commitFileNode(testContext(), commitFileParams{
@@ -847,7 +847,7 @@ func TestCommit_SnapshotSortsAfterTheReplacedHeadsOwnVersion(t *testing.T) {
 }
 
 func TestGC_ReapsTrimmedVersionBlobsAfterMinAge(t *testing.T) {
-	d, store, blob := newVersionFixture(1)
+	d, store, blob := newVersionFixture(t, 1)
 	mustOverwrite(t, d, "c0")
 	mustOverwrite(t, d, "c1")
 	gc := testGC(store, blob, false)
@@ -872,7 +872,7 @@ func TestGC_ReapsTrimmedVersionBlobsAfterMinAge(t *testing.T) {
 }
 
 func TestGC_KeepsBlobSharedByRestoreAfterTrim(t *testing.T) {
-	d, store, blob := newVersionFixture(3)
+	d, store, blob := newVersionFixture(t, 3)
 	mustOverwrite(t, d, "c0")
 	mustOverwrite(t, d, "c1")
 	if err := d.RestoreRevision(testContext(), f1Ref(), versionKeyFor(t, store, blob, "original")); err != nil {
@@ -905,7 +905,7 @@ func (s *restoreDuringSweepStore) ListVersionsBySpace(spaceID string) ([]*Versio
 }
 
 func TestGC_RestoreDuringSweep_KeepsRestoredBlob(t *testing.T) {
-	d, store, blob := newVersionFixture(3)
+	d, store, blob := newVersionFixture(t, 3)
 	for _, c := range []string{"c0", "c1", "c2"} {
 		mustOverwrite(t, d, c)
 	}
@@ -949,7 +949,7 @@ func TestTrimVersions_ProtectsKeptKeys(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			store := newMockMetadataStore()
 			blob := newMockBlobStore()
-			d := testDriver(store, blob)
+			d := testDriver(t, store, blob)
 			d.opts.MaxVersions = tc.max
 			setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
 			for i, mt := range tc.mtime {

@@ -54,9 +54,14 @@ type Options struct {
 	ChildrenMaxValueSize int32 `mapstructure:"children_max_value_size"`
 
 	// MaxCASRetries bounds every CAS retry loop in the driver. Zero means
-	// use the package default. Bursts on a hot parent need more retries
-	// than the default 10; tune up on contended workloads.
+	// use the package default (100). Bursts on a hot parent need more
+	// retries; tune up on contended workloads.
 	MaxCASRetries int `mapstructure:"max_cas_retries"`
+
+	// AuthoritativeReadTimeout bounds the single leader read that confirms a
+	// direct-read miss; a leaderless stream must fail it fast, not pin the
+	// request for the shared 30 s context wait. Zero means the package default.
+	AuthoritativeReadTimeout time.Duration `mapstructure:"authoritative_read_timeout"`
 
 	// MaxDeleteDepth bounds how many directory levels a recursive delete
 	// (trash purge, space delete) will traverse below the delete root.
@@ -172,6 +177,16 @@ func resolveMaxCASRetries(o *Options) int {
 	return defaultMaxCASRetries
 }
 
+// resolveAuthoritativeReadTimeout returns the configured leader-read bound,
+// or the package default when unset (<= 0). Same fixture-defense contract as
+// resolveMaxCASRetries.
+func resolveAuthoritativeReadTimeout(o *Options) time.Duration {
+	if o != nil && o.AuthoritativeReadTimeout > 0 {
+		return o.AuthoritativeReadTimeout
+	}
+	return defaultAuthoritativeReadTimeout
+}
+
 // resolveMaxDeleteDepth returns the configured recursive-delete depth
 // bound, or the package default when unset (<= 0). Same fixture-defense
 // contract as resolveMaxCASRetries.
@@ -204,6 +219,9 @@ func (o *Options) init() {
 	}
 	if o.MaxDeleteDepth <= 0 {
 		o.MaxDeleteDepth = defaultMaxDeleteDepth
+	}
+	if o.AuthoritativeReadTimeout <= 0 {
+		o.AuthoritativeReadTimeout = defaultAuthoritativeReadTimeout
 	}
 	if o.UploadBackend == "" {
 		o.UploadBackend = "disk"

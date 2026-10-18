@@ -27,11 +27,11 @@ import (
 )
 
 // emptySaveFixture holds file s1/f1 "file.txt" with content "original" and folder s1/sub.
-func emptySaveFixture() (*kvfsDriver, *mockMetadataStore, *mockBlobStore, *mockStream) {
+func emptySaveFixture(t testing.TB) (*kvfsDriver, *mockMetadataStore, *mockBlobStore, *mockStream) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
 	stream := newMockStream()
-	d := testDriverWithStream(store, blob, stream)
+	d := testDriverWithStream(t, store, blob, stream)
 	setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
 	blob.blobs[BlobKey("s1", "old-blob")] = []byte("original")
 	store.nodes["s1.sub"] = &NodeEntry{
@@ -95,7 +95,7 @@ func TestTouchFile_ExistingNodeIsAlreadyExists(t *testing.T) {
 		"folder":       pathRef("./sub"),
 	} {
 		t.Run(name, func(t *testing.T) {
-			d, store, _, stream := emptySaveFixture()
+			d, store, _, stream := emptySaveFixture(t)
 			nodes, children := nodeSnapshot(store), childrenSnapshot(store)
 			if err := d.TouchFile(testContext(), ref, false, "1000000000"); !isAlreadyExists(err) {
 				t.Fatalf("TouchFile = %v, want AlreadyExists", err)
@@ -109,7 +109,7 @@ func TestTouchFile_ExistingNodeIsAlreadyExists(t *testing.T) {
 }
 
 func TestTouchFile_MarkProcessingFlagsTheExistingFile(t *testing.T) {
-	d, store, _, _ := emptySaveFixture()
+	d, store, _, _ := emptySaveFixture(t)
 	before := *store.nodes["s1.f1"]
 	if err := d.TouchFile(testContext(), pathRef("./file.txt"), true, ""); err != nil {
 		t.Fatalf("TouchFile(markprocessing): %v", err)
@@ -125,7 +125,7 @@ func TestTouchFile_MarkProcessingFlagsTheExistingFile(t *testing.T) {
 }
 
 func TestTouchFile_ViewerIsPermissionDenied(t *testing.T) {
-	d, store, _, _ := emptySaveFixture()
+	d, store, _, _ := emptySaveFixture(t)
 	store.nodes["s1.root"].Grants = map[string]*GrantEntry{
 		"u:bob": {GranteeType: "user", GranteeID: "bob", Permissions: permissionsToUint32(&provider.ResourcePermissions{Stat: true, ListContainer: true})},
 	}
@@ -137,7 +137,7 @@ func TestTouchFile_ViewerIsPermissionDenied(t *testing.T) {
 // A name whose entry points at a missing node is not free: the create refuses it rather than
 // orphaning whatever the entry is meant to hold.
 func TestTouchFile_DanglingEntryIsAlreadyExists(t *testing.T) {
-	d, store, _, _ := emptySaveFixture()
+	d, store, _, _ := emptySaveFixture(t)
 	store.children["s1.root"]["ghost.txt"] = "ghost"
 	nodes, children := nodeSnapshot(store), childrenSnapshot(store)
 	if err := d.TouchFile(testContext(), pathRef("./ghost.txt"), false, ""); !isAlreadyExists(err) {
@@ -155,7 +155,7 @@ func TestTouchFile_ReadErrorsChangeNothing(t *testing.T) {
 		"node read":   {&provider.Reference{ResourceId: &provider.ResourceId{SpaceId: "s1", OpaqueId: "f1"}}, func(s *failingStore) { s.failNode = "f1" }},
 	} {
 		t.Run(name, func(t *testing.T) {
-			d, store, _, _ := emptySaveFixture()
+			d, store, _, _ := emptySaveFixture(t)
 			fs := &failingStore{mockMetadataStore: store}
 			c.fail(fs)
 			d.store = fs
@@ -171,7 +171,7 @@ func TestTouchFile_ReadErrorsChangeNothing(t *testing.T) {
 // --- Empty uploads commit at initiation, as in decomposedfs ---
 
 func TestEmptyUpload_TruncatesAndKeepsAVersion(t *testing.T) {
-	d, store, blob, stream := emptySaveFixture()
+	d, store, blob, stream := emptySaveFixture(t)
 	res, err := d.InitiateUpload(testContext(), pathRef("./file.txt"), 0, map[string]string{"mtime": "1000000000"})
 	if err != nil {
 		t.Fatalf("InitiateUpload(0): %v", err)
@@ -199,7 +199,7 @@ func TestEmptyUpload_TruncatesAndKeepsAVersion(t *testing.T) {
 
 func TestEmptyUpload_IfMatch(t *testing.T) {
 	t.Run("stale etag on content", func(t *testing.T) {
-		d, store, _, _ := emptySaveFixture()
+		d, store, _, _ := emptySaveFixture(t)
 		nodes, children := nodeSnapshot(store), childrenSnapshot(store)
 		_, err := d.InitiateUpload(testContext(), pathRef("./file.txt"), 0, map[string]string{"if-match": "stale"})
 		if _, ok := err.(errtypes.IsAborted); !ok {
@@ -208,7 +208,7 @@ func TestEmptyUpload_IfMatch(t *testing.T) {
 		assertTreeUnchanged(t, store, nodes, children, 0)
 	})
 	t.Run("current etag", func(t *testing.T) {
-		d, store, _, _ := emptySaveFixture()
+		d, store, _, _ := emptySaveFixture(t)
 		if _, err := d.InitiateUpload(testContext(), pathRef("./file.txt"), 0, map[string]string{"if-match": "old-etag"}); err != nil {
 			t.Fatalf("current If-Match: %v", err)
 		}
@@ -217,7 +217,7 @@ func TestEmptyUpload_IfMatch(t *testing.T) {
 		}
 	})
 	t.Run("replay on an emptied file", func(t *testing.T) {
-		d, store, _, _ := emptySaveFixture()
+		d, store, _, _ := emptySaveFixture(t)
 		if _, err := d.InitiateUpload(testContext(), pathRef("./file.txt"), 0, map[string]string{"if-match": "old-etag"}); err != nil {
 			t.Fatalf("first empty save: %v", err)
 		}
@@ -232,7 +232,7 @@ func TestEmptyUpload_IfMatch(t *testing.T) {
 }
 
 func TestEmptyUpload_NewFile(t *testing.T) {
-	d, store, _, _ := emptySaveFixture()
+	d, store, _, _ := emptySaveFixture(t)
 	if _, err := d.InitiateUpload(testContext(), pathRef("./sub/new.txt"), 0, map[string]string{"mtime": "1000000000"}); err != nil {
 		t.Fatalf("InitiateUpload(0) of a new name: %v", err)
 	}
@@ -256,7 +256,7 @@ func TestUpload_FolderTargetIsRefused(t *testing.T) {
 			"by path": pathRef("./sub"),
 			"by id":   {ResourceId: &provider.ResourceId{StorageId: "st", SpaceId: "s1", OpaqueId: "sub"}, Path: "."},
 		} {
-			d, store, _, _ := emptySaveFixture()
+			d, store, _, _ := emptySaveFixture(t)
 			nodes, children := nodeSnapshot(store), childrenSnapshot(store)
 			_, err := d.InitiateUpload(testContext(), ref, length, map[string]string{})
 			if _, ok := err.(errtypes.IsPreconditionFailed); !ok {
@@ -269,7 +269,7 @@ func TestUpload_FolderTargetIsRefused(t *testing.T) {
 
 // A TUS commit whose name turned into a folder meanwhile refuses to write into it.
 func TestFinishUpload_RefusesAFolder(t *testing.T) {
-	d, store, _, _ := emptySaveFixture()
+	d, store, _, _ := emptySaveFixture(t)
 	ctx := testContext()
 	res, err := d.InitiateUpload(ctx, pathRef("./later-a-folder"), 5, map[string]string{})
 	if err != nil {
@@ -296,7 +296,7 @@ func TestFinishUpload_RefusesAFolder(t *testing.T) {
 }
 
 func TestEmptyUpload_SnapshotFailureKeepsTheContent(t *testing.T) {
-	d, store, _, _ := emptySaveFixture()
+	d, store, _, _ := emptySaveFixture(t)
 	fs := &failingStore{mockMetadataStore: store, failPutVersion: true}
 	d.store = fs
 	nodes, children := nodeSnapshot(store), childrenSnapshot(store)
@@ -308,7 +308,7 @@ func TestEmptyUpload_SnapshotFailureKeepsTheContent(t *testing.T) {
 
 // An empty save that loses the CAS race keeps the content its retry replaces, as its first attempt does.
 func TestEmptyUpload_CASRetryKeepsTheRacingWritersContent(t *testing.T) {
-	d, store, blob, _ := emptySaveFixture()
+	d, store, blob, _ := emptySaveFixture(t)
 	d.store = &racingWriterStore{mockMetadataStore: store, blob: blob}
 	if _, err := d.InitiateUpload(testContext(), pathRef("./file.txt"), 0, map[string]string{}); err != nil {
 		t.Fatalf("InitiateUpload(0): %v", err)
@@ -322,7 +322,7 @@ func TestEmptyUpload_CASRetryKeepsTheRacingWritersContent(t *testing.T) {
 }
 
 func TestEmptyUpload_CASRetrySnapshotFailureKeepsTheRacingWritersContent(t *testing.T) {
-	d, store, blob, _ := emptySaveFixture()
+	d, store, blob, _ := emptySaveFixture(t)
 	d.store = &racingWriterStore{mockMetadataStore: store, blob: blob, failRacerVersion: true}
 	if _, err := d.InitiateUpload(testContext(), pathRef("./file.txt"), 0, map[string]string{}); err == nil {
 		t.Fatal("an empty save whose retry could not keep the replaced content succeeded")
@@ -338,7 +338,7 @@ func TestEmptyUpload_ReadErrorsChangeNothing(t *testing.T) {
 		"target read":   func(s *failingStore) { s.failNode = "f1" },
 	} {
 		t.Run(name, func(t *testing.T) {
-			d, store, _, _ := emptySaveFixture()
+			d, store, _, _ := emptySaveFixture(t)
 			fs := &failingStore{mockMetadataStore: store}
 			fail(fs)
 			d.store = fs
@@ -353,7 +353,7 @@ func TestEmptyUpload_ReadErrorsChangeNothing(t *testing.T) {
 
 // A file-level grant (an OCS file share) authorizes an empty save, as it does any upload.
 func TestEmptyUpload_FileShareGrantee(t *testing.T) {
-	d, store, _, _ := emptySaveFixture()
+	d, store, _, _ := emptySaveFixture(t)
 	store.nodes["s1.f1"].Grants = map[string]*GrantEntry{
 		"u:bob": {GranteeType: "user", GranteeID: "bob", Permissions: permissionsToUint32(&provider.ResourcePermissions{
 			Stat: true, InitiateFileDownload: true, InitiateFileUpload: true,
@@ -370,7 +370,7 @@ func TestEmptyUpload_FileShareGrantee(t *testing.T) {
 // --- Empty content reads as nothing, without asking the blob store ---
 
 func TestDownload_EmptyFileReadsNothing(t *testing.T) {
-	d, store, _, _ := emptySaveFixture()
+	d, store, _, _ := emptySaveFixture(t)
 	store.nodes["s1.f1"].BlobID, store.nodes["s1.f1"].Size = "", 0
 	if got := readHead(t, d); got != "" {
 		t.Errorf("empty file reads %q", got)

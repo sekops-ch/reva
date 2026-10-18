@@ -46,7 +46,7 @@ func testContextServiceAccount() context.Context {
 
 func TestAssemblePermissions_OwnerGetsAll(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
 
 	ctx := testContextWithUser("test-user-id", nil)
@@ -60,7 +60,7 @@ func TestAssemblePermissions_OwnerGetsAll(t *testing.T) {
 
 func TestAssemblePermissions_ServiceAccountGetsAll(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
 
 	ctx := testContextServiceAccount()
@@ -74,7 +74,7 @@ func TestAssemblePermissions_ServiceAccountGetsAll(t *testing.T) {
 
 func TestAssemblePermissions_NoGrantGetsNone(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
 
 	ctx := testContextWithUser("other-user", nil)
@@ -88,7 +88,7 @@ func TestAssemblePermissions_NoGrantGetsNone(t *testing.T) {
 
 func TestAssemblePermissions_NoUserGetsNone(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
 
 	node, _, _ := store.GetNode("s1", "f1")
@@ -101,7 +101,7 @@ func TestAssemblePermissions_NoUserGetsNone(t *testing.T) {
 
 func TestAssemblePermissions_UserGrantOnRoot(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
 
 	rootNode := store.nodes["s1.root"]
@@ -125,7 +125,7 @@ func TestAssemblePermissions_UserGrantOnRoot(t *testing.T) {
 
 func TestAssemblePermissions_GroupGrant(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
 
 	rootNode := store.nodes["s1.root"]
@@ -150,7 +150,7 @@ func TestAssemblePermissions_GroupGrant(t *testing.T) {
 
 func TestAssemblePermissions_InheritedGrant(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceEmpty(store, "s1", "root")
 
 	subID := "sub-dir"
@@ -186,7 +186,7 @@ func TestAssemblePermissions_InheritedGrant(t *testing.T) {
 
 func TestGetMD_NonMemberReturnsNotFound(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceWithFile(store, "s1", "root", "f1", "secret.txt")
 
 	ctx := testContextWithUser("stranger", nil)
@@ -206,7 +206,7 @@ func TestGetMD_NonMemberReturnsNotFound(t *testing.T) {
 func TestDownload_NonMemberDenied(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 	setupSpaceWithFile(store, "s1", "root", "f1", "secret.txt")
 	blob.blobs[BlobKey("s1", "old-blob")] = []byte("data")
 
@@ -224,7 +224,7 @@ func TestDownload_NonMemberDenied(t *testing.T) {
 func TestUpload_ReadOnlyGrantDenied(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 	setupSpaceWithFile(store, "s1", "root", "f1", "readonly.txt")
 
 	rootNode := store.nodes["s1.root"]
@@ -252,7 +252,7 @@ func TestUpload_ReadOnlyGrantDenied(t *testing.T) {
 
 func TestDelete_NonMemberDenied(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceWithFile(store, "s1", "root", "f1", "secret.txt")
 
 	ctx := testContextWithUser("stranger", nil)
@@ -268,7 +268,7 @@ func TestDelete_NonMemberDenied(t *testing.T) {
 
 func TestPurgeRecycleItem_NonMemberDenied(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceEmpty(store, "s1", "root")
 	store.trash["s1.tk1"] = &TrashEntry{
 		Key: "tk1", NodeID: "n1", SpaceID: "s1",
@@ -291,7 +291,7 @@ func TestPurgeRecycleItem_NonMemberDenied(t *testing.T) {
 
 func TestListStorageSpaces_FiltersNonMember(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceEmpty(store, "owned", "root-owned")
 	setupSpaceEmpty(store, "other", "root-other")
 
@@ -313,7 +313,7 @@ func TestListStorageSpaces_FiltersNonMember(t *testing.T) {
 
 func TestListStorageSpaces_IncludesGrantedSpace(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceEmpty(store, "project", "root-proj")
 
 	store.spaces["project"].Owner = "someone-else"
@@ -346,7 +346,7 @@ func TestListStorageSpaces_IncludesGrantedSpace(t *testing.T) {
 
 func TestPurgeRecycleItem_MissingReturns404(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceEmpty(store, "s1", "root")
 
 	ctx := testContext()
@@ -365,7 +365,7 @@ func TestPurgeRecycleItem_MissingReturns404(t *testing.T) {
 
 func TestRestoreRecycleItem_MissingReturns404(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceEmpty(store, "s1", "root")
 
 	ctx := testContext()
@@ -384,7 +384,7 @@ func TestRestoreRecycleItem_MissingReturns404(t *testing.T) {
 
 func TestPurgeRecycleItem_DoublePurge(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceEmpty(store, "s1", "root")
 	store.trash["s1.tk1"] = &TrashEntry{
 		Key: "tk1", NodeID: "n1", SpaceID: "s1",
@@ -414,7 +414,7 @@ func TestPurgeRecycleItem_DoublePurge(t *testing.T) {
 
 func TestAddGrant_StoresGrantOnNode(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceWithFile(store, "s1", "root", "f1", "shared.txt")
 
 	ctx := testContext()
@@ -458,7 +458,7 @@ func TestAddGrant_StoresGrantOnNode(t *testing.T) {
 
 func TestAssemblePermissions_FindsAddedGrant(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceWithFile(store, "s1", "root", "f1", "shared.txt")
 
 	ctx := testContext()
@@ -493,7 +493,7 @@ func TestAssemblePermissions_FindsAddedGrant(t *testing.T) {
 
 func TestAssemblePermissions_FindsGrantOnSpaceRoot(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
 
 	store.spaces["s1"].Owner = "alice"
@@ -531,7 +531,7 @@ func TestAssemblePermissions_FindsGrantOnSpaceRoot(t *testing.T) {
 
 func TestModifyGrant_CASRetry(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
 
 	store.nodes["s1.f1"].Grants = map[string]*GrantEntry{
@@ -564,7 +564,7 @@ func TestModifyGrant_CASRetry(t *testing.T) {
 
 func TestSpaceToCS3_OpaqueGrants(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceEmpty(store, "proj", "root-proj")
 
 	store.spaces["proj"].Type = "project"
@@ -606,7 +606,7 @@ func TestSpaceToCS3_OpaqueGrants(t *testing.T) {
 
 func TestListStorageSpaces_GrantFilter(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceEmpty(store, "alice-space", "root-alice")
 
 	store.spaces["alice-space"].Owner = "alice"
@@ -660,7 +660,7 @@ func TestListStorageSpaces_GrantFilter(t *testing.T) {
 
 func TestListRecycle_SpecificKeyReturnsItem(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceEmpty(store, "s1", "root")
 	store.trash["s1.tk1"] = &TrashEntry{
 		Key: "tk1", NodeID: "n1", SpaceID: "s1",
@@ -690,7 +690,7 @@ func TestListRecycle_SpecificKeyReturnsItem(t *testing.T) {
 
 func TestListRecycle_MissingKeyReturns404(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceEmpty(store, "s1", "root")
 
 	ctx := testContext()
@@ -709,7 +709,7 @@ func TestListRecycle_MissingKeyReturns404(t *testing.T) {
 
 func TestListRecycle_EmptyKeyListsAll(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceEmpty(store, "s1", "root")
 	store.trash["s1.tk1"] = &TrashEntry{
 		Key: "tk1", NodeID: "n1", SpaceID: "s1",
@@ -736,7 +736,7 @@ func TestListRecycle_EmptyKeyListsAll(t *testing.T) {
 
 func TestListRecycle_PurgedKeyReturns404(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceEmpty(store, "s1", "root")
 	store.trash["s1.tk1"] = &TrashEntry{
 		Key: "tk1", NodeID: "n1", SpaceID: "s1",
@@ -768,7 +768,7 @@ func TestListRecycle_PurgedKeyReturns404(t *testing.T) {
 
 func TestAddGrant_NonMemberDenied(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
 
 	ctx := testContextWithUser("stranger", nil)
@@ -794,7 +794,7 @@ func TestAddGrant_NonMemberDenied(t *testing.T) {
 
 func TestRemoveGrant_NonMemberDenied(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
 
 	ctx := testContextWithUser("stranger", nil)
@@ -819,7 +819,7 @@ func TestRemoveGrant_NonMemberDenied(t *testing.T) {
 
 func TestUpdateGrant_NonMemberDenied(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
 
 	ctx := testContextWithUser("stranger", nil)
@@ -845,7 +845,7 @@ func TestUpdateGrant_NonMemberDenied(t *testing.T) {
 
 func TestListGrants_NonMemberDenied(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
 
 	ctx := testContextWithUser("stranger", nil)
@@ -864,7 +864,7 @@ func TestListGrants_NonMemberDenied(t *testing.T) {
 
 func TestAddGrant_ReadOnlyGrantDenied(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
 
 	store.nodes["s1.root"].Grants = map[string]*GrantEntry{
@@ -898,7 +898,7 @@ func TestAddGrant_ReadOnlyGrantDenied(t *testing.T) {
 
 func TestListRevisions_NonMemberDenied(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
 
 	ctx := testContextWithUser("stranger", nil)
@@ -917,7 +917,7 @@ func TestListRevisions_NonMemberDenied(t *testing.T) {
 
 func TestDownloadRevision_NonMemberDenied(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
 
 	ctx := testContextWithUser("stranger", nil)
@@ -936,7 +936,7 @@ func TestDownloadRevision_NonMemberDenied(t *testing.T) {
 
 func TestDownloadRevision_ReadOnlyNoVersionPermDenied(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
 
 	store.nodes["s1.root"].Grants = map[string]*GrantEntry{
@@ -961,7 +961,7 @@ func TestDownloadRevision_ReadOnlyNoVersionPermDenied(t *testing.T) {
 
 func TestRestoreRevision_NonMemberDenied(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
 
 	ctx := testContextWithUser("stranger", nil)
@@ -982,7 +982,7 @@ func TestRestoreRevision_NonMemberDenied(t *testing.T) {
 
 func TestSetArbitraryMetadata_NonMemberDenied(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
 
 	ctx := testContextWithUser("stranger", nil)
@@ -1003,7 +1003,7 @@ func TestSetArbitraryMetadata_NonMemberDenied(t *testing.T) {
 
 func TestSetArbitraryMetadata_ReadOnlyDenied(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
 
 	store.nodes["s1.root"].Grants = map[string]*GrantEntry{
@@ -1030,7 +1030,7 @@ func TestSetArbitraryMetadata_ReadOnlyDenied(t *testing.T) {
 
 func TestUnsetArbitraryMetadata_NonMemberDenied(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
 
 	ctx := testContextWithUser("stranger", nil)
@@ -1051,7 +1051,7 @@ func TestUnsetArbitraryMetadata_NonMemberDenied(t *testing.T) {
 
 func TestSetArbitraryMetadata_LockedDenied(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
 
 	store.nodes["s1.f1"].Lock = &LockEntry{
@@ -1078,7 +1078,7 @@ func TestSetArbitraryMetadata_LockedDenied(t *testing.T) {
 
 func TestUnsetArbitraryMetadata_LockedDenied(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
 
 	store.nodes["s1.f1"].Lock = &LockEntry{
@@ -1103,7 +1103,7 @@ func TestUnsetArbitraryMetadata_LockedDenied(t *testing.T) {
 
 func TestRestoreRevision_LockedDenied(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
 
 	store.nodes["s1.f1"].Lock = &LockEntry{
@@ -1130,7 +1130,7 @@ func TestRestoreRevision_LockedDenied(t *testing.T) {
 
 func TestAddLabel_NonMemberDenied(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
 
 	ctx := testContextWithUser("stranger", nil)
@@ -1149,7 +1149,7 @@ func TestAddLabel_NonMemberDenied(t *testing.T) {
 
 func TestRemoveLabel_NonMemberDenied(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
 
 	ctx := testContextWithUser("stranger", nil)
@@ -1170,7 +1170,7 @@ func TestRemoveLabel_NonMemberDenied(t *testing.T) {
 
 func TestGetLock_NonMemberDenied(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
 
 	ctx := testContextWithUser("stranger", nil)
@@ -1189,7 +1189,7 @@ func TestGetLock_NonMemberDenied(t *testing.T) {
 
 func TestSetLock_NonMemberDenied(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
 
 	ctx := testContextWithUser("stranger", nil)
@@ -1209,7 +1209,7 @@ func TestSetLock_NonMemberDenied(t *testing.T) {
 
 func TestRefreshLock_NonMemberDenied(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
 
 	ctx := testContextWithUser("stranger", nil)
@@ -1229,7 +1229,7 @@ func TestRefreshLock_NonMemberDenied(t *testing.T) {
 
 func TestUnlock_NonMemberDenied(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
 
 	ctx := testContextWithUser("stranger", nil)
@@ -1251,7 +1251,7 @@ func TestUnlock_NonMemberDenied(t *testing.T) {
 
 func TestTouchFile_ExistingFile_NonMemberDenied(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
 
 	ctx := testContextWithUser("stranger", nil)
@@ -1270,7 +1270,7 @@ func TestTouchFile_ExistingFile_NonMemberDenied(t *testing.T) {
 
 func TestTouchFile_NewFile_NonMemberDenied(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceEmpty(store, "s1", "root")
 
 	ctx := testContextWithUser("stranger", nil)
@@ -1292,7 +1292,7 @@ func TestTouchFile_NewFile_NonMemberDenied(t *testing.T) {
 
 func TestGrantOps_OwnerAllowed(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
 
 	ctx := testContext()
@@ -1328,7 +1328,7 @@ func TestGrantOps_OwnerAllowed(t *testing.T) {
 func TestRevisionOps_OwnerAllowed(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 	setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
 
 	store.versions = append(store.versions, &VersionEntry{
@@ -1366,7 +1366,7 @@ func TestRevisionOps_OwnerAllowed(t *testing.T) {
 
 func TestLockOps_OwnerAllowed(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
 
 	ctx := testContext()
@@ -1418,7 +1418,7 @@ func TestDelete_HonoursLocks(t *testing.T) {
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			store := newMockMetadataStore()
-			d := testDriver(store, newMockBlobStore())
+			d := testDriver(t, store, newMockBlobStore())
 			setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
 			if c.lock {
 				store.nodes["s1.f1"].Lock = &LockEntry{LockID: "lock-123", Type: 1, UserID: "alice"}

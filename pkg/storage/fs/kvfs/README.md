@@ -134,7 +134,7 @@ unreferenced.
 
 How each interface method translates to backend operations. "CAS-retried" means
 the operation runs in a loop of up to `MaxCASRetries` attempts (100 by default)
-with exponential backoff (1–50 ms + jitter); see [`cas.go`](cas.go).
+with full-jitter exponential backoff capped at 1 s; see [`cas.go`](cas.go).
 
 ### 4.1 Namespace
 
@@ -154,10 +154,10 @@ with exponential backoff (1–50 ms + jitter); see [`cas.go`](cas.go).
 | Method | KV ops | S3 ops | Notes |
 |---|---|---|---|
 | `Upload` (simple PUT) | `commitFileNode` CAS-retry | `PUT` (single object) | Streams body → S3 while computing SHA-1; the file keeps the client's modification time (`X-OC-Mtime`, TUS `mtime`); an overwrite checks the lock again with `X-Lock-Id` or the lock id from initiation; emits `FileUploaded` |
-| `InitiateUpload` (TUS) | `PutUpload` (new session) | `InitiateMultipartUpload` | Returns TUS session ID in storage map; sessions only after the permission check; a missing parent of a non-empty upload gets the simple protocol only, other errors are returned; a folder target is `PreconditionFailed`; an existing file's lock is checked (a locked file needs its lock id); an empty upload commits here and keeps the replaced content as a version or fails |
-| `WriteChunk` (TUS) | `PutUpload` (offset++) | `UploadPart` | Per-chunk; gauge `kvfs_upload_in_flight{protocol="tus"}` |
-| `FinishUpload` (TUS) | `commitNode` CAS-retry + `DeleteUpload` | `CompleteMultipartUpload` | Computes SHA-1 from concatenation; an overwrite checks the lock with the lock id from initiation, and a refusal by the lock discards the session (423); emits `FileUploaded` |
-| `Terminate` (TUS) | `DeleteUpload` | `AbortMultipartUpload` | |
+| `InitiateUpload` (TUS) | `PutUpload` (new session) | — | Returns TUS session ID in storage map; sessions only after the permission check; a missing parent of a non-empty upload gets the simple protocol only, other errors are returned; a folder target is `PreconditionFailed`; an existing file's lock is checked (a locked file needs its lock id); an empty upload commits here and keeps the replaced content as a version or fails |
+| `WriteChunk` (TUS) | — | — | Appends to the upload cache (disk or NATS stream); the persisted session's offset reconciles from the cache; gauge `kvfs_upload_in_flight{protocol="tus"}` |
+| `FinishUpload` (TUS) | `commitNode` CAS-retry + `DeleteUpload` | one `PUT` via `blob.Upload` | Computes SHA-1 over the staged body; minio-go sends ≤16 MiB bodies (driver-buffered) in one PUT and larger ones multipart, buffering each part itself; an overwrite checks the lock with the lock id from initiation, and a refusal by the lock discards the session (423); emits `FileUploaded` |
+| `Terminate` (TUS) | `DeleteUpload` | `AbortMultipartUpload` (legacy sessions only) | Drops the staging cache |
 | `Download` | `nodes` get | `GET` (stream) | A revision key as opaque ID streams that version (ListFileVersions + InitiateFileDownload); empty content has no blob and reads as nothing |
 
 ### 4.3 Spaces
@@ -198,8 +198,8 @@ revision numbers. There are no cross-key transactions.
 - **Update** uses the revision returned by the most recent `Get` as
   `expectedRev`. Mismatch yields `ErrCASConflict`.
 - **Retry**: every CAS-bound mutation runs in a loop bounded by
-  `MaxCASRetries` (100 by default), with exponential backoff + jitter capped at
-  50 ms (`casBackoff` in [`cas.go`](cas.go)).
+  `MaxCASRetries` (100 by default), with full-jitter exponential backoff capped
+  at 1 s (`casBackoff` in [`cas.go`](cas.go)).
 - **Conflict resolution for `PutChildren`**: on a create conflict, the helper
   re-reads, merges the new entry into the existing children map, and retries.
   This handles the common "two creates race" case without escalating an error.
@@ -241,19 +241,17 @@ contain `?`, `&` or `=`.
 ### 6.2 TUS resumable (`InitiateUpload` / `WriteChunk` / `FinishUpload`)
 
 ```
-InitiateUpload  ──▶  S3 InitiateMultipartUpload
-                ──▶  PutUpload (new UploadSession in `uploads` bucket)
+InitiateUpload  ──▶  PutUpload (new UploadSession in `uploads` bucket)
                 ──▶  return TUS session ID
 
-WriteChunk(part_n)  ──▶  S3 UploadPart(part_n)
-                    ──▶  PutUpload (offset, parts, etags)
+WriteChunk(n)   ──▶  upload cache append (disk file or NATS object stream)
 
-FinishUpload   ──▶  S3 CompleteMultipartUpload
-               ──▶  commitFileNode (same path as simple)
+FinishUpload   ──▶  blob.Upload (ONE S3 PUT ≤16 MiB, multipart above —
+               ──▶  commitFileNode (same path as simple)      minio-go buffers each part)
                ──▶  DeleteUpload (session)
 
-Terminate      ──▶  S3 AbortMultipartUpload
-               ──▶  DeleteUpload (session)
+Terminate      ──▶  drop staging cache (+ S3 AbortMultipartUpload on legacy
+               ──▶  DeleteUpload (session)                    multipart sessions)
 ```
 
 Implements `tusd.Core`, `tusd.Terminater`, and `tusd.LengthDeferrer`. The
@@ -329,11 +327,39 @@ the oldest other one; at `max_versions = 1` the replaced content is not kept.
 | `kvfs_blob_operation_duration_seconds` | histogram | `op` | S3 op latency |
 | `kvfs_upload_in_flight` | gauge | `protocol` | Active uploads (`simple` / `tus`) |
 | `kvfs_tree_size_drift_total` | counter | — | Ancestor CAS failures |
+| `kvfs_kv_authoritative_reads_total` | counter | `bucket`, `outcome` | Leader reads confirming a direct-read miss: `lag_caught` / `confirmed_absent` / `error` |
+| `kvfs_kv_authoritative_read_duration_seconds` | histogram | `bucket` | Leader-read latency (buckets to 10 s) |
+| `kvfs_authoritative_read_timeout_seconds` | gauge | `prefix` | Effective leader-read bound (dead-config seam) |
+| `kvfs_max_cas_retries` / `kvfs_max_delete_depth` | gauge | `prefix` | Effective config bounds (dead-config seams) |
 | `kvfs_gc_blobs_scanned_total` | counter | — | Blobs scanned by GC |
 | `kvfs_gc_blobs_deleted_total` | counter | — | Orphans deleted |
 | `kvfs_gc_would_delete_total` | counter | — | Dry-run would-delete count |
 | `kvfs_gc_errors_total` | counter | — | GC errors |
 | `kvfs_gc_run_duration_seconds` | histogram | — | Sweep duration |
+
+#### Authoritative leader reads
+
+A direct KV read a replica answers can trail a just-acknowledged write
+(buckets run `allow_direct` at R=3). `GetUpload`, `GetNode` and the resolve
+name-miss therefore confirm every miss with ONE `$JS.API.STREAM.MSG.GET`
+(answered by the stream leader, never `DIRECT.GET`), bounded by
+`authoritative_read_timeout` (default 5 s). Outcomes are semantic:
+`lag_caught` means the leader had what the replica's view (or a stale
+children map) missed; `confirmed_absent` is a true miss — every create
+resolves at least one, so absent is the common outcome; `error` surfaces
+leader/decode failures (the operation fails loudly, never a silent
+not-found). The children confirm scans the map value with a streaming
+decoder instead of materializing it (`scanChildMap`; benchmarked 3–8×
+faster and ~7× lighter than a full unmarshal at 1k–50k entries).
+
+Live cost math: per-read latency =
+`rate(kvfs_kv_authoritative_read_duration_seconds_sum[5m]) /
+rate(kvfs_kv_authoritative_read_duration_seconds_count[5m])`;
+reads per created item ≈
+`rate(kvfs_kv_authoritative_reads_total{bucket="<prefix>-children"}[5m])`
+over the create rate (every new name confirms once; ocdav's MKCOL and TUS
+pre-Stats add one each); payload size per read is the directory's
+`kvfs_children_value_bytes`.
 
 ### 9.2 Events
 
@@ -342,7 +368,13 @@ via `publishEvent`:
 
 - `FileUploaded` — simple PUT, empty-file commit, TUS FinishUpload (there is
   no `InitiateFileUpload` case in the middleware, and the datatx `uff`
-  callback path does not apply to this driver)
+  callback path does not apply to this driver). A TUS upload the client
+  finishes with its own continuation PATCH arrives on the unprotected data
+  path with no user in the request context: the event then falls back to the
+  identity stored in the UploadSession at initiate (opaque id, idp, type,
+  initiator id). `SpaceOwner`, `Owner` and `Executant` all carry the
+  uploading user — a deviation from upstream datatx, which uses the space
+  owner-or-manager; changing it is a semantics decision.
 - `ItemMoved` — the middleware has no Move case; decomposedfs also
   self-publishes it
 
@@ -353,6 +385,13 @@ publisher there: `ContainerCreated`, `FileDownloaded` (on
 A driver-side copy of any of these double-counts every operation on the event
 stream. These are the standard reva storage events consumed by OpenCloud's
 notifications, audit, and search services.
+
+Recorded gap (do not fix casually): middleware-published events carry a nil
+`SpaceOwner` because kvfs never calls `storagespace.ContextSendSpaceOwnerID`
+(decomposedfs does, ~10 call sites). Any future fix must call it EXACTLY once
+per request — the helper sends on an unbuffered channel from a goroutine and
+closes it, so a second call can panic and a missed non-blocking read leaks
+the goroutine. No consumer reads the field today.
 
 ## 10. Feature parity vs decomposedfs / posix
 

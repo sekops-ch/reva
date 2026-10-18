@@ -40,7 +40,7 @@ func appLock(id string, expires time.Time) *provider.Lock {
 func lockFixture(t *testing.T, lock *provider.Lock) (*kvfsDriver, *mockMetadataStore) {
 	t.Helper()
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
 	store.nodes["s1.root"].Grants = map[string]*GrantEntry{
 		"u:bob": {GranteeType: "user", GranteeID: "bob", Permissions: permissionsToUint32(&provider.ResourcePermissions{

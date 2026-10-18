@@ -50,8 +50,8 @@ func buildDirChain(store *mockMetadataStore, spaceID, rootID string, n int) stri
 
 // depthDriver returns a test driver with an explicit MaxDeleteDepth so the
 // depth tests don't need to build 100-deep chains.
-func depthDriver(store *mockMetadataStore, blob *mockBlobStore, limit int) *kvfsDriver {
-	d := testDriver(store, blob)
+func depthDriver(t testing.TB, store *mockMetadataStore, blob *mockBlobStore, limit int) *kvfsDriver {
+	d := testDriver(t, store, blob)
 	d.opts = &Options{MaxDeleteDepth: limit}
 	return d
 }
@@ -78,7 +78,7 @@ func trashChainTop(t *testing.T, d *kvfsDriver, store *mockMetadataStore, spaceI
 func TestPurgeRecycleItem_DepthWithinLimit(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := depthDriver(store, blob, 5)
+	d := depthDriver(t, store, blob, 5)
 
 	buildDirChain(store, "s1", "root", 6) // 5 levels below c1
 	key := trashChainTop(t, d, store, "s1", "c1")
@@ -105,7 +105,7 @@ func TestPurgeRecycleItem_DepthWithinLimit(t *testing.T) {
 func TestPurgeRecycleItem_DepthExceeded(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := depthDriver(store, blob, 5)
+	d := depthDriver(t, store, blob, 5)
 
 	buildDirChain(store, "s1", "root", 7) // 6 levels below c1
 	key := trashChainTop(t, d, store, "s1", "c1")
@@ -147,7 +147,7 @@ func TestPurgeRecycleItem_DepthExceeded(t *testing.T) {
 func TestEmptyRecycle_DepthExceededAborts(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := depthDriver(store, blob, 5)
+	d := depthDriver(t, store, blob, 5)
 
 	buildDirChain(store, "s1", "root", 7)
 	trashChainTop(t, d, store, "s1", "c1")
@@ -173,7 +173,7 @@ func TestEmptyRecycle_DepthExceededAborts(t *testing.T) {
 func TestDeleteStorageSpace_DepthGuard(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := depthDriver(store, blob, 5)
+	d := depthDriver(t, store, blob, 5)
 
 	buildDirChain(store, "s-deep", "root", 6) // 6 levels below the space root
 	err := d.DeleteStorageSpace(testContext(), &provider.DeleteStorageSpaceRequest{
@@ -190,7 +190,7 @@ func TestDeleteStorageSpace_DepthGuard(t *testing.T) {
 	}
 
 	store2 := newMockMetadataStore()
-	d2 := depthDriver(store2, newMockBlobStore(), 5)
+	d2 := depthDriver(t, store2, newMockBlobStore(), 5)
 	buildDirChain(store2, "s-ok", "root", 5) // exactly at the bound
 	if err := d2.DeleteStorageSpace(testContext(), &provider.DeleteStorageSpaceRequest{
 		Id: &provider.StorageSpaceId{OpaqueId: "s-ok"},
@@ -207,7 +207,7 @@ func TestDeleteStorageSpace_DepthGuard(t *testing.T) {
 func TestPurgeRecycleItem_DefaultDepthBoundary(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob) // opts = &Options{} → resolveMaxDeleteDepth → 100
+	d := testDriver(t, store, blob) // opts = &Options{} → resolveMaxDeleteDepth → 100
 
 	buildDirChain(store, "s1", "root", 101) // 100 levels below c1
 	key := trashChainTop(t, d, store, "s1", "c1")
@@ -217,7 +217,7 @@ func TestPurgeRecycleItem_DefaultDepthBoundary(t *testing.T) {
 	}
 
 	store2 := newMockMetadataStore()
-	d2 := testDriver(store2, newMockBlobStore())
+	d2 := testDriver(t, store2, newMockBlobStore())
 	buildDirChain(store2, "s2", "root", 102) // 101 levels below c1
 	key2 := trashChainTop(t, d2, store2, "s2", "c1")
 	spaceRef2 := &provider.Reference{ResourceId: &provider.ResourceId{SpaceId: "s2"}}

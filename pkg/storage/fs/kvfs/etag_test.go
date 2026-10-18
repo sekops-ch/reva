@@ -89,7 +89,7 @@ func TestIfMatch_QuotedOrBare(t *testing.T) {
 			return err
 		}}} {
 			t.Run(c.name+"/"+proto.name, func(t *testing.T) {
-				d, store, _ := newVersionFixture(0)
+				d, store, _ := newVersionFixture(t, 0)
 				etag := store.nodes["s1.f1"].ETag
 				err := proto.put(t, d, "file.txt", "fresh", map[string]string{"if-match": c.ifMatch(etag)})
 				if c.ok && err != nil {
@@ -143,7 +143,7 @@ func TestEtagHelpers(t *testing.T) {
 // The simple-upload id and the TUS session carry If-Match bare, so pods that compare raw values
 // still match it while both run.
 func TestIfMatch_TravelsBare(t *testing.T) {
-	d, store, _ := newVersionFixture(0)
+	d, store, _ := newVersionFixture(t, 0)
 	etag := store.nodes["s1.f1"].ETag
 	res, err := d.InitiateUpload(testContext(), rootChildRef("file.txt"), 5, map[string]string{"if-match": quoted(etag)})
 	if err != nil {

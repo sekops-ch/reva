@@ -56,12 +56,30 @@ var (
 		Help: "Effective MaxDeleteDepth bound per kvfs instance (labeled by bucket prefix)",
 	}, []string{"prefix"})
 
-	// KVAuthoritativeReads counts leader reads confirming a direct KV miss:
-	// "hit" = the leader had a key a replica's view missed, "absent" = real miss.
+	// KVAuthoritativeReads counts leader reads confirming a direct-read miss.
+	// Outcomes are semantic per bucket: lag_caught = the leader had what the
+	// replica's view (or a stale children map) missed, confirmed_absent = the
+	// miss is real, error = the leader read or decode failed.
 	KVAuthoritativeReads = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "kvfs_kv_authoritative_reads_total",
-		Help: "Authoritative leader reads confirming a direct KV miss, by bucket and outcome (hit = replica lag caught, absent = real miss).",
+		Help: "Authoritative leader reads confirming a direct-read miss, by bucket and outcome (lag_caught, confirmed_absent, error).",
 	}, []string{"bucket", "outcome"})
+
+	// KVAuthoritativeReadDuration observes each leader read (STREAM.MSG.GET):
+	// unlike direct reads it crosses to the stream leader, so it carries its
+	// own latency signal and a wider bucket range than KVOperationDuration.
+	KVAuthoritativeReadDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "kvfs_kv_authoritative_read_duration_seconds",
+		Help:    "Duration of authoritative leader reads in seconds, by bucket.",
+		Buckets: []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0},
+	}, []string{"bucket"})
+
+	// AuthoritativeReadTimeoutGauge exports the effective leader-read bound —
+	// the dead-config seam, like kvfs_max_cas_retries.
+	AuthoritativeReadTimeoutGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "kvfs_authoritative_read_timeout_seconds",
+		Help: "Effective authoritative leader-read timeout per kvfs instance (labeled by bucket prefix)",
+	}, []string{"prefix"})
 
 	// KVOperationDuration observes the duration of NATS KV operations.
 	KVOperationDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{

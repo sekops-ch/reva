@@ -38,7 +38,7 @@ func revisionRef(opaqueID string) *provider.Reference {
 // holding "content-0" (plus the "original" entry), and returns that entry.
 func twoRevisionFixture(t *testing.T) (*kvfsDriver, *mockMetadataStore, *mockBlobStore, *VersionEntry) {
 	t.Helper()
-	d, store, blob := newVersionFixture(0)
+	d, store, blob := newVersionFixture(t, 0)
 	mustOverwrite(t, d, "content-0")
 	mustOverwrite(t, d, "content-1")
 	key := versionKeyFor(t, store, blob, "content-0")
@@ -70,7 +70,7 @@ func isPermissionDenied(err error) bool {
 }
 
 func TestListRevisions_ReturnsRevisionKeys(t *testing.T) {
-	d, store, _ := newVersionFixture(0)
+	d, store, _ := newVersionFixture(t, 0)
 	mustOverwrite(t, d, "c0")
 	mustOverwrite(t, d, "c1")
 
@@ -203,7 +203,7 @@ func TestRestoreRevision_AcceptsRevisionAndBareKeys(t *testing.T) {
 }
 
 func TestRestoreRevision_RevisionKeyAtLimit_KeepsRestoredEntry(t *testing.T) {
-	d, store, blob := newVersionFixture(3)
+	d, store, blob := newVersionFixture(t, 3)
 	for _, c := range []string{"c0", "c1", "c2"} {
 		mustOverwrite(t, d, c)
 	}
@@ -227,7 +227,7 @@ func TestRestoreRevision_RevisionKeyAtLimit_KeepsRestoredEntry(t *testing.T) {
 // mismatchFixture adds a second file f2 and one version entry per file.
 func mismatchFixture(t *testing.T) (*kvfsDriver, *mockMetadataStore) {
 	t.Helper()
-	d, store, blob := newVersionFixture(0)
+	d, store, blob := newVersionFixture(t, 0)
 	store.nodes["s1.f2"] = &NodeEntry{
 		ID: "f2", SpaceID: "s1", ParentID: "root", Name: "other.txt", Type: NodeTypeFile,
 		BlobID: "f2-blob", BlobSize: 5, Size: 5, MTime: 1000, ETag: "f2-etag",
@@ -492,7 +492,7 @@ func TestRestoreRevision_AcceptsBothKeyForms_DriverSilent(t *testing.T) {
 			store := newMockMetadataStore()
 			blob := newMockBlobStore()
 			stream := newMockStream()
-			d := testDriverWithStream(store, blob, stream)
+			d := testDriverWithStream(t, store, blob, stream)
 			setupSpaceWithFile(store, "space-1", "root-1", "file-1", "versioned.txt")
 			store.versions = append(store.versions, &VersionEntry{
 				Key: "ver-key-1", NodeID: "file-1", SpaceID: "space-1",

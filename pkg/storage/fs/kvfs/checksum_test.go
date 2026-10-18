@@ -35,7 +35,7 @@ func sha1Hex(data []byte) string {
 func TestUpload_ComputesSHA1Checksum(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 
 	setupSpaceEmpty(store, "space-1", "root-1")
 
@@ -81,7 +81,7 @@ func TestUpload_ComputesSHA1Checksum(t *testing.T) {
 func TestUpload_Overwrite_UpdatesChecksum(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 
 	setupSpaceWithFile(store, "space-1", "root-1", "file-1", "existing.txt")
 
@@ -111,7 +111,7 @@ func TestUpload_Overwrite_UpdatesChecksum(t *testing.T) {
 func TestFinishUpload_ComputesSHA1Checksum(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 
 	setupSpaceEmpty(store, "space-1", "root-1")
 
@@ -166,7 +166,7 @@ func TestFinishUpload_ComputesSHA1Checksum(t *testing.T) {
 func TestFinishUpload_MultipleChunks_Checksum(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 
 	setupSpaceEmpty(store, "space-1", "root-1")
 
@@ -228,7 +228,7 @@ func TestFinishUpload_MultipleChunks_Checksum(t *testing.T) {
 func TestFinishUpload_MultiRequest_Checksum(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 	ctx := testContext()
 
 	setupSpaceEmpty(store, "space-1", "root-1")
@@ -352,7 +352,7 @@ func TestChecksum_InResourceInfo(t *testing.T) {
 func TestChecksum_PreservedInVersion(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 
 	setupSpaceWithFile(store, "space-1", "root-1", "file-1", "versioned.txt")
 	store.nodes["space-1.file-1"].Checksum = "sha1:oldchecksum"

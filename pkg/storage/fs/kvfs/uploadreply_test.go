@@ -41,7 +41,7 @@ func tusReplyFileID(info tusd.FileInfo) string {
 // reach the TUS upload info, or the reply names a resource other than the uploaded file.
 func TestInitiateUpload_TUSReplyNamesNoResource(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
 	ctx := testContext()
 
@@ -97,7 +97,7 @@ func simpleUpload(t *testing.T, d *kvfsDriver, name, content string) *provider.R
 func TestUpload_ReplyIDCarriesMountID(t *testing.T) {
 	for _, tc := range []struct{ mount, want string }{{"mnt-1", "mnt-1$s1!"}, {"", "s1!"}} {
 		store := newMockMetadataStore()
-		d := testDriver(store, newMockBlobStore())
+		d := testDriver(t, store, newMockBlobStore())
 		d.opts.MountID = tc.mount
 		setupSpaceEmpty(store, "s1", "root")
 
@@ -116,7 +116,7 @@ func TestUpload_ReplyIDCarriesMountID(t *testing.T) {
 func TestUpload_MountIDLeavesEventAndStatIDs(t *testing.T) {
 	store := newMockMetadataStore()
 	stream := newMockStream()
-	d := testDriverWithStream(store, newMockBlobStore(), stream)
+	d := testDriverWithStream(t, store, newMockBlobStore(), stream)
 	d.opts.MountID = "mnt-1"
 	setupSpaceEmpty(store, "s1", "root")
 

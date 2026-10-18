@@ -87,7 +87,7 @@ func TestUpload_KeepsTheClientDate(t *testing.T) {
 	}{{"simple", simplePut}, {"tus", tusPut}} {
 		t.Run(proto.name, func(t *testing.T) {
 			store := newMockMetadataStore()
-			d := testDriver(store, newMockBlobStore())
+			d := testDriver(t, store, newMockBlobStore())
 			setupSpaceEmpty(store, "s1", "root")
 			before := time.Now().UnixNano()
 
@@ -124,7 +124,7 @@ func TestUpload_KeepsTheClientDate(t *testing.T) {
 func TestUpload_UnusableClientDateFallsBackToCommitTime(t *testing.T) {
 	for _, v := range []string{"", "null", "abc", "-5", "12.x", "1.5e9", "9223372037", "9223372036.854775808"} {
 		store := newMockMetadataStore()
-		d := testDriver(store, newMockBlobStore())
+		d := testDriver(t, store, newMockBlobStore())
 		setupSpaceEmpty(store, "s1", "root")
 		before := time.Now().UnixNano()
 		if err := simplePut(t, d, "a.txt", "x", map[string]string{"mtime": v}); err != nil {
@@ -138,7 +138,7 @@ func TestUpload_UnusableClientDateFallsBackToCommitTime(t *testing.T) {
 
 func TestTouchFile_NewFileKeepsTheClientDate(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceEmpty(store, "s1", "root")
 	if err := d.TouchFile(testContext(), rootChildRef("empty.txt"), false, "1000000000"); err != nil {
 		t.Fatalf("TouchFile: %v", err)
@@ -151,7 +151,7 @@ func TestTouchFile_NewFileKeepsTheClientDate(t *testing.T) {
 // Version entries are trimmed by when they were taken, not by the client's dates: saves with
 // descending dates keep the newest snapshots.
 func TestTrim_DescendingClientDatesKeepTheNewestSnapshots(t *testing.T) {
-	d, store, blob := newVersionFixture(3)
+	d, store, blob := newVersionFixture(t, 3)
 	for i, c := range []string{"c1", "c2", "c3", "c4", "c5"} {
 		mtime := strconv.FormatInt(1000000000-int64(i)*86400, 10)
 		if err := simplePut(t, d, "file.txt", c, map[string]string{"mtime": mtime}); err != nil {
@@ -166,7 +166,7 @@ func TestTrim_DescendingClientDatesKeepTheNewestSnapshots(t *testing.T) {
 
 // A restore's snapshot of the replaced head is the newest entry, whatever the head's date.
 func TestRestore_SnapshotOfTheReplacedHeadIsNewest(t *testing.T) {
-	d, store, blob := newVersionFixture(2)
+	d, store, blob := newVersionFixture(t, 2)
 	for _, s := range []struct{ body, mtime string }{{"c1", "1000000000"}, {"c2", "900000000"}} {
 		if err := simplePut(t, d, "file.txt", s.body, map[string]string{"mtime": s.mtime}); err != nil {
 			t.Fatalf("save %s: %v", s.body, err)
@@ -210,7 +210,7 @@ func TestParseClientMTime(t *testing.T) {
 // Entries without a SnapshotTime order by their MTime, the commit time when they were written.
 func TestTrimVersions_EntriesWithAndWithoutSnapshotTime(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	d.opts.MaxVersions = 2
 	setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
 	store.versions = append(store.versions,

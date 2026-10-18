@@ -19,6 +19,9 @@
 package kvfs
 
 import (
+	"bytes"
+	"time"
+
 	"github.com/nats-io/nats.go"
 	"github.com/pkg/errors"
 	"github.com/vmihailenco/msgpack/v5"
@@ -42,36 +45,85 @@ const (
 // single authoritative read stays with the caller.
 func (s *KVStore) getLastAuthoritative(kv nats.KeyValue, key string) ([]byte, uint64, bool, error) {
 	bucket := kv.Bucket()
-	msg, err := s.js.GetLastMsg("KV_"+bucket, "$KV."+bucket+"."+key)
+	start := time.Now()
+	// The shared JetStream context waits 30 s; a leaderless stream must fail
+	// this read fast and loudly instead of pinning the request that long.
+	msg, err := s.js.GetLastMsg("KV_"+bucket, "$KV."+bucket+"."+key, nats.MaxWait(s.authReadTimeout))
+	KVAuthoritativeReadDuration.WithLabelValues(bucket).Observe(time.Since(start).Seconds())
 	if err != nil {
 		if errors.Is(err, nats.ErrMsgNotFound) {
-			KVAuthoritativeReads.WithLabelValues(bucket, "absent").Inc()
 			return nil, 0, false, nil
 		}
+		KVAuthoritativeReads.WithLabelValues(bucket, "error").Inc()
 		return nil, 0, false, errors.Wrapf(err, "kvfs: authoritative read of %s/%s failed", bucket, key)
 	}
 	if op := msg.Header.Get(kvOperationHeader); op == kvOperationDelete || op == kvOperationPurge {
-		KVAuthoritativeReads.WithLabelValues(bucket, "absent").Inc()
 		return nil, 0, false, nil
 	}
-	KVAuthoritativeReads.WithLabelValues(bucket, "hit").Inc()
 	return msg.Data, msg.Sequence, true, nil
 }
 
-// GetChildrenAuthoritative re-reads a children key from the stream leader.
-// resolveRelativePath uses it to confirm that a name absent from a possibly
-// stale children map is truly absent before answering not-found.
-func (s *KVStore) GetChildrenAuthoritative(spaceID, parentID string) (ChildMap, uint64, error) {
-	data, rev, ok, err := s.getLastAuthoritative(s.children, childrenKey(spaceID, parentID))
+// countAuthoritativeOutcome records what a leader read established: the leader
+// had what the replica's view missed (lag_caught), or the miss is real
+// (confirmed_absent). Callers decide `found` at their own semantic level —
+// key presence for nodes/uploads, NAME presence for children.
+func countAuthoritativeOutcome(bucket string, found bool) {
+	outcome := "confirmed_absent"
+	if found {
+		outcome = "lag_caught"
+	}
+	KVAuthoritativeReads.WithLabelValues(bucket, outcome).Inc()
+}
+
+// ConfirmChildAuthoritative confirms one name of a children map against the
+// stream leader. resolveRelativePath uses it when a name is absent from a
+// possibly stale map: a stale-but-present map is not a KV miss, so only the
+// leader can distinguish replica lag from true absence. The whole map value
+// still travels (one KV entry per directory) but is scanned with a streaming
+// decoder, never materialized.
+func (s *KVStore) ConfirmChildAuthoritative(spaceID, parentID, name string) (string, bool, error) {
+	bucket := s.children.Bucket()
+	data, _, ok, err := s.getLastAuthoritative(s.children, childrenKey(spaceID, parentID))
 	if err != nil {
-		return nil, 0, err
+		return "", false, err
 	}
 	if !ok {
-		return ChildMap{}, 0, nil // empty directory, no entry yet
+		countAuthoritativeOutcome(bucket, false)
+		return "", false, nil // no entry yet: the directory has no children
 	}
-	var children ChildMap
-	if err := msgpack.Unmarshal(data, &children); err != nil {
-		return nil, 0, errors.Wrap(err, "kvfs: failed to unmarshal children")
+	id, found, err := scanChildMap(data, name)
+	if err != nil {
+		KVAuthoritativeReads.WithLabelValues(bucket, "error").Inc()
+		return "", false, err
 	}
-	return children, rev, nil
+	countAuthoritativeOutcome(bucket, found)
+	return id, found, nil
+}
+
+// scanChildMap finds one name in a msgpack-encoded ChildMap with a streaming
+// decoder — the map is never materialized, so a leader confirm on a large
+// directory costs one allocation-light scan instead of a full unmarshal.
+func scanChildMap(data []byte, name string) (string, bool, error) {
+	dec := msgpack.NewDecoder(bytes.NewReader(data))
+	n, err := dec.DecodeMapLen()
+	if err != nil {
+		return "", false, errors.Wrap(err, "kvfs: failed to decode children map")
+	}
+	for i := 0; i < n; i++ {
+		key, err := dec.DecodeString()
+		if err != nil {
+			return "", false, errors.Wrap(err, "kvfs: failed to decode children map key")
+		}
+		if key == name {
+			id, err := dec.DecodeString()
+			if err != nil {
+				return "", false, errors.Wrap(err, "kvfs: failed to decode children map value")
+			}
+			return id, true, nil
+		}
+		if err := dec.Skip(); err != nil {
+			return "", false, errors.Wrap(err, "kvfs: failed to skip children map value")
+		}
+	}
+	return "", false, nil
 }

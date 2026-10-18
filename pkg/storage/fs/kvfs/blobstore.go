@@ -20,8 +20,10 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/http"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/minio/minio-go/v7"
@@ -83,18 +85,22 @@ func NewS3Blobstore(endpoint, region, bucket, accessKey, secretKey, blobPrefix s
 	}
 
 	useSSL := u.Scheme != "http"
-	client, err := minio.New(u.Host, &minio.Options{
-		Region: region,
-		Creds:  credentials.NewStaticV4(accessKey, secretKey, ""),
-		Secure: useSSL,
-	})
-	if err != nil {
-		return nil, errors.Wrap(err, "kvfs: failed to create S3 client")
-	}
-
 	if log == nil {
 		l := zerolog.Nop()
 		log = &l
+	}
+	tr, err := minio.DefaultTransport(useSSL)
+	if err != nil {
+		return nil, errors.Wrap(err, "kvfs: failed to build S3 transport")
+	}
+	client, err := minio.New(u.Host, &minio.Options{
+		Region:    region,
+		Creds:     credentials.NewStaticV4(accessKey, secretKey, ""),
+		Secure:    useSSL,
+		Transport: &attemptLogTransport{next: tr, log: log},
+	})
+	if err != nil {
+		return nil, errors.Wrap(err, "kvfs: failed to create S3 client")
 	}
 	return &S3Blobstore{
 		client: client,
@@ -151,55 +157,73 @@ func parseSpacePrefix(commonPrefix, blobPrefix string) (string, bool) {
 // multipart, where minio-go buffers each part itself.
 const smallBodyBufferLimit = 16 << 20
 
-// rewindLogReader is a seekable body that logs when a consumed body is rewound
-// to its start — the visible trace of an S3-level retry whose first-attempt
-// error minio-go otherwise swallows.
-type rewindLogReader struct {
-	*bytes.Reader
-	key      string
-	size     int64
-	consumed bool
-	log      *zerolog.Logger
+// blobAttemptKey carries an upload's logical blob key through the request
+// context so the client transport can attribute every attempt to it.
+type blobAttemptKey struct{}
+
+type blobAttemptInfo struct {
+	key     string
+	attempt atomic.Int32
 }
 
-func (r *rewindLogReader) Read(p []byte) (int, error) {
-	n, err := r.Reader.Read(p)
-	if n > 0 {
-		r.consumed = true
-	}
-	return n, err
+func withBlobAttemptLog(ctx context.Context, key string) context.Context {
+	return context.WithValue(ctx, blobAttemptKey{}, &blobAttemptInfo{key: key})
 }
 
-func (r *rewindLogReader) Seek(offset int64, whence int) (int64, error) {
-	if r.consumed && offset == 0 && whence == io.SeekStart {
-		r.log.Warn().Str("blob_key", r.key).Int64("size", r.size).
-			Msg("kvfs: blob upload body rewound (S3 request retried)")
-		r.consumed = false
+// attemptLogTransport logs every failing S3 attempt — transport error or error
+// status — with its blob key and attempt number, on the single-PUT path and on
+// every multipart part alike. minio-go retries silently and surfaces only the
+// LAST error, so the first attempt's failure (the one naming the real cause)
+// is otherwise unobservable.
+type attemptLogTransport struct {
+	next http.RoundTripper
+	log  *zerolog.Logger
+}
+
+func (t *attemptLogTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	info, _ := req.Context().Value(blobAttemptKey{}).(*blobAttemptInfo)
+	if info == nil {
+		return t.next.RoundTrip(req)
 	}
-	return r.Reader.Seek(offset, whence)
+	n := info.attempt.Add(1)
+	resp, err := t.next.RoundTrip(req)
+	switch {
+	case err != nil:
+		t.log.Warn().Str("blob_key", info.key).Int32("attempt", n).
+			Str("method", req.Method).Str("url", req.URL.RequestURI()).
+			Err(err).Msg("kvfs: blob upload attempt failed")
+	case resp.StatusCode >= 400:
+		t.log.Warn().Str("blob_key", info.key).Int32("attempt", n).
+			Str("method", req.Method).Str("url", req.URL.RequestURI()).
+			Int("status", resp.StatusCode).Msg("kvfs: blob upload attempt failed")
+	}
+	return resp, err
 }
 
 // Upload stores data from a reader into S3 under the given key. Bodies at or
 // below the single-PUT threshold are buffered to a seekable reader first:
 // minio-go retries a failed PUT by rewinding the body, and a plain stream
 // silently "rewinds" to nothing, so the retry would announce ContentLength
-// bytes and send an empty body while the first attempt's error is lost. The
-// buffer makes retries resend the real content, a short read from the staging
-// layer fails loudly before S3 is touched, and a rewind after consumption is
-// logged as the trace of the retried attempt. Larger bodies stream: minio-go
-// switches to multipart and buffers each part itself.
+// bytes and send an empty body. The buffer makes retries resend the real
+// content and a short read from the staging layer fails loudly before S3 is
+// touched. Larger bodies stream: minio-go switches to multipart and buffers
+// each part itself, so a retried part is never empty and a short source
+// aborts the multipart upload loudly. Every failing attempt on any path is
+// logged by the client transport under this key.
 func (bs *S3Blobstore) Upload(ctx context.Context, key string, reader io.Reader, size int64) error {
 	start := time.Now()
+	ctx = withBlobAttemptLog(ctx, key)
 	body := reader
 	if size >= 0 && size <= smallBodyBufferLimit {
-		buf, err := io.ReadAll(io.LimitReader(reader, size+1))
-		if err != nil {
-			return errors.Wrapf(err, "kvfs: failed to stage blob %s", key)
+		buf := make([]byte, size)
+		if n, err := io.ReadFull(reader, buf); err != nil {
+			return errors.Wrapf(err, "kvfs: staged blob %s has %d bytes, expected %d", key, n, size)
 		}
-		if int64(len(buf)) != size {
-			return errors.Errorf("kvfs: staged blob %s has %d bytes, expected %d", key, len(buf), size)
+		var extra [1]byte
+		if n, _ := reader.Read(extra[:]); n > 0 {
+			return errors.Errorf("kvfs: staged blob %s longer than the declared %d bytes", key, size)
 		}
-		body = &rewindLogReader{Reader: bytes.NewReader(buf), key: key, size: size, log: bs.log}
+		body = bytes.NewReader(buf)
 	}
 	_, err := bs.client.PutObject(ctx, bs.bucket, bs.physicalKey(key), body, size, minio.PutObjectOptions{
 		ContentType: "application/octet-stream",

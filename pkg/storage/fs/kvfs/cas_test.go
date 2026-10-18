@@ -32,7 +32,7 @@ import (
 func TestCreateDir_CASRetry_Succeeds(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 
 	setupSpaceEmpty(store, "space-1", "root-1")
 
@@ -68,7 +68,7 @@ func TestCreateDir_CASRetry_Succeeds(t *testing.T) {
 func TestCreateDir_CASExhausted_ReturnsError(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 	d.opts.MaxCASRetries = 10
 
 	setupSpaceEmpty(store, "space-1", "root-1")
@@ -100,7 +100,7 @@ func TestCreateDir_CASExhausted_ReturnsError(t *testing.T) {
 func TestCreateDir_AlreadyExists_NoRetry(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 
 	setupSpaceEmpty(store, "space-1", "root-1")
 
@@ -126,7 +126,7 @@ func TestCreateDir_AlreadyExists_NoRetry(t *testing.T) {
 func TestCreateDir_CleansUpOnCASFailure(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 	d.opts.MaxCASRetries = 10
 
 	setupSpaceEmpty(store, "space-1", "root-1")
@@ -172,7 +172,7 @@ func TestCasBackoff_Bounded(t *testing.T) {
 func TestUpload_CASBackoff_StillSucceeds(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 
 	setupSpaceEmpty(store, "space-1", "root-1")
 
@@ -230,7 +230,7 @@ func TestTreeSize_CASBackoff_StillPropagates(t *testing.T) {
 func TestPutNodeWithCASCheck_RetrySucceeds(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 
 	setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
 	store.injectCASFailures(2)
@@ -255,7 +255,7 @@ func TestPutNodeWithCASCheck_RetrySucceeds(t *testing.T) {
 func TestPutNodeWithCASCheck_Exhausted(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 	d.opts.MaxCASRetries = 10
 
 	setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
@@ -272,7 +272,7 @@ func TestPutNodeWithCASCheck_Exhausted(t *testing.T) {
 func TestPutNodeWithCASCheck_BusinessErrorAborts(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 
 	setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
 
@@ -290,7 +290,7 @@ func TestPutNodeWithCASCheck_BusinessErrorAborts(t *testing.T) {
 func TestPutNodeWithCASCheck_NoChangeSkipsPut(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 
 	setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
 	oldNode, oldRev, _ := store.GetNode("s1", "f1")
@@ -317,7 +317,7 @@ func TestPutNodeWithCASCheck_NoChangeSkipsPut(t *testing.T) {
 func TestSetMetadata_CASRetry(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 
 	setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
 	store.injectCASFailures(2)
@@ -344,7 +344,7 @@ func TestSetMetadata_CASRetry(t *testing.T) {
 func TestSetLock_CASRetry(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 
 	setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
 	store.injectCASFailures(2)
@@ -373,7 +373,7 @@ func TestSetLock_CASRetry(t *testing.T) {
 func TestSetLock_AlreadyLocked_AbortsRetry(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 
 	setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
 
@@ -401,7 +401,7 @@ func TestSetLock_AlreadyLocked_AbortsRetry(t *testing.T) {
 // --- casRetryLoop helper unit tests ---
 
 func TestCasRetryLoop_SuccessFirstTry(t *testing.T) {
-	d := testDriver(newMockMetadataStore(), newMockBlobStore())
+	d := testDriver(t, newMockMetadataStore(), newMockBlobStore())
 	calls := 0
 	err := d.casRetryLoop("cas_test_ok", func() error {
 		calls++
@@ -416,7 +416,7 @@ func TestCasRetryLoop_SuccessFirstTry(t *testing.T) {
 }
 
 func TestCasRetryLoop_RetryThenSucceed(t *testing.T) {
-	d := testDriver(newMockMetadataStore(), newMockBlobStore())
+	d := testDriver(t, newMockMetadataStore(), newMockBlobStore())
 	op := "cas_test_retry"
 	labels := map[string]string{"operation": op}
 	before := getCounterValue(t, "kvfs_cas_retries_total", labels)
@@ -440,7 +440,7 @@ func TestCasRetryLoop_RetryThenSucceed(t *testing.T) {
 }
 
 func TestCasRetryLoop_AbortOnOtherError(t *testing.T) {
-	d := testDriver(newMockMetadataStore(), newMockBlobStore())
+	d := testDriver(t, newMockMetadataStore(), newMockBlobStore())
 	op := "cas_test_abort"
 	labels := map[string]string{"operation": op}
 	beforeR := getCounterValue(t, "kvfs_cas_retries_total", labels)
@@ -465,7 +465,7 @@ func TestCasRetryLoop_AbortOnOtherError(t *testing.T) {
 }
 
 func TestCasRetryLoop_ExhaustionReturnsConflict(t *testing.T) {
-	d := testDriver(newMockMetadataStore(), newMockBlobStore())
+	d := testDriver(t, newMockMetadataStore(), newMockBlobStore())
 	d.opts.MaxCASRetries = 10
 	op := "cas_test_exhaust"
 	labels := map[string]string{"operation": op}

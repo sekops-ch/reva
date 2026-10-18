@@ -46,6 +46,10 @@ import (
 
 const defaultMaxCASRetries = 100
 
+// defaultAuthoritativeReadTimeout envelopes a JetStream leader election while
+// failing a blocked read six times faster than the shared 30 s context wait.
+const defaultAuthoritativeReadTimeout = 5 * time.Second
+
 // defaultMaxDeleteDepth bounds recursive delete traversal (trash purge,
 // space delete) when max_delete_depth is unset. Deep enough for any sane
 // tree; shallow enough that the recursion can never threaten the stack.
@@ -159,6 +163,7 @@ func New(m map[string]interface{}, stream events.Stream, log *zerolog.Logger) (s
 	// Export the effective CAS retry bound per instance so dead config
 	// (value diverging from the deployment setting) is observable.
 	MaxCASRetriesGauge.WithLabelValues(opts.BucketPrefix).Set(float64(opts.MaxCASRetries))
+	AuthoritativeReadTimeoutGauge.WithLabelValues(opts.BucketPrefix).Set(resolveAuthoritativeReadTimeout(opts).Seconds())
 	// Same dead-config seam for the recursive-delete depth bound.
 	MaxDeleteDepthGauge.WithLabelValues(opts.BucketPrefix).Set(float64(resolveMaxDeleteDepth(opts)))
 
@@ -1068,11 +1073,8 @@ func checkLockID(lockID string, node *NodeEntry) error {
 // FileTouched) must NOT gain a driver-side copy: it double-counts every
 // operation on the event stream. See README §9.2.
 //
-// Previously this was synchronous (events.Publish ACK blocked the upload
-// response). Under burst load the event stream backed up and that latency
-// showed up as per-upload tail latency. The async queue decouples the two:
-// uploads return as soon as the metadata commit lands, and a single
-// background worker drains the event channel.
+// Async by design: a synchronous events.Publish ACK would ride the event
+// stream's backpressure into every upload response.
 //
 // Falls back to synchronous publish when the queue is nil (test fixtures
 // that build kvfsDriver via struct literal without going through New()).

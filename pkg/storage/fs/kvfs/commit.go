@@ -19,6 +19,7 @@ import (
 	"context"
 	"crypto/sha1"
 	"encoding/hex"
+	stderrors "errors"
 	"io"
 	"math"
 	"time"
@@ -55,6 +56,21 @@ type commitFileParams struct {
 
 // emptyChecksum is the SHA-1 of no bytes.
 const emptyChecksum = "sha1:da39a3ee5e6b4b0d3255bfef95601890afd80709"
+
+// reapTUSSibling deletes the TUS session minted alongside a simple upload:
+// once the simple commit has an outcome — success or refusal — the sibling
+// can never be used. Best-effort: DeleteUpload tolerates a missing key, and
+// on failure the TTL reaper still collects it.
+func (d *kvfsDriver) reapTUSSibling(sessionID string) {
+	if sessionID == "" {
+		return
+	}
+	if delErr := d.store.DeleteUpload(sessionID); delErr != nil {
+		d.log.Warn().Err(delErr).Str("session_id", sessionID).Msg("Upload: failed to reap sibling TUS session — leaving for the TTL reaper")
+		return
+	}
+	UploadInFlight.WithLabelValues("tus").Dec()
+}
 
 // commitEmpty commits an empty file at the upload target. It requires the snapshot: an empty
 // save is the one an editor sends by mistake, so the replaced content must stay restorable.
@@ -125,9 +141,6 @@ func (d *kvfsDriver) Upload(ctx context.Context, req storage.UploadRequest, uff 
 	parentID := parentNode.ID
 
 	u := ctxpkg.ContextMustGetUser(ctx)
-	if u == nil {
-		return nil, errtypes.InternalError("kvfs: no user in context")
-	}
 	// The data request's lock id (X-Lock-Id) wins over the one carried from initiation.
 	lockID, _ := ctxpkg.ContextGetLockID(ctx)
 	if lockID == "" {
@@ -218,20 +231,21 @@ func (d *kvfsDriver) Upload(ctx context.Context, req storage.UploadRequest, uff 
 		if delErr := d.blob.Delete(commitCtx, BlobKey(spaceID, blobID)); delErr != nil {
 			d.log.Warn().Err(delErr).Str("blob_id", blobID).Msg("Upload: rollback blob delete failed — leaving for GC")
 		}
+		// An If-Match loser's refusal is final — the sibling carries the
+		// same stale If-Match, so the keep-for-TUS-retry affordance cannot
+		// apply and every racing writer would strand one session for the
+		// TTL reaper. Transient failures keep the sibling.
+		var aborted errtypes.Aborted
+		if stderrors.As(err, &aborted) {
+			d.reapTUSSibling(params.TUSSibling)
+		}
 		return nil, err
 	}
 
 	// The simple commit succeeded, so the TUS session minted by the same
 	// InitiateUpload will never be used — reap it now instead of leaving
-	// it for the TTL reaper. Best-effort: DeleteUpload tolerates a
-	// missing key, and on failure the reaper still collects it.
-	if params.TUSSibling != "" {
-		if delErr := d.store.DeleteUpload(params.TUSSibling); delErr != nil {
-			d.log.Warn().Err(delErr).Str("session_id", params.TUSSibling).Msg("Upload: failed to reap sibling TUS session — leaving for the TTL reaper")
-		} else {
-			UploadInFlight.WithLabelValues("tus").Dec()
-		}
-	}
+	// it for the TTL reaper.
+	d.reapTUSSibling(params.TUSSibling)
 
 	d.publishEvent(commitCtx, func() interface{} {
 		return events.FileUploaded{

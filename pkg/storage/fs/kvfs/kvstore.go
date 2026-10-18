@@ -37,7 +37,7 @@ type MetadataStore interface {
 	ListNodesBySpace(spaceID string) ([]*NodeEntry, error)
 	GetNodes(spaceID string, nodeIDs []string) (map[string]*NodeEntry, error)
 	GetChildren(spaceID, parentID string) (ChildMap, uint64, error)
-	GetChildrenAuthoritative(spaceID, parentID string) (ChildMap, uint64, error)
+	ConfirmChildAuthoritative(spaceID, parentID, name string) (string, bool, error)
 	PutChildren(spaceID, parentID string, children ChildMap, expectedRev uint64) error
 	DeleteChildren(spaceID, parentID string) error
 	GetSpace(spaceID string) (*SpaceEntry, uint64, error)
@@ -87,6 +87,9 @@ type KVStore struct {
 	// PutChildren so every CAS path in the driver honours the same
 	// configured retry budget. Resolved from Options at construction.
 	maxCASRetries int
+	// authReadTimeout bounds the single authoritative leader read; the shared
+	// JetStream context's 30 s MaxWait governs every other KV call.
+	authReadTimeout time.Duration
 }
 
 // NewKVStore connects to NATS JetStream and initializes KV buckets.
@@ -123,9 +126,10 @@ func NewKVStore(opts *Options, log *zerolog.Logger) (*KVStore, error) {
 	}
 
 	store := &KVStore{
-		conn:          nc,
-		js:            js,
-		maxCASRetries: resolveMaxCASRetries(opts),
+		conn:            nc,
+		js:              js,
+		maxCASRetries:   resolveMaxCASRetries(opts),
+		authReadTimeout: resolveAuthoritativeReadTimeout(opts),
 	}
 
 	// Create or bind to KV buckets. The children bucket may be created with a
@@ -467,6 +471,7 @@ func (s *KVStore) GetNode(spaceID, nodeID string) (*NodeEntry, uint64, error) {
 		if aerr != nil {
 			return nil, 0, aerr
 		}
+		countAuthoritativeOutcome(s.nodes.Bucket(), ok)
 		if !ok {
 			return nil, 0, ErrNodeNotFound
 		}
@@ -912,6 +917,7 @@ func (s *KVStore) GetUpload(uploadID string) (*UploadSession, error) {
 		if aerr != nil {
 			return nil, aerr
 		}
+		countAuthoritativeOutcome(s.uploads.Bucket(), ok)
 		if !ok {
 			return nil, ErrNotFound
 		}

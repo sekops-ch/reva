@@ -95,7 +95,7 @@ func TestInitiateUpload_FailsClosed(t *testing.T) {
 			if c.fail != nil {
 				c.fail(fs)
 			}
-			d := testDriver(store, newMockBlobStore())
+			d := testDriver(t, store, newMockBlobStore())
 			d.store = fs
 
 			ref := &provider.Reference{ResourceId: &provider.ResourceId{StorageId: "st", SpaceId: "s1", OpaqueId: "root"}, Path: c.path}

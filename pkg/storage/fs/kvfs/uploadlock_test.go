@@ -65,7 +65,7 @@ func TestInitiateUpload_HonoursTheTargetsLock(t *testing.T) {
 			{"new file, a lock id", "./new.txt", "", "lock-123", nil},
 		} {
 			t.Run(fmt.Sprintf("%s/length=%d", c.name, length), func(t *testing.T) {
-				d, store, _, _ := emptySaveFixture()
+				d, store, _, _ := emptySaveFixture(t)
 				if c.lock != "" {
 					lockFile(store, c.lock)
 				}
@@ -101,7 +101,7 @@ func TestInitiateUpload_HonoursTheTargetsLock(t *testing.T) {
 // TouchFile stays free of lock checks: on an existing file it is AlreadyExists, and the empty
 // upload that follows checks the lock.
 func TestTouchFile_LockedFileIsAlreadyExists(t *testing.T) {
-	d, store, _, _ := emptySaveFixture()
+	d, store, _, _ := emptySaveFixture(t)
 	lockFile(store, "lock-123")
 	if err := d.TouchFile(testContext(), pathRef("./file.txt"), false, ""); !isAlreadyExists(err) {
 		t.Errorf("TouchFile on a locked file = %v, want AlreadyExists", err)
@@ -136,7 +136,7 @@ func TestSimpleUpload_HonoursTheLockAtCommit(t *testing.T) {
 		{"unlocked after initiation", "lock-123", "lock-123", "", "", isAborted},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			d, store, blob, _ := emptySaveFixture()
+			d, store, blob, _ := emptySaveFixture(t)
 			if c.initLock != "" {
 				lockFile(store, c.initLock)
 			}
@@ -171,7 +171,7 @@ func TestSimpleUpload_HonoursTheLockAtCommit(t *testing.T) {
 // A TUS commit refused by a lock discards its session: all bytes arrived, so a kept session would
 // look complete to the client's HEAD and the save would be lost silently.
 func TestFinishUpload_LockedDiscardsTheSession(t *testing.T) {
-	d, store, blob, _ := emptySaveFixture()
+	d, store, blob, _ := emptySaveFixture(t)
 	ctx := testContext()
 	res, err := d.InitiateUpload(ctx, pathRef("./file.txt"), 5, map[string]string{})
 	if err != nil {
@@ -209,7 +209,7 @@ func TestFinishUpload_LockedDiscardsTheSession(t *testing.T) {
 
 // Only Locked discards: other refusals keep the session for a retry.
 func TestFinishUpload_LockMismatchKeepsTheSession(t *testing.T) {
-	d, store, _, _ := emptySaveFixture()
+	d, store, _, _ := emptySaveFixture(t)
 	lockFile(store, "lock-123")
 	ctx := lockCtx("lock-123")
 	res, err := d.InitiateUpload(ctx, pathRef("./file.txt"), 5, map[string]string{})
@@ -234,7 +234,7 @@ func TestFinishUpload_LockMismatchKeepsTheSession(t *testing.T) {
 
 // The TUS commit uses the lock id carried from initiation.
 func TestFinishUpload_CarriedLockID(t *testing.T) {
-	d, store, _, _ := emptySaveFixture()
+	d, store, _, _ := emptySaveFixture(t)
 	lockFile(store, "lock-123")
 	res, err := d.InitiateUpload(lockCtx("lock-123"), pathRef("./file.txt"), 5, map[string]string{})
 	if err != nil {

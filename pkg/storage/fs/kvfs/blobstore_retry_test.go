@@ -25,14 +25,18 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha1"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/rs/zerolog"
 )
 
 // decodeAWSChunked strips the aws-chunked framing (hex size;chunk-signature
@@ -145,5 +149,104 @@ func TestUploadShortBodyFailsBeforeS3(t *testing.T) {
 	}
 	if st.attempts.Load() != 0 {
 		t.Fatalf("short body reached S3 (%d attempts), want the failure before any PUT", st.attempts.Load())
+	}
+}
+
+type lockedBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (lb *lockedBuffer) Write(p []byte) (int, error) {
+	lb.mu.Lock()
+	defer lb.mu.Unlock()
+	return lb.b.Write(p)
+}
+
+func (lb *lockedBuffer) String() string {
+	lb.mu.Lock()
+	defer lb.mu.Unlock()
+	return lb.b.String()
+}
+
+func newStubBlobstoreWithLog(t *testing.T) (*S3Blobstore, *retryStub, *lockedBuffer) {
+	t.Helper()
+	st := &retryStub{}
+	srv := httptest.NewServer(st.handler())
+	t.Cleanup(srv.Close)
+	buf := &lockedBuffer{}
+	log := zerolog.New(buf)
+	bs, err := NewS3Blobstore(srv.URL, "test", "bucket", "ak", "sk", "t", &log)
+	if err != nil {
+		t.Fatalf("NewS3Blobstore: %v", err)
+	}
+	return bs, st, buf
+}
+
+// TestUploadFirstAttemptFailureIsLogged proves the FIRST attempt's failure is
+// observable with its blob key. minio-go retries silently and returns only the
+// last error, so without transport-level logging a push whose uploads all
+// eventually succeed hides every transient S3/network fault.
+func TestUploadFirstAttemptFailureIsLogged(t *testing.T) {
+	payload := bytes.Repeat([]byte("kvfs-attempt-"), 90_000) // ~1.1 MiB
+	bs, st, buf := newStubBlobstoreWithLog(t)
+
+	hasher := sha1.New()
+	body := io.TeeReader(io.NopCloser(bytes.NewReader(payload)), hasher)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	if err := bs.Upload(ctx, "s1/blob-log", body, int64(len(payload))); err != nil {
+		t.Fatalf("Upload across a killed first attempt: %v", err)
+	}
+	if got := st.attempts.Load(); got < 2 {
+		t.Fatalf("expected a retried PUT, saw %d attempt(s)", got)
+	}
+	logged := buf.String()
+	if !strings.Contains(logged, "blob upload attempt failed") ||
+		!strings.Contains(logged, "s1/blob-log") {
+		t.Fatalf("first attempt's failure not logged with its blob key; log: %q", logged)
+	}
+}
+
+// TestAttemptLogTransport_SilentWithoutBlobKey: requests outside an Upload
+// (no ctx value) pass through unlogged.
+func TestAttemptLogTransport_SilentWithoutBlobKey(t *testing.T) {
+	buf := &lockedBuffer{}
+	log := zerolog.New(buf)
+	rt := &attemptLogTransport{
+		next: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			return nil, errors.New("boom")
+		}),
+		log: &log,
+	}
+	req, _ := http.NewRequest(http.MethodGet, "http://s3.test/x", nil)
+	if _, err := rt.RoundTrip(req); err == nil {
+		t.Fatal("fake transport should error")
+	}
+	if buf.String() != "" {
+		t.Fatalf("request without a blob key was logged: %q", buf.String())
+	}
+
+	req = req.WithContext(withBlobAttemptLog(req.Context(), "s1/k"))
+	_, _ = rt.RoundTrip(req)
+	if !strings.Contains(buf.String(), "s1/k") {
+		t.Fatalf("keyed request's failure not logged: %q", buf.String())
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+// TestUploadLongBodyFailsBeforeS3 guards the sized-buffer staging refactor:
+// a reader longer than the declared size must fail before any PUT.
+func TestUploadLongBodyFailsBeforeS3(t *testing.T) {
+	bs, st := newStubBlobstore(t)
+	err := bs.Upload(context.Background(), "s1/blob-3", bytes.NewReader(make([]byte, 20)), 10)
+	if err == nil {
+		t.Fatal("Upload with a long body succeeded, want a loud staging error")
+	}
+	if st.attempts.Load() != 0 {
+		t.Fatalf("long body reached S3 (%d attempts), want the failure before any PUT", st.attempts.Load())
 	}
 }

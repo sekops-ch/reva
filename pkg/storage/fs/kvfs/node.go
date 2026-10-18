@@ -150,14 +150,17 @@ type UploadSession struct {
 	Expires  int64             `msgpack:"exp"`  // expiry unix timestamp
 
 	// S3 multipart upload state
-	BlobID         string     `msgpack:"bid"`           // target blob ID in S3
-	S3MultipartID  string     `msgpack:"s3mid"`         // S3 multipart upload ID
-	Parts          []PartInfo `msgpack:"parts"`         // completed parts
-	SizeIsDeferred bool       `msgpack:"sdef"`          // true if total size is not yet known
-	IfMatchEtag    string     `msgpack:"ifm"`           // if-match etag for CAS semantics
-	OwnerID        string     `msgpack:"own"`           // uploading user ID
-	ClientMTime    string     `msgpack:"cmt,omitempty"` // the client's modification time; "" when absent
-	LockID         string     `msgpack:"lid,omitempty"` // the lock id the upload was initiated with
+	BlobID         string     `msgpack:"bid"`            // target blob ID in S3
+	S3MultipartID  string     `msgpack:"s3mid"`          // S3 multipart upload ID
+	Parts          []PartInfo `msgpack:"parts"`          // completed parts
+	SizeIsDeferred bool       `msgpack:"sdef"`           // true if total size is not yet known
+	IfMatchEtag    string     `msgpack:"ifm"`            // if-match etag for CAS semantics
+	OwnerID        string     `msgpack:"own"`            // uploading user ID
+	OwnerIDP       string     `msgpack:"oidp,omitempty"` // uploading user's identity provider
+	OwnerType      int32      `msgpack:"otyp,omitempty"` // uploading user's CS3 user type
+	InitiatorID    string     `msgpack:"iid,omitempty"`  // initiating request's initiator id (event metadata)
+	ClientMTime    string     `msgpack:"cmt,omitempty"`  // the client's modification time; "" when absent
+	LockID         string     `msgpack:"lid,omitempty"`  // the lock id the upload was initiated with
 }
 
 // --- Conversion helpers ---

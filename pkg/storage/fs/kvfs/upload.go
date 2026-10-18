@@ -26,6 +26,7 @@ import (
 	"github.com/pkg/errors"
 	tusd "github.com/tus/tusd/v2/pkg/handler"
 
+	userpb "github.com/cs3org/go-cs3apis/cs3/identity/user/v1beta1"
 	ctxpkg "github.com/opencloud-eu/reva/v2/pkg/ctx"
 	"github.com/opencloud-eu/reva/v2/pkg/errtypes"
 	"github.com/opencloud-eu/reva/v2/pkg/events"
@@ -50,9 +51,9 @@ type kvfsUpload struct {
 // The session's Offset is updated in memory but NOT persisted to NATS
 // per-chunk — the persisted UploadSession is allowed to be slightly
 // stale because GetUpload reconciles the offset from the cache's
-// authoritative size. PutUpload happens once at FinishUpload (then
-// immediately DeleteUpload). This is the same checkpointing model
-// decomposedfs uses ([decomposedfs/upload/upload.go:91]).
+// authoritative size; FinishUpload only deletes the session. This is the
+// same checkpointing model decomposedfs uses
+// ([decomposedfs/upload/upload.go:91]).
 func (u *kvfsUpload) WriteChunk(ctx context.Context, offset int64, src io.Reader) (int64, error) {
 	start := time.Now()
 	defer func() { TUSPhaseDuration.WithLabelValues("write_chunk").Observe(time.Since(start).Seconds()) }()
@@ -252,23 +253,38 @@ func (u *kvfsUpload) FinishUpload(ctx context.Context) error {
 		return err
 	}
 
-	// Capture the user from ctx now, while the request is still alive.
-	// publishEvent dispatches to the eventPublisher goroutine, where ctx
-	// has been canceled and ContextMustGetUser would panic. Using the
-	// non-panicking variant lets unauthenticated paths (which shouldn't
-	// reach FinishUpload at all) drop the event instead of crash the pod.
-	executant, _ := ctxpkg.ContextGetUser(ctx)
-	u.driver.publishEvent(commitCtx, func() interface{} {
-		if executant == nil {
+	// The desktop finishes a TUS upload with an unauthenticated continuation
+	// PATCH on the data path (the proxy serves /data unprotected), so the
+	// request context may carry no user or initiator: the event falls back to
+	// the identity stored at initiate. Captured here — publishEvent dispatches
+	// to the eventPublisher goroutine after the request context is dead.
+	var executantID *userpb.UserId
+	if executant, _ := ctxpkg.ContextGetUser(ctx); executant != nil {
+		executantID = executant.Id
+	} else if u.session.OwnerID != "" {
+		executantID = &userpb.UserId{
+			OpaqueId: u.session.OwnerID,
+			Idp:      u.session.OwnerIDP,
+			Type:     userpb.UserType(u.session.OwnerType),
+		}
+	}
+	publishCtx := commitCtx
+	if _, ok := ctxpkg.ContextGetInitiator(ctx); !ok && u.session.InitiatorID != "" {
+		publishCtx = ctxpkg.ContextSetInitiator(publishCtx, u.session.InitiatorID)
+	}
+	u.driver.publishEvent(publishCtx, func() interface{} {
+		if executantID == nil {
+			u.driver.log.Warn().Str("session_id", u.session.ID).
+				Msg("kvfs: fileuploaded event dropped: session carries no owner identity")
 			return nil
 		}
 		ref := spaceRef(u.session.SpaceID, u.session.ParentID)
 		ref.Path = u.session.Filename
 		return events.FileUploaded{
-			SpaceOwner: executant.Id,
-			Executant:  executant.Id,
+			SpaceOwner: executantID,
+			Executant:  executantID,
 			Ref:        ref,
-			Owner:      executant.Id,
+			Owner:      executantID,
 			Timestamp:  nowTimestamp(),
 		}
 	})
@@ -420,6 +436,7 @@ func (d *kvfsDriver) createTUSSession(ctx context.Context, p tusSessionParams) (
 	defer func() { TUSPhaseDuration.WithLabelValues("initiate").Observe(time.Since(start).Seconds()) }()
 
 	u := ctxpkg.ContextMustGetUser(ctx)
+	initiator, _ := ctxpkg.ContextGetInitiator(ctx)
 	sessionID := uuid.New().String()
 	blobID := uuid.New().String()
 
@@ -438,6 +455,9 @@ func (d *kvfsDriver) createTUSSession(ctx context.Context, p tusSessionParams) (
 		SizeIsDeferred: p.SizeIsDeferred,
 		IfMatchEtag:    p.IfMatch,
 		OwnerID:        u.Id.OpaqueId,
+		OwnerIDP:       u.Id.Idp,
+		OwnerType:      int32(u.Id.Type),
+		InitiatorID:    initiator,
 		ClientMTime:    p.ClientMTime,
 		LockID:         p.LockID,
 	}

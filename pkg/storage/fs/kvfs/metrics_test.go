@@ -79,6 +79,9 @@ func TestMetricsRegistration(t *testing.T) {
 		"kvfs_tree_size_drift_total",
 		"kvfs_gc_children_reconciled_total",
 		"kvfs_gc_trash_reconciled_total",
+		"kvfs_kv_authoritative_reads_total",
+		"kvfs_kv_authoritative_read_duration_seconds",
+		"kvfs_authoritative_read_timeout_seconds",
 	}
 
 	// promauto registers metrics at init time, but counter/gauge/histogram vecs
@@ -95,6 +98,9 @@ func TestMetricsRegistration(t *testing.T) {
 	TreeSizeDrift.Inc()
 	GCChildrenReconciled.Inc()
 	GCTrashReconciled.Inc()
+	KVAuthoritativeReads.WithLabelValues("t-children", "confirmed_absent")
+	KVAuthoritativeReadDuration.WithLabelValues("t-children")
+	AuthoritativeReadTimeoutGauge.WithLabelValues("oc")
 
 	metrics = gatherKVFSMetrics(t)
 
@@ -315,6 +321,9 @@ func TestMetricDescriptions(t *testing.T) {
 		{"kvfs_tree_size_drift_total", "Total number of ancestor CAS failures during tree-size propagation"},
 		{"kvfs_gc_children_reconciled_total", "Total number of stale oc-children entries removed by the GC reconciler"},
 		{"kvfs_gc_trash_reconciled_total", "Total number of stale oc-trash entries removed by the GC consistency sweep"},
+		{"kvfs_kv_authoritative_reads_total", "Authoritative leader reads confirming a direct-read miss, by bucket and outcome (lag_caught, confirmed_absent, error)."},
+		{"kvfs_kv_authoritative_read_duration_seconds", "Duration of authoritative leader reads in seconds, by bucket."},
+		{"kvfs_authoritative_read_timeout_seconds", "Effective authoritative leader-read timeout per kvfs instance (labeled by bucket prefix)"},
 	}
 
 	metrics := gatherKVFSMetrics(t)

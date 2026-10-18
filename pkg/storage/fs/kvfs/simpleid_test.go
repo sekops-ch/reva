@@ -46,7 +46,7 @@ var awkwardNames = []string{
 }
 
 func TestSimpleUploadID_RoundTrip(t *testing.T) {
-	d := testDriver(newMockMetadataStore(), newMockBlobStore())
+	d := testDriver(t, newMockMetadataStore(), newMockBlobStore())
 	for _, name := range awkwardNames {
 		for _, p := range []simpleUploadParams{
 			{},
@@ -73,7 +73,7 @@ func TestSimpleUploadID_RoundTrip(t *testing.T) {
 
 // Ids minted before every id carried a query still parse.
 func TestSimpleUploadID_EarlierFormatParses(t *testing.T) {
-	d := testDriver(newMockMetadataStore(), newMockBlobStore())
+	d := testDriver(t, newMockMetadataStore(), newMockBlobStore())
 	for id, want := range map[string]simpleUploadParams{
 		"/st$s1!root/a.txt":                                  {},
 		"/st$s1!root/a.txt?if-match=e1":                      {IfMatch: "e1"},
@@ -90,7 +90,7 @@ func TestSimpleUploadID_EarlierFormatParses(t *testing.T) {
 // A simple upload lands under the requested name, whatever characters it holds.
 func TestSimpleUpload_AwkwardNamesLandUnderTheirName(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceEmpty(store, "s1", "root")
 	ctx := testContext()
 	nameRef := func(name string) *provider.Reference {

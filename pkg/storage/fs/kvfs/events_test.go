@@ -19,7 +19,6 @@ import (
 	"bytes"
 	"context"
 	"io"
-	"os"
 	"reflect"
 	"sync"
 	"testing"
@@ -108,19 +107,16 @@ func (s *mockStream) eventTypes() []string {
 
 // --- Test helpers ---
 
-func testDriverWithStream(store *mockMetadataStore, blob *mockBlobStore, stream revaevents.Stream) *kvfsDriver {
+func testDriverWithStream(t testing.TB, store *mockMetadataStore, blob *mockBlobStore, stream revaevents.Stream) *kvfsDriver {
+	t.Helper()
 	log := zerolog.Nop()
-	tmpDir, err := os.MkdirTemp("", "kvfs-test-*")
-	if err != nil {
-		panic(err)
-	}
 	return &kvfsDriver{
 		store:       store,
 		blob:        blob,
 		opts:        &Options{},
 		log:         &log,
 		stream:      stream,
-		uploadCache: newDiskUploadCache(tmpDir),
+		uploadCache: newDiskUploadCache(t.TempDir()),
 	}
 }
 
@@ -136,7 +132,7 @@ func TestCreateDir_DriverStaysSilent(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
 	stream := newMockStream()
-	d := testDriverWithStream(store, blob, stream)
+	d := testDriverWithStream(t, store, blob, stream)
 
 	setupSpaceEmpty(store, "space-1", "root-1")
 
@@ -162,7 +158,7 @@ func TestCreateDir_DriverStaysSilent(t *testing.T) {
 func TestCreateDir_NoEventWithoutStream(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob) // no stream
+	d := testDriver(t, store, blob) // no stream
 
 	setupSpaceEmpty(store, "space-1", "root-1")
 
@@ -185,7 +181,7 @@ func TestUpload_PublishesFileUploaded(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
 	stream := newMockStream()
-	d := testDriverWithStream(store, blob, stream)
+	d := testDriverWithStream(t, store, blob, stream)
 
 	setupSpaceEmpty(store, "space-1", "root-1")
 
@@ -232,7 +228,7 @@ func TestUpload_Overwrite_PublishesFileUploaded(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
 	stream := newMockStream()
-	d := testDriverWithStream(store, blob, stream)
+	d := testDriverWithStream(t, store, blob, stream)
 
 	setupSpaceWithFile(store, "space-1", "root-1", "file-1", "existing.txt")
 
@@ -268,7 +264,7 @@ func TestDelete_DriverStaysSilent(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
 	stream := newMockStream()
-	d := testDriverWithStream(store, blob, stream)
+	d := testDriverWithStream(t, store, blob, stream)
 
 	setupSpaceWithFile(store, "space-1", "root-1", "file-1", "doomed.txt")
 
@@ -295,7 +291,7 @@ func TestMove_PublishesItemMoved(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
 	stream := newMockStream()
-	d := testDriverWithStream(store, blob, stream)
+	d := testDriverWithStream(t, store, blob, stream)
 
 	setupSpaceWithFile(store, "space-1", "root-1", "file-1", "original.txt")
 
@@ -343,7 +339,7 @@ func TestRestoreRevision_DriverStaysSilent(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
 	stream := newMockStream()
-	d := testDriverWithStream(store, blob, stream)
+	d := testDriverWithStream(t, store, blob, stream)
 
 	setupSpaceWithFile(store, "space-1", "root-1", "file-1", "versioned.txt")
 
@@ -384,7 +380,7 @@ func TestRestoreRecycleItem_DriverStaysSilent(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
 	stream := newMockStream()
-	d := testDriverWithStream(store, blob, stream)
+	d := testDriverWithStream(t, store, blob, stream)
 
 	// Setup space with root
 	setupSpaceEmpty(store, "space-1", "root-1")
@@ -428,7 +424,7 @@ func TestPurgeRecycleItem_DriverStaysSilent(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
 	stream := newMockStream()
-	d := testDriverWithStream(store, blob, stream)
+	d := testDriverWithStream(t, store, blob, stream)
 
 	setupSpaceEmpty(store, "space-1", "root-1")
 
@@ -468,7 +464,7 @@ func TestEmptyRecycle_DriverStaysSilent(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
 	stream := newMockStream()
-	d := testDriverWithStream(store, blob, stream)
+	d := testDriverWithStream(t, store, blob, stream)
 
 	setupSpaceEmpty(store, "space-1", "root-1")
 
@@ -506,7 +502,7 @@ func TestFinishUpload_PublishesFileUploaded(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
 	stream := newMockStream()
-	d := testDriverWithStream(store, blob, stream)
+	d := testDriverWithStream(t, store, blob, stream)
 
 	setupSpaceEmpty(store, "space-1", "root-1")
 	blob.nextUploadID = "mp-1"
@@ -567,7 +563,7 @@ func TestPublishEvent_StreamError_LogsButDoesNotFail(t *testing.T) {
 	blob := newMockBlobStore()
 	stream := newMockStream()
 	stream.err = errMockStreamFailure
-	d := testDriverWithStream(store, blob, stream)
+	d := testDriverWithStream(t, store, blob, stream)
 
 	setupSpaceEmpty(store, "space-1", "root-1")
 
@@ -626,7 +622,7 @@ func TestEvent_HasCorrectTopic(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
 	stream := newMockStream()
-	d := testDriverWithStream(store, blob, stream)
+	d := testDriverWithStream(t, store, blob, stream)
 
 	setupSpaceEmpty(store, "space-1", "root-1")
 
@@ -662,7 +658,7 @@ func TestMultipleOperations_EventSequence(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
 	stream := newMockStream()
-	d := testDriverWithStream(store, blob, stream)
+	d := testDriverWithStream(t, store, blob, stream)
 
 	setupSpaceEmpty(store, "space-1", "root-1")
 
@@ -709,11 +705,11 @@ func TestMultipleOperations_EventSequence(t *testing.T) {
 
 // --- Delete directory events ---
 
-func TestDeleteDir_PublishesItemTrashed(t *testing.T) {
+func TestDeleteDir_DriverStaysSilent(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
 	stream := newMockStream()
-	d := testDriverWithStream(store, blob, stream)
+	d := testDriverWithStream(t, store, blob, stream)
 
 	// Setup space with a directory child
 	setupSpaceEmpty(store, "space-1", "root-1")
@@ -752,7 +748,7 @@ func TestEmptyRecycle_NoItems_DriverStaysSilent(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
 	stream := newMockStream()
-	d := testDriverWithStream(store, blob, stream)
+	d := testDriverWithStream(t, store, blob, stream)
 
 	setupSpaceEmpty(store, "space-empty", "root-empty")
 
@@ -774,11 +770,11 @@ func TestEmptyRecycle_NoItems_DriverStaysSilent(t *testing.T) {
 
 // --- PurgeRecycleItem deletes blob ---
 
-func TestPurgeRecycleItem_DeletesBlob_AndPublishes(t *testing.T) {
+func TestPurgeRecycleItem_DeletesBlob_DriverStaysSilent(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
 	stream := newMockStream()
-	d := testDriverWithStream(store, blob, stream)
+	d := testDriverWithStream(t, store, blob, stream)
 
 	setupSpaceEmpty(store, "space-1", "root-1")
 
@@ -818,11 +814,11 @@ func TestPurgeRecycleItem_DeletesBlob_AndPublishes(t *testing.T) {
 
 // --- Restore to custom path ---
 
-func TestRestoreRecycleItem_CustomPath_PublishesItemRestored(t *testing.T) {
+func TestRestoreRecycleItem_CustomPath_DriverStaysSilent(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
 	stream := newMockStream()
-	d := testDriverWithStream(store, blob, stream)
+	d := testDriverWithStream(t, store, blob, stream)
 
 	setupSpaceEmpty(store, "space-1", "root-1")
 
@@ -863,7 +859,7 @@ func TestDelete_NoUserInContext_Denied(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
 	stream := newMockStream()
-	d := testDriverWithStream(store, blob, stream)
+	d := testDriverWithStream(t, store, blob, stream)
 
 	setupSpaceWithFile(store, "space-1", "root-1", "file-1", "no-user.txt")
 
@@ -882,13 +878,158 @@ func TestDelete_NoUserInContext_Denied(t *testing.T) {
 	}
 }
 
-// --- TouchFile must update parent ETag and publish event ---
+func TestFinishUpload_ClientContinuationWithoutUser_PublishesStoredOwner(t *testing.T) {
+	store := newMockMetadataStore()
+	blob := newMockBlobStore()
+	stream := newMockStream()
+	d := testDriverWithStream(t, store, blob, stream)
+
+	setupSpaceEmpty(store, "space-1", "root-1")
+
+	chunk1 := []byte("first chunk of a client-finished upload ")
+	chunk2 := []byte("second chunk arriving on the unauthenticated data path")
+	full := append(append([]byte{}, chunk1...), chunk2...)
+
+	store.uploads["sess-cc-1"] = &UploadSession{
+		ID:       "sess-cc-1",
+		SpaceID:  "space-1",
+		Filename: "continuation.bin",
+		ParentID: "root-1",
+		Size:     int64(len(full)),
+		Storage:  map[string]string{},
+		BlobID:   "cc-blob",
+		OwnerID:  "test-user-id",
+	}
+
+	// Request 1: the authenticated creation-with-upload POST carries the user.
+	u1, err := d.GetUpload(testContext(), "sess-cc-1")
+	if err != nil {
+		t.Fatalf("GetUpload (req 1): %v", err)
+	}
+	if _, err := u1.(*kvfsUpload).WriteChunk(testContext(), 0, bytes.NewReader(chunk1)); err != nil {
+		t.Fatalf("WriteChunk (req 1): %v", err)
+	}
+
+	// Request 2: the client's own continuation PATCH rides the unprotected
+	// data path — no user in ctx — and finishes the upload.
+	noUser := context.Background()
+	u2, err := d.GetUpload(noUser, "sess-cc-1")
+	if err != nil {
+		t.Fatalf("GetUpload (req 2): %v", err)
+	}
+	ku2 := u2.(*kvfsUpload)
+	if _, err := ku2.WriteChunk(noUser, int64(len(chunk1)), bytes.NewReader(chunk2)); err != nil {
+		t.Fatalf("WriteChunk (req 2): %v", err)
+	}
+	UploadInFlight.WithLabelValues("tus").Add(1)
+	if err := ku2.FinishUpload(noUser); err != nil {
+		t.Fatalf("FinishUpload: %v", err)
+	}
+
+	if n := stream.eventCount(); n != 1 {
+		t.Fatalf("FileUploaded events = %d, want 1 (stored-owner fallback)", n)
+	}
+	fu, ok := stream.lastEvent().payload.(revaevents.FileUploaded)
+	if !ok {
+		t.Fatalf("last event is %T, want FileUploaded", stream.lastEvent().payload)
+	}
+	if fu.Executant.GetOpaqueId() != "test-user-id" {
+		t.Errorf("Executant = %q, want the session's stored owner", fu.Executant.GetOpaqueId())
+	}
+	if fu.Owner.GetOpaqueId() != "test-user-id" || fu.SpaceOwner.GetOpaqueId() != "test-user-id" {
+		t.Errorf("Owner/SpaceOwner = %q/%q, want the stored owner",
+			fu.Owner.GetOpaqueId(), fu.SpaceOwner.GetOpaqueId())
+	}
+	if fu.Ref.GetPath() != "continuation.bin" {
+		t.Errorf("Ref.Path = %q, want the uploaded filename", fu.Ref.GetPath())
+	}
+}
+
+func TestFinishUpload_ClientContinuationWithoutUser_KeepsIdpAndInitiator(t *testing.T) {
+	store := newMockMetadataStore()
+	blob := newMockBlobStore()
+	stream := newMockStream()
+	d := testDriverWithStream(t, store, blob, stream)
+
+	setupSpaceEmpty(store, "space-1", "root-1")
+	body := []byte("one-chunk body finished without a user")
+	store.uploads["sess-cc-2"] = &UploadSession{
+		ID:          "sess-cc-2",
+		SpaceID:     "space-1",
+		Filename:    "idp.bin",
+		ParentID:    "root-1",
+		Size:        int64(len(body)),
+		Storage:     map[string]string{},
+		BlobID:      "cc-blob-2",
+		OwnerID:     "test-user-id",
+		OwnerIDP:    "https://idp.test",
+		OwnerType:   1,
+		InitiatorID: "init-9",
+	}
+
+	noUser := context.Background()
+	u, err := d.GetUpload(noUser, "sess-cc-2")
+	if err != nil {
+		t.Fatalf("GetUpload: %v", err)
+	}
+	ku := u.(*kvfsUpload)
+	if _, err := ku.WriteChunk(noUser, 0, bytes.NewReader(body)); err != nil {
+		t.Fatalf("WriteChunk: %v", err)
+	}
+	UploadInFlight.WithLabelValues("tus").Add(1)
+	if err := ku.FinishUpload(noUser); err != nil {
+		t.Fatalf("FinishUpload: %v", err)
+	}
+
+	if n := stream.eventCount(); n != 1 {
+		t.Fatalf("FileUploaded events = %d, want 1", n)
+	}
+	fu := stream.lastEvent().payload.(revaevents.FileUploaded)
+	if fu.Executant.GetIdp() != "https://idp.test" || fu.Executant.GetType() != 1 {
+		t.Errorf("Executant idp/type = %q/%d, want the stored identity",
+			fu.Executant.GetIdp(), fu.Executant.GetType())
+	}
+	if got := stream.lastEvent().metadata[revaevents.MetadatakeyInitiatorID]; got != "init-9" {
+		t.Errorf("initiator metadata = %q, want the stored initiator id", got)
+	}
+}
+
+func TestDownload_DriverStaysSilent(t *testing.T) {
+	store := newMockMetadataStore()
+	blob := newMockBlobStore()
+	stream := newMockStream()
+	d := testDriverWithStream(t, store, blob, stream)
+
+	setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
+	blob.blobs[BlobKey("s1", "old-blob")] = []byte("content")
+
+	ctx := eventTestContext()
+	ref := &provider.Reference{
+		ResourceId: &provider.ResourceId{SpaceId: "s1", OpaqueId: "f1"},
+	}
+	_, rc, err := d.Download(ctx, ref, nil)
+	if err != nil {
+		t.Fatalf("Download failed: %v", err)
+	}
+	if rc != nil {
+		_, _ = io.ReadAll(rc)
+		rc.Close()
+	}
+
+	// The eventsmiddleware publishes FileDownloaded on InitiateFileDownload;
+	// a driver-side copy would double every download event.
+	if n := stream.eventCount(); n != 0 {
+		t.Fatalf("Download published %d driver events, want 0", n)
+	}
+}
+
+// --- TouchFile must update parent ETag and stay silent (middleware publishes FileTouched) ---
 
 func TestTouchFile_ExistingFile_ChangesNothing(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
 	stream := newMockStream()
-	d := testDriverWithStream(store, blob, stream)
+	d := testDriverWithStream(t, store, blob, stream)
 
 	setupSpaceWithFile(store, "space-1", "root-1", "file-1", "test.txt")
 	origETag := store.nodes["space-1.root-1"].ETag
@@ -913,7 +1054,7 @@ func TestTouchFile_NewFile_UpdatesParentETag(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
 	stream := newMockStream()
-	d := testDriverWithStream(store, blob, stream)
+	d := testDriverWithStream(t, store, blob, stream)
 
 	setupSpaceEmpty(store, "space-1", "root-1")
 	parentBefore := store.nodes["space-1.root-1"]
@@ -957,19 +1098,16 @@ func TestTouchFile_NewFile_UpdatesParentETag(t *testing.T) {
 
 // testDriverWithAsyncStream mirrors the event-worker wiring New() performs so
 // the async dispatch path is under test, not just the sync fallback.
-func testDriverWithAsyncStream(store *mockMetadataStore, blob *mockBlobStore, stream revaevents.Stream, bufSize int) *kvfsDriver {
+func testDriverWithAsyncStream(t testing.TB, store *mockMetadataStore, blob *mockBlobStore, stream revaevents.Stream, bufSize int) *kvfsDriver {
+	t.Helper()
 	log := zerolog.Nop()
-	tmpDir, err := os.MkdirTemp("", "kvfs-test-*")
-	if err != nil {
-		panic(err)
-	}
 	d := &kvfsDriver{
 		store:       store,
 		blob:        blob,
 		opts:        &Options{},
 		log:         &log,
 		stream:      stream,
-		uploadCache: newDiskUploadCache(tmpDir),
+		uploadCache: newDiskUploadCache(t.TempDir()),
 		eventQueue:  make(chan eventJob, bufSize),
 		eventStop:   make(chan struct{}),
 	}
@@ -993,7 +1131,7 @@ func waitForEvents(t *testing.T, stream *mockStream, want int) {
 
 func TestPublishEventAsync_DrainsToStream(t *testing.T) {
 	stream := newMockStream()
-	d := testDriverWithAsyncStream(newMockMetadataStore(), newMockBlobStore(), stream, eventQueueSize)
+	d := testDriverWithAsyncStream(t, newMockMetadataStore(), newMockBlobStore(), stream, eventQueueSize)
 	defer d.Shutdown(context.Background())
 
 	d.publishEvent(eventTestContext(), func() interface{} {
@@ -1010,7 +1148,7 @@ func TestPublishEventAsync_DrainsToStream(t *testing.T) {
 // self-notification suppression.
 func TestPublishEventAsync_PreservesInitiator(t *testing.T) {
 	stream := newMockStream()
-	d := testDriverWithAsyncStream(newMockMetadataStore(), newMockBlobStore(), stream, eventQueueSize)
+	d := testDriverWithAsyncStream(t, newMockMetadataStore(), newMockBlobStore(), stream, eventQueueSize)
 	defer d.Shutdown(context.Background())
 
 	ctx := ctxpkg.ContextSetInitiator(eventTestContext(), "init-123")
@@ -1060,7 +1198,7 @@ func TestPublishEventAsync_QueueFull_Drops(t *testing.T) {
 // the worker goroutine stops draining afterwards.
 func TestEventPublisher_ShutdownStopsWorker(t *testing.T) {
 	stream := newMockStream()
-	d := testDriverWithAsyncStream(newMockMetadataStore(), newMockBlobStore(), stream, eventQueueSize)
+	d := testDriverWithAsyncStream(t, newMockMetadataStore(), newMockBlobStore(), stream, eventQueueSize)
 
 	// Prove the worker is alive.
 	d.publishEvent(eventTestContext(), func() interface{} { return revaevents.FileUploaded{} })

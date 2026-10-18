@@ -96,7 +96,7 @@ func TestResourceInfo_ListsTheLockForDiscovery(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			store := newMockMetadataStore()
-			d := testDriver(store, newMockBlobStore())
+			d := testDriver(t, store, newMockBlobStore())
 			setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
 			ctx := testContext()
 			if err := d.SetLock(ctx, f1Ref(), lock); err != nil {
@@ -142,7 +142,7 @@ func TestResourceInfo_NothingToDiscoverWithoutALiveLock(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			store := newMockMetadataStore()
-			d := testDriver(store, newMockBlobStore())
+			d := testDriver(t, store, newMockBlobStore())
 			setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
 			if err := prepare(d, store); err != nil {
 				t.Fatalf("prepare: %v", err)
@@ -160,7 +160,7 @@ func TestResourceInfo_NothingToDiscoverWithoutALiveLock(t *testing.T) {
 
 func TestRefreshLock_UpdatesWhatDiscoveryShows(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
 	ctx := testContext()
 	lock := webdavLock(time.Now().Add(time.Hour), "2026-10-04T08:00:00Z")
@@ -220,7 +220,7 @@ func TestMsgpack_LockFieldsCompatible(t *testing.T) {
 // listing nor add elements to it. The CS3 lock itself keeps the raw value.
 func TestResourceInfo_LockOwnerNameIsSafeInXML(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
 	ctx := testContext()
 	name := `Tom & Jerry </oc:ownername><oc:permissions>RDNVW</oc:permissions><oc:ownername>`

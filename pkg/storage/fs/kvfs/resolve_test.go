@@ -80,7 +80,7 @@ var rootTree = ChildMap{"x.txt": "rx", "sub": "rsub", "F": "F"}
 
 func TestFolderRelativeUpload_LandsInTheFolder(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	folderTree(store)
 	ctx := testContext()
 
@@ -117,7 +117,7 @@ func TestFolderRelativeUpload_LandsInTheFolder(t *testing.T) {
 
 func TestFolderRelativeCreates_LandInTheFolder(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	folderTree(store)
 	ctx := testContext()
 
@@ -146,7 +146,7 @@ func TestFolderRelativeCreates_LandInTheFolder(t *testing.T) {
 // folder by id with a relative path.
 func TestFolderRelativeUpload_RecipientWithFolderGrant(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	folderTree(store)
 	store.nodes["s1.F"].Grants = map[string]*GrantEntry{
 		"u:bob": {GranteeType: "user", GranteeID: "bob", Permissions: permissionsToUint32(&provider.ResourcePermissions{
@@ -170,7 +170,7 @@ func TestFolderRelativeUpload_RecipientWithFolderGrant(t *testing.T) {
 
 func TestStaleIDWithDot_CreatesNothing(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	folderTree(store)
 
 	err := d.TouchFile(testContext(), idRef("gone", "."), false, "")
@@ -182,7 +182,7 @@ func TestStaleIDWithDot_CreatesNothing(t *testing.T) {
 
 func TestPathThroughAFile_Refused(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	folderTree(store)
 
 	err := d.CreateDir(testContext(), idRef("root", "./x.txt/sub"))
@@ -196,7 +196,7 @@ func TestPathThroughAFile_Refused(t *testing.T) {
 
 func TestResolveParent(t *testing.T) {
 	store := newMockMetadataStore()
-	d := testDriver(store, newMockBlobStore())
+	d := testDriver(t, store, newMockBlobStore())
 	folderTree(store)
 	ctx := testContext()
 	rootless := &provider.Reference{ResourceId: &provider.ResourceId{SpaceId: "s1"}, Path: "./a.txt"}
@@ -285,7 +285,7 @@ func TestPathThroughAHiddenFile_LooksMissing(t *testing.T) {
 	for name, op := range ops {
 		t.Run(name, func(t *testing.T) {
 			store := newMockMetadataStore()
-			d := testDriver(store, newMockBlobStore())
+			d := testDriver(t, store, newMockBlobStore())
 			setupSpaceWithDir(store, "s1", "root", "docs", "Documents", map[string]string{"salaries.xlsx": "sal"})
 			eve := testContextWithUser("eve", nil)
 

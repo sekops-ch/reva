@@ -275,7 +275,7 @@ func TestGCRun_IdentityReapingEndToEnd(t *testing.T) {
 	opts := gcOpts(false)
 	opts.GCMinAge = "0s"
 	log := zerolog.Nop()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 	d.opts = opts
 	d.gc = newBlobGC(store, blob, opts, &log)
 	// Reuse the real deletion path, exactly like New() wires it.
@@ -381,7 +381,7 @@ func countSpaceKeys(store *mockMetadataStore, blob *mockBlobStore, spaceID strin
 func TestDeleteStorageSpace_LeavesNoResidue(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
-	d := testDriver(store, blob)
+	d := testDriver(t, store, blob)
 
 	setupSpaceWithFile(store, "s1", "root", "f1", "file.txt")
 	blob.blobs[BlobKey("s1", "old-blob")] = []byte("file data")
