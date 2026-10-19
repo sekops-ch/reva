@@ -276,9 +276,22 @@ The `blobGC` loop runs on `Options.GCInterval` (default 24 h). Each sweep:
      blobs uploaded between the metadata snapshot and the S3 list. Age is the
      blob's upload time, so a blob a trim left unreferenced goes at the first
      sweep after it is older than `GCMinAge`.
-4. **Clean expired upload sessions**: `cleanExpiredUploads` aborts the S3
-   multipart and deletes the `uploads` entry for any session past its expiry.
-5. **Release lock**.
+4. **Reconcile children and trash** (`reconcileChildren`, `reconcileTrash`):
+   crash residue repair. Listings only nominate candidates; every removal is
+   confirmed at the stream leader (node existence and parent for children
+   entries; liveness, reachability and a `GCMinAge` age guard for trash
+   entries), so a create, move, delete or restore racing the sweep is read as
+   replica lag, never as residue.
+5. **Residue sweep** (`reconcileResidue`): spaces absent from the space
+   listing are ghost candidates; each is confirmed absent at the leader and
+   skipped while any of its KV entries is younger than the cutoff (space
+   creation writes the space entry last), then its KV keys, staged upload
+   bodies and S3 prefix are reaped.
+6. **Clean expired upload sessions**: `cleanExpiredUploads` aborts the S3
+   multipart and deletes the `uploads` entry for any session past its expiry
+   (staged bodies expire with the stream's MaxAge, which equals the session
+   TTL).
+7. **Release lock**.
 
 `GCRunOnStart` triggers an immediate sweep at process boot. All counters
 (`kvfs_gc_blobs_*_total`, `kvfs_gc_run_duration_seconds`) are exported.
@@ -328,7 +341,7 @@ the oldest other one; at `max_versions = 1` the replaced content is not kept.
 | `kvfs_upload_in_flight` | gauge | `protocol` | Active uploads (`simple` / `tus`) |
 | `kvfs_tree_size_drift_total` | counter | — | Ancestor CAS failures |
 | `kvfs_kv_authoritative_reads_total` | counter | `bucket`, `outcome` | Leader reads confirming a direct-read miss: `lag_caught` / `confirmed_absent` / `error` |
-| `kvfs_kv_authoritative_read_duration_seconds` | histogram | `bucket` | Leader-read latency (buckets to 10 s) |
+| `kvfs_kv_authoritative_read_duration_seconds` | histogram | `bucket` | Leader-read latency (buckets to 15 s) |
 | `kvfs_authoritative_read_timeout_seconds` | gauge | `prefix` | Effective leader-read bound (dead-config seam) |
 | `kvfs_max_cas_retries` / `kvfs_max_delete_depth` | gauge | `prefix` | Effective config bounds (dead-config seams) |
 | `kvfs_gc_blobs_scanned_total` | counter | — | Blobs scanned by GC |
@@ -343,7 +356,8 @@ A direct KV read a replica answers can trail a just-acknowledged write
 (buckets run `allow_direct` at R=3). `GetUpload`, `GetNode` and the resolve
 name-miss therefore confirm every miss with ONE `$JS.API.STREAM.MSG.GET`
 (answered by the stream leader, never `DIRECT.GET`), bounded by
-`authoritative_read_timeout` (default 5 s). Outcomes are semantic:
+`authoritative_read_timeout` (default 5 s; deployments size it past the
+server's randomized 4-9 s raft election window). Outcomes are semantic:
 `lag_caught` means the leader had what the replica's view (or a stale
 children map) missed; `confirmed_absent` is a true miss — every create
 resolves at least one, so absent is the common outcome; `error` surfaces
@@ -360,6 +374,18 @@ reads per created item ≈
 over the create rate (every new name confirms once; ocdav's MKCOL and TUS
 pre-Stats add one each); payload size per read is the directory's
 `kvfs_children_value_bytes`.
+
+#### No destructive verdict from a listing alone
+
+KV listings are watcher streams a replica may serve stale or cut short, so a
+listing only nominates candidates. Every destructive write re-checks its
+premise at the stream leader (node existence and parent for children entries;
+space existence for the residue reap; liveness plus reachability and an age
+guard for trash entries), and a listing that cannot prove completeness fails
+(`listAll`/`listByPrefix`: watcher error, missing end marker, or corrupt
+entry) instead of returning a prefix. The staged-body Reader follows the same
+rule: it reads to the size the leader reported, never to a replica's pending
+count.
 
 ### 9.2 Events
 

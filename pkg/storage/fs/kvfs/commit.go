@@ -75,7 +75,10 @@ func (d *kvfsDriver) reapTUSSibling(sessionID string) {
 // commitEmpty commits an empty file at the upload target. It requires the snapshot: an empty
 // save is the one an editor sends by mistake, so the replaced content must stay restorable.
 func (d *kvfsDriver) commitEmpty(ctx context.Context, t *uploadTarget, params simpleUploadParams) error {
-	u := ctxpkg.ContextMustGetUser(ctx)
+	u, err := requireUser(ctx)
+	if err != nil {
+		return err
+	}
 	commitCtx, cancel := d.commitPhase(ctx)
 	defer cancel()
 	nodeID, err := d.commitFileNode(commitCtx, commitFileParams{
@@ -140,7 +143,10 @@ func (d *kvfsDriver) Upload(ctx context.Context, req storage.UploadRequest, uff 
 	}
 	parentID := parentNode.ID
 
-	u := ctxpkg.ContextMustGetUser(ctx)
+	u, err := requireUser(ctx)
+	if err != nil {
+		return nil, err
+	}
 	// The data request's lock id (X-Lock-Id) wins over the one carried from initiation.
 	lockID, _ := ctxpkg.ContextGetLockID(ctx)
 	if lockID == "" {
@@ -231,12 +237,13 @@ func (d *kvfsDriver) Upload(ctx context.Context, req storage.UploadRequest, uff 
 		if delErr := d.blob.Delete(commitCtx, BlobKey(spaceID, blobID)); delErr != nil {
 			d.log.Warn().Err(delErr).Str("blob_id", blobID).Msg("Upload: rollback blob delete failed — leaving for GC")
 		}
-		// An If-Match loser's refusal is final — the sibling carries the
-		// same stale If-Match, so the keep-for-TUS-retry affordance cannot
-		// apply and every racing writer would strand one session for the
-		// TTL reaper. Transient failures keep the sibling.
+		// Final refusals reap the sibling; transient failures keep it for
+		// the client's retry. Aborted covers If-Match losers and lock-id
+		// refusals; PreconditionFailed covers a folder target. A Locked
+		// refusal keeps the sibling for the client's unlocked retry.
 		var aborted errtypes.Aborted
-		if stderrors.As(err, &aborted) {
+		var precond errtypes.PreconditionFailed
+		if stderrors.As(err, &aborted) || stderrors.As(err, &precond) {
 			d.reapTUSSibling(params.TUSSibling)
 		}
 		return nil, err

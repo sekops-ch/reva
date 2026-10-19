@@ -1223,3 +1223,69 @@ func TestEventPublisher_ShutdownStopsWorker(t *testing.T) {
 		t.Errorf("worker still draining after Shutdown: stream count=%d, want 1", stream.eventCount())
 	}
 }
+
+// An authenticated finish carries an EMPTY initiator (the HTTP auth
+// interceptor always stores the header value): the event must still fall
+// back to the initiator stored at initiate.
+func TestFinishUpload_AuthenticatedEmptyInitiator_FallsBackToStored(t *testing.T) {
+	store := newMockMetadataStore()
+	blob := newMockBlobStore()
+	stream := newMockStream()
+	d := testDriverWithStream(t, store, blob, stream)
+
+	setupSpaceEmpty(store, "space-1", "root-1")
+	body := []byte("finished with a user but an empty initiator header")
+	store.uploads["sess-ei"] = &UploadSession{
+		ID:          "sess-ei",
+		SpaceID:     "space-1",
+		Filename:    "ei.bin",
+		ParentID:    "root-1",
+		Size:        int64(len(body)),
+		Storage:     map[string]string{},
+		BlobID:      "ei-blob",
+		OwnerID:     "test-user-id",
+		OwnerIDP:    "https://idp.test",
+		OwnerType:   1,
+		InitiatorID: "init-10",
+	}
+
+	ctx := ctxpkg.ContextSetInitiator(eventTestContext(), "")
+	u, err := d.GetUpload(ctx, "sess-ei")
+	if err != nil {
+		t.Fatalf("GetUpload: %v", err)
+	}
+	ku := u.(*kvfsUpload)
+	if _, err := ku.WriteChunk(ctx, 0, bytes.NewReader(body)); err != nil {
+		t.Fatalf("WriteChunk: %v", err)
+	}
+	UploadInFlight.WithLabelValues("tus").Add(1)
+	if err := ku.FinishUpload(ctx); err != nil {
+		t.Fatalf("FinishUpload: %v", err)
+	}
+
+	if got := stream.lastEvent().metadata[revaevents.MetadatakeyInitiatorID]; got != "init-10" {
+		t.Errorf("initiator metadata = %q, want the stored initiator id", got)
+	}
+}
+
+// InitiateUpload must capture the request's initiator into the session: the
+// stored value is the only identity a client-finished upload can publish.
+func TestInitiateUpload_CapturesInitiator(t *testing.T) {
+	store := newMockMetadataStore()
+	d := testDriver(t, store, newMockBlobStore())
+	setupSpaceEmpty(store, "space-1", "root-1")
+
+	ctx := ctxpkg.ContextSetInitiator(testContext(), "init-cap")
+	ref := &provider.Reference{ResourceId: &provider.ResourceId{StorageId: "st", SpaceId: "space-1", OpaqueId: "root-1"}, Path: "/cap.bin"}
+	if _, err := d.InitiateUpload(ctx, ref, 4, map[string]string{}); err != nil {
+		t.Fatalf("InitiateUpload: %v", err)
+	}
+	if len(store.uploads) == 0 {
+		t.Fatal("no upload session created")
+	}
+	for id, s := range store.uploads {
+		if s.InitiatorID != "init-cap" {
+			t.Errorf("session %s InitiatorID = %q, want the request initiator", id, s.InitiatorID)
+		}
+	}
+}

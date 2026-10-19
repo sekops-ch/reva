@@ -38,6 +38,8 @@ type MetadataStore interface {
 	GetNodes(spaceID string, nodeIDs []string) (map[string]*NodeEntry, error)
 	GetChildren(spaceID, parentID string) (ChildMap, uint64, error)
 	ConfirmChildAuthoritative(spaceID, parentID, name string) (string, bool, error)
+	GetNodeAuthoritative(spaceID, nodeID string) (*NodeEntry, bool, error)
+	GetSpaceAuthoritative(spaceID string) (*SpaceEntry, bool, error)
 	PutChildren(spaceID, parentID string, children ChildMap, expectedRev uint64) error
 	DeleteChildren(spaceID, parentID string) error
 	GetSpace(spaceID string) (*SpaceEntry, uint64, error)
@@ -400,51 +402,6 @@ func ensureReplicas(js streamUpdater, kv kvStatusProvider, desired int) error {
 }
 
 // --- Generic KV helpers ---
-
-func listAll[T any](kv nats.KeyValue, bucket string) ([]*T, error) {
-	watcher, err := kv.WatchAll(nats.IgnoreDeletes())
-	if err != nil {
-		if err == nats.ErrNoKeysFound {
-			return nil, nil
-		}
-		return nil, errors.Wrapf(err, "kvfs: failed to watch all %s", bucket)
-	}
-	defer watcher.Stop()
-
-	var result []*T
-	for entry := range watcher.Updates() {
-		if entry == nil {
-			break
-		}
-		var v T
-		if err := msgpack.Unmarshal(entry.Value(), &v); err != nil {
-			continue
-		}
-		result = append(result, &v)
-	}
-	return result, nil
-}
-
-func listByPrefix[T any](kv nats.KeyValue, bucket, prefix string) ([]*T, error) {
-	watcher, err := kv.Watch(prefix+">", nats.IgnoreDeletes())
-	if err != nil {
-		return nil, errors.Wrapf(err, "kvfs: failed to watch %s with prefix %s", bucket, prefix)
-	}
-	defer watcher.Stop()
-
-	var result []*T
-	for entry := range watcher.Updates() {
-		if entry == nil {
-			break
-		}
-		var v T
-		if err := msgpack.Unmarshal(entry.Value(), &v); err != nil {
-			continue
-		}
-		result = append(result, &v)
-	}
-	return result, nil
-}
 
 // --- Node operations ---
 
@@ -1002,16 +959,26 @@ func (s *KVStore) ListAllUploadEntries() ([]*UploadEntry, error) {
 	defer watcher.Stop()
 
 	var result []*UploadEntry
+	sawMarker := false
 	for entry := range watcher.Updates() {
 		if entry == nil {
+			sawMarker = true
 			break
 		}
+		// Unmarshal tolerance is this listing's contract: a corrupt session
+		// surfaces as Session == nil for the age-gated reap.
 		e := &UploadEntry{Key: entry.Key(), Created: entry.Created()}
 		var u UploadSession
 		if err := msgpack.Unmarshal(entry.Value(), &u); err == nil {
 			e.Session = &u
 		}
 		result = append(result, e)
+	}
+	if err := watcherError(watcher); err != nil {
+		return nil, errors.Wrap(err, "kvfs: uploads listing ended on a watcher error")
+	}
+	if !sawMarker {
+		return nil, errors.New("kvfs: uploads listing ended before the initial-values marker")
 	}
 	return result, nil
 }

@@ -207,7 +207,7 @@ func (u *kvfsUpload) FinishUpload(ctx context.Context) error {
 
 		hasher := sha1.New()
 		blobStart := time.Now()
-		err = u.driver.blob.Upload(commitCtx, blobKey, io.TeeReader(reader, hasher), u.session.Offset)
+		err = u.driver.blob.Upload(WithBlobSession(commitCtx, u.session.ID), blobKey, io.TeeReader(reader, hasher), u.session.Offset)
 		blobDur := time.Since(blobStart)
 		TUSPhaseDuration.WithLabelValues("blob_upload").Observe(blobDur.Seconds())
 		if err != nil {
@@ -253,11 +253,11 @@ func (u *kvfsUpload) FinishUpload(ctx context.Context) error {
 		return err
 	}
 
-	// The desktop finishes a TUS upload with an unauthenticated continuation
-	// PATCH on the data path (the proxy serves /data unprotected), so the
-	// request context may carry no user or initiator: the event falls back to
-	// the identity stored at initiate. Captured here — publishEvent dispatches
-	// to the eventPublisher goroutine after the request context is dead.
+	// A client-finished continuation PATCH arrives unauthenticated on the data
+	// path: the context may carry no user and no or an EMPTY initiator (the
+	// HTTP auth interceptor always stores the header value), so the event
+	// falls back to the identity stored at initiate, captured before
+	// publishEvent's goroutine outlives the request context.
 	var executantID *userpb.UserId
 	if executant, _ := ctxpkg.ContextGetUser(ctx); executant != nil {
 		executantID = executant.Id
@@ -269,7 +269,7 @@ func (u *kvfsUpload) FinishUpload(ctx context.Context) error {
 		}
 	}
 	publishCtx := commitCtx
-	if _, ok := ctxpkg.ContextGetInitiator(ctx); !ok && u.session.InitiatorID != "" {
+	if v, ok := ctxpkg.ContextGetInitiator(ctx); (!ok || v == "") && u.session.InitiatorID != "" {
 		publishCtx = ctxpkg.ContextSetInitiator(publishCtx, u.session.InitiatorID)
 	}
 	u.driver.publishEvent(publishCtx, func() interface{} {
@@ -435,7 +435,10 @@ func (d *kvfsDriver) createTUSSession(ctx context.Context, p tusSessionParams) (
 	start := time.Now()
 	defer func() { TUSPhaseDuration.WithLabelValues("initiate").Observe(time.Since(start).Seconds()) }()
 
-	u := ctxpkg.ContextMustGetUser(ctx)
+	u, err := requireUser(ctx)
+	if err != nil {
+		return "", err
+	}
 	initiator, _ := ctxpkg.ContextGetInitiator(ctx)
 	sessionID := uuid.New().String()
 	blobID := uuid.New().String()

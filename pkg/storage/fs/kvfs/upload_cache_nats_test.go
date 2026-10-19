@@ -19,7 +19,9 @@ import (
 	"bytes"
 	"crypto/rand"
 	"io"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -248,9 +250,13 @@ func TestNATSStreamUploadCache_CrossPod(t *testing.T) {
 		t.Errorf("cacheB sees size=%d, want %d (A's chunk should be visible)", size, len(chunkA))
 	}
 
-	// Pod B writes the second chunk.
-	if _, err := cacheB.Append("xpod", 0, bytes.NewReader(chunkB)); err != nil {
+	// Pod B appends at the size pod A left behind — the TUS handler always
+	// supplies offset == current size (see the UploadCache contract).
+	if _, err := cacheB.Append("xpod", size, bytes.NewReader(chunkB)); err != nil {
 		t.Fatalf("cacheB.Append: %v", err)
+	}
+	if got, _ := cacheB.Size("xpod"); got != int64(len(chunkA)+len(chunkB)) {
+		t.Errorf("cumulative size after both pods = %d, want %d", got, len(chunkA)+len(chunkB))
 	}
 
 	// Either pod can read back the full body in order.
@@ -388,6 +394,150 @@ func TestNATSStreamUploadCache_AppendHonorsCallerOffset(t *testing.T) {
 	}
 	if want := off + int64(len(data)); size != want {
 		t.Fatalf("Size=%d, want %d (caller offset not honoured — Append may be re-probing)", size, want)
+	}
+}
+
+// lagPendingJS emulates a lagging consumer replica with the real delivery path: the
+// probe (GetLastMsg, a leader read) declares MORE bytes than the stream
+// holds right now, exactly what a Reader whose ordered consumer sits on a
+// lagging replica observes. SubscribeSync passes through to the live
+// JetStream context and signals when the consumer exists, so the test can
+// time the late chunk's arrival.
+type lagPendingJS struct {
+	nats.JetStreamContext
+	declaredOff  int64
+	declaredData []byte
+	subscribed   chan struct{}
+	subOnce      sync.Once
+}
+
+func (p *lagPendingJS) GetLastMsg(stream, subject string, opts ...nats.JSOpt) (*nats.RawStreamMsg, error) {
+	h := nats.Header{}
+	h.Set("Upload-Offset", strconv.FormatInt(p.declaredOff, 10))
+	return &nats.RawStreamMsg{Subject: subject, Header: h, Data: p.declaredData}, nil
+}
+
+func (p *lagPendingJS) SubscribeSync(subj string, opts ...nats.SubOpt) (*nats.Subscription, error) {
+	sub, err := p.JetStreamContext.SubscribeSync(subj, opts...)
+	if err == nil {
+		p.subOnce.Do(func() { close(p.subscribed) })
+	}
+	return sub, err
+}
+
+// A pending count of zero from the consumer's view must not end the body
+// early: only chunk 1 is stored when the consumer delivers it (true
+// NumPending == 0), while the leader-declared size includes chunk 2, which
+// arrives later and must still be delivered.
+func TestNATSStreamUploadCache_ReaderWaitsPastPrematurePendingZero(t *testing.T) {
+	js := embeddedNATS(t)
+	cache, err := newNATSStreamUploadCache(js, defaultNATSCacheOpts(), nopCacheLogger())
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+
+	chunk1 := bytes.Repeat([]byte("a"), 512)
+	chunk2 := bytes.Repeat([]byte("b"), 256)
+	if _, err := cache.Append("premature", 0, bytes.NewReader(chunk1)); err != nil {
+		t.Fatalf("Append chunk1: %v", err)
+	}
+
+	fake := &lagPendingJS{
+		JetStreamContext: js,
+		declaredOff:      int64(len(chunk1)),
+		declaredData:     chunk2,
+		subscribed:       make(chan struct{}),
+	}
+	cache.js = fake
+
+	done := make(chan struct{})
+	t.Cleanup(func() { <-done })
+	go func() {
+		defer close(done)
+		<-fake.subscribed
+		time.Sleep(300 * time.Millisecond)
+		// PublishMsg passes through the fake to the live stream.
+		_, _ = cache.Append("premature", int64(len(chunk1)), bytes.NewReader(chunk2))
+	}()
+
+	r, err := cache.Reader("premature")
+	if err != nil {
+		t.Fatalf("Reader: %v", err)
+	}
+	defer r.Close()
+	got, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if want := len(chunk1) + len(chunk2); len(got) != want {
+		t.Fatalf("read %d of %d bytes: the read ended at the consumer's pending count instead of the leader-declared size", len(got), want)
+	}
+}
+
+// When the staged body never reaches the leader-declared size, the Reader
+// must fail loudly at the idle timeout instead of returning a short body as
+// success.
+func TestNATSStreamUploadCache_ReaderShortBodyFailsLoudly(t *testing.T) {
+	js := embeddedNATS(t)
+	cache, err := newNATSStreamUploadCache(js, defaultNATSCacheOpts(), nopCacheLogger())
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+
+	chunk1 := []byte("stored-chunk")
+	if _, err := cache.Append("short", 0, bytes.NewReader(chunk1)); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	cache.js = &lagPendingJS{
+		JetStreamContext: js,
+		declaredOff:      int64(len(chunk1)),
+		declaredData:     []byte("never-arrives"),
+		subscribed:       make(chan struct{}),
+	}
+
+	oldIdle := uploadCacheIdleTimeout
+	uploadCacheIdleTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { uploadCacheIdleTimeout = oldIdle })
+
+	r, err := cache.Reader("short")
+	if err != nil {
+		t.Fatalf("Reader: %v", err)
+	}
+	defer r.Close()
+	_, err = io.ReadAll(r)
+	if err == nil {
+		t.Fatal("ReadAll returned nil error on a short staged body, want a loud failure")
+	}
+	if !strings.Contains(err.Error(), "staged body incomplete") {
+		t.Fatalf("error %q lacks the staged-body-incomplete signal", err)
+	}
+}
+
+// failingGetLastJS wraps a live JetStreamContext and fails every GetLastMsg
+// with a fixed error, emulating a leader election or transport failure.
+type failingGetLastJS struct {
+	nats.JetStreamContext
+	err error
+}
+
+func (f *failingGetLastJS) GetLastMsg(stream, subject string, opts ...nats.JSOpt) (*nats.RawStreamMsg, error) {
+	return nil, f.err
+}
+
+// A GetLastMsg failure that is not the not-found sentinel must reach the
+// caller: reporting it as size 0 reads a transient NATS failure as "nothing
+// staged".
+func TestNATSStreamUploadCache_SizeErrorPropagates(t *testing.T) {
+	js := embeddedNATS(t)
+	cache, err := newNATSStreamUploadCache(js, defaultNATSCacheOpts(), nopCacheLogger())
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	cache.js = &failingGetLastJS{JetStreamContext: js, err: nats.ErrConnectionClosed}
+
+	size, err := cache.Size("sess-err")
+	if err == nil {
+		t.Fatalf("Size = (%d, nil) on a failed GetLastMsg, want the error propagated", size)
 	}
 }
 

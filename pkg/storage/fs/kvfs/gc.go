@@ -103,6 +103,12 @@ type blobGC struct {
 	// exactly one deletion implementation to reuse. Nil in unit tests that do
 	// not exercise reaping.
 	reapSpace func(ctx context.Context, spaceID, rootID string) error
+
+	// uploadCache drops staged upload bodies when the residue sweep deletes
+	// their sessions; staged bytes are keyed by session, so deleting the KV
+	// entry alone orphans them until the stream MaxAge. Nil in unit tests
+	// that do not exercise staging.
+	uploadCache UploadCache
 }
 
 // newBlobGC creates a new GC instance.
@@ -370,7 +376,7 @@ func (gc *blobGC) Run(ctx context.Context) GCResult {
 		}
 
 		result.ChildrenReconciled += gc.reconcileChildren(ctx, space.ID)
-		result.TrashReconciled += gc.reconcileTrash(ctx, space.ID)
+		result.TrashReconciled += gc.reconcileTrash(ctx, space.ID, cutoff)
 	}
 
 	gc.cleanExpiredUploads(ctx, uploadEntries, &result)
@@ -692,15 +698,77 @@ func (gc *blobGC) reconcileResidue(ctx context.Context, liveSpaceIDs map[string]
 	}
 }
 
+// ghostResidueYoung reports whether any listed KV entry of the ghost space is
+// newer than the cutoff. tryCreateSpace writes the space entry LAST, so young
+// residue can be a space mid-creation (or a live write burst): wait a sweep.
+func (gc *blobGC) ghostResidueYoung(spaceID string, cutoff time.Time) (bool, error) {
+	nodes, err := gc.store.ListNodesBySpace(spaceID)
+	if err != nil {
+		return false, err
+	}
+	for _, n := range nodes {
+		if time.Unix(0, n.MTime).After(cutoff) {
+			return true, nil
+		}
+	}
+	versions, err := gc.store.ListVersionsBySpace(spaceID)
+	if err != nil {
+		return false, err
+	}
+	for _, v := range versions {
+		// SnapshotTime is write-stamped; MTime is client-settable content time.
+		if v.SnapshotTime != 0 && time.Unix(0, v.SnapshotTime).After(cutoff) {
+			return true, nil
+		}
+	}
+	trash, err := gc.store.ListTrash(spaceID)
+	if err != nil {
+		return false, err
+	}
+	for _, t := range trash {
+		if time.Unix(t.DeletionTime, 0).After(cutoff) {
+			return true, nil
+		}
+	}
+	ups, err := gc.store.ListUploadsBySpace(spaceID)
+	if err != nil {
+		return false, err
+	}
+	for _, u := range ups {
+		if time.Unix(u.Expires-int64(uploadSessionTTL/time.Second), 0).After(cutoff) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // reapGhostSpace removes all KV metadata and S3 blobs for a single space that
-// no longer exists in oc-spaces. All reads are per-space (bounded). Safe
-// without an age gate on KV entries because space creation writes the
-// oc-spaces entry FIRST (PutSpace rev=0, atomic create-or-fail), so a
-// missing space entry means the space was deleted, not mid-provision; the S3
-// blob delete still honours the age cutoff as a second belt.
+// no longer exists in oc-spaces. All reads are per-space (bounded). The ghost
+// verdict comes from a listing a replica may serve stale, so it is confirmed
+// at the leader first, and young residue waits a sweep: tryCreateSpace writes
+// the space entry LAST, so a space mid-creation has nodes and children before
+// oc-spaces knows it. The S3 blob delete honours the age cutoff as a second belt.
 func (gc *blobGC) reapGhostSpace(ctx context.Context, spaceID string, cutoff time.Time, result *GCResult) {
 	if ctx.Err() != nil {
 		return // sweep lease lost — do not begin reaping this ghost space
+	}
+	if _, found, err := gc.store.GetSpaceAuthoritative(spaceID); err != nil {
+		gc.log.Warn().Err(err).Str("space_id", spaceID).Msg("gc: ghost leader confirm failed; skipping space this sweep")
+		GCErrors.Inc()
+		result.Errors++
+		return
+	} else if found {
+		gc.log.Warn().Str("space_id", spaceID).Msg("gc: ghost verdict refuted at the leader; skipping space")
+		return
+	}
+	if young, err := gc.ghostResidueYoung(spaceID, cutoff); err != nil {
+		gc.log.Warn().Err(err).Str("space_id", spaceID).Msg("gc: ghost residue age check failed; skipping space this sweep")
+		GCErrors.Inc()
+		result.Errors++
+		return
+	} else if young {
+		gc.log.Info().Str("space_id", spaceID).Msg("gc: ghost residue younger than the cutoff; skipping space this sweep")
+		return
 	}
 	dryRun := gc.opts.GCDryRun
 
@@ -766,6 +834,11 @@ func (gc *blobGC) reapGhostSpace(ctx context.Context, spaceID string, cutoff tim
 					gc.blob.AbortMultipartUpload(ctx, BlobKey(u.SpaceID, u.BlobID), u.S3MultipartID)
 				}
 				gc.store.DeleteUpload(u.ID)
+				if gc.uploadCache != nil {
+					if err := gc.uploadCache.Drop(u.ID); err != nil {
+						gc.log.Warn().Err(err).Str("session_id", u.ID).Msg("gc: ghost reap failed to drop staged upload bytes")
+					}
+				}
 			}
 			delKey()
 		}
@@ -808,183 +881,6 @@ func (gc *blobGC) reapGhostSpace(ctx context.Context, spaceID string, cutoff tim
 	if !dryRun && (result.ResidueKeysDeleted > 0 || result.ResidueBlobsDeleted > 0) {
 		gc.log.Info().Str("space_id", spaceID).Msg("gc: reaped residue of a deleted space")
 	}
-}
-
-// reconcileChildren walks oc-children for a single space and resolves any
-// entry whose recorded child does not match the corresponding node's own
-// ParentID. This catches the two interesting crash modes for Move (which is a
-// 3-phase CAS sequence at kvfs.go: node, add-to-new, remove-from-old):
-//
-//  1. A child entry references a nodeID whose `node.ParentID` points at a
-//     different directory (the "duplicate children" case the upstream review
-//     on opencloud-eu/reva#625 raised).
-//  2. A child entry references a nodeID that no longer exists at all (the
-//     dangling-ref case).
-//
-// Resolution: the node's own ParentID is authoritative. Any children entry
-// whose nodeID disagrees with truth is removed from that parent's children
-// map. The node itself is left untouched.
-//
-// Best-effort interim safety net until a proper Move journal / WAL lands.
-// Honors the GC dry-run flag.
-func (gc *blobGC) reconcileChildren(ctx context.Context, spaceID string) int {
-	nodes, err := gc.store.ListNodesBySpace(spaceID)
-	if err != nil {
-		gc.log.Warn().Err(err).Str("space_id", spaceID).Msg("gc: reconcileChildren: list nodes failed")
-		return 0
-	}
-
-	// Truth table: nodeID -> authoritative ParentID.
-	truth := make(map[string]string, len(nodes))
-	parents := make(map[string]struct{}, len(nodes))
-	for _, n := range nodes {
-		truth[n.ID] = n.ParentID
-		if n.Type == NodeTypeDir {
-			parents[n.ID] = struct{}{}
-		}
-	}
-
-	reconciled := 0
-	for parentID := range parents {
-		children, rev, err := gc.store.GetChildren(spaceID, parentID)
-		if err != nil {
-			continue
-		}
-		dirty := false
-		for name, childID := range children {
-			actual, exists := truth[childID]
-			if exists && actual == parentID {
-				continue
-			}
-			// Either dangling (no node) or stale (node belongs elsewhere).
-			reason := "stale"
-			if !exists {
-				reason = "dangling"
-			}
-			if gc.opts.GCDryRun {
-				gc.log.Info().
-					Str("space_id", spaceID).
-					Str("parent_id", parentID).
-					Str("child_id", childID).
-					Str("name", name).
-					Str("reason", reason).
-					Str("actual_parent", actual).
-					Msg("gc: would remove stray children entry (dry-run)")
-				reconciled++
-				GCChildrenReconciled.Inc()
-				continue
-			}
-			delete(children, name)
-			dirty = true
-			reconciled++
-			GCChildrenReconciled.Inc()
-			gc.log.Info().
-				Str("space_id", spaceID).
-				Str("parent_id", parentID).
-				Str("child_id", childID).
-				Str("name", name).
-				Str("reason", reason).
-				Str("actual_parent", actual).
-				Msg("gc: removed stray children entry")
-		}
-		if dirty {
-			if err := gc.store.PutChildren(spaceID, parentID, children, rev); err != nil {
-				gc.log.Warn().Err(err).
-					Str("space_id", spaceID).
-					Str("parent_id", parentID).
-					Msg("gc: reconcileChildren: PutChildren failed; skipping this parent for the cycle")
-			}
-		}
-	}
-
-	return reconciled
-}
-
-// reconcileTrash walks oc-trash for a single space and removes any trash
-// entry whose referenced node is already live AND reachable in the tree.
-// This catches the RestoreRecycleItem crash mode: PutNode + updateChildren
-// succeeded but DeleteTrash did not, leaving the node both restored AND
-// in trash.
-//
-// KVFS keeps directory nodes alive in oc-nodes even while trashed (for
-// subtree restorability). A trashed directory has a node entry but is NOT
-// listed in any parent's children map. A restored directory IS reachable.
-// The reachability check distinguishes the two cases.
-//
-// Resolution: the node is live and reachable; the trash entry is stale.
-// Honors the GC dry-run flag.
-func (gc *blobGC) reconcileTrash(ctx context.Context, spaceID string) int {
-	nodes, err := gc.store.ListNodesBySpace(spaceID)
-	if err != nil {
-		gc.log.Warn().Err(err).Str("space_id", spaceID).Msg("gc: reconcileTrash: list nodes failed")
-		return 0
-	}
-
-	liveNodes := make(map[string]*NodeEntry, len(nodes))
-	for _, n := range nodes {
-		liveNodes[n.ID] = n
-	}
-
-	// Build the set of node IDs reachable from some parent's children map.
-	reachable := make(map[string]struct{})
-	for _, n := range nodes {
-		if n.Type != NodeTypeDir {
-			continue
-		}
-		children, _, err := gc.store.GetChildren(spaceID, n.ID)
-		if err != nil {
-			continue
-		}
-		for _, childID := range children {
-			reachable[childID] = struct{}{}
-		}
-	}
-
-	trash, err := gc.store.ListTrash(spaceID)
-	if err != nil {
-		gc.log.Warn().Err(err).Str("space_id", spaceID).Msg("gc: reconcileTrash: list trash failed")
-		return 0
-	}
-
-	reconciled := 0
-	for _, t := range trash {
-		node, isLive := liveNodes[t.NodeID]
-		if !isLive {
-			continue
-		}
-		if _, ok := reachable[t.NodeID]; !ok {
-			continue
-		}
-		// Node is live AND reachable — trash entry is stale.
-		if gc.opts.GCDryRun {
-			gc.log.Info().
-				Str("space_id", spaceID).
-				Str("trash_key", t.Key).
-				Str("node_id", t.NodeID).
-				Str("parent_id", node.ParentID).
-				Msg("gc: would remove stale trash entry (node is live and reachable) (dry-run)")
-			reconciled++
-			GCTrashReconciled.Inc()
-			continue
-		}
-		if err := gc.store.DeleteTrash(spaceID, t.Key); err != nil {
-			gc.log.Warn().Err(err).
-				Str("space_id", spaceID).
-				Str("trash_key", t.Key).
-				Msg("gc: reconcileTrash: DeleteTrash failed; skipping this entry")
-			continue
-		}
-		reconciled++
-		GCTrashReconciled.Inc()
-		gc.log.Info().
-			Str("space_id", spaceID).
-			Str("trash_key", t.Key).
-			Str("node_id", t.NodeID).
-			Str("parent_id", node.ParentID).
-			Msg("gc: removed stale trash entry (node already restored)")
-	}
-
-	return reconciled
 }
 
 // buildSpaceReferenceSet builds the set of S3 blob keys referenced by a

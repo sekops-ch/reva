@@ -17,6 +17,7 @@ package kvfs
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -937,7 +938,7 @@ func TestReconcileTrash_StaleEntryFromAbortedRestore(t *testing.T) {
 	store.childRevs["s1.dir"] = 1
 	store.trash["s1.t1"] = &TrashEntry{Key: "t1", NodeID: "victim", SpaceID: "s1"}
 
-	reconciled := gc.reconcileTrash(context.Background(), "s1")
+	reconciled := gc.reconcileTrash(context.Background(), "s1", time.Now())
 
 	if reconciled != 1 {
 		t.Errorf("reconciled = %d, want 1", reconciled)
@@ -963,7 +964,7 @@ func TestReconcileTrash_LegitimateTrashUntouched(t *testing.T) {
 	store.childRevs["s1.dir"] = 1
 	store.trash["s1.t1"] = &TrashEntry{Key: "t1", NodeID: "deleted-node", SpaceID: "s1"}
 
-	reconciled := gc.reconcileTrash(context.Background(), "s1")
+	reconciled := gc.reconcileTrash(context.Background(), "s1", time.Now())
 	if reconciled != 0 {
 		t.Errorf("reconciled = %d, want 0 for legitimate trash", reconciled)
 	}
@@ -990,7 +991,7 @@ func TestReconcileTrash_TrashedDirectoryUntouched(t *testing.T) {
 	store.childRevs["s1.trashed-dir"] = 1
 	store.trash["s1.t1"] = &TrashEntry{Key: "t1", NodeID: "trashed-dir", SpaceID: "s1"}
 
-	reconciled := gc.reconcileTrash(context.Background(), "s1")
+	reconciled := gc.reconcileTrash(context.Background(), "s1", time.Now())
 	if reconciled != 0 {
 		t.Errorf("reconciled = %d, want 0 for trashed directory", reconciled)
 	}
@@ -1013,7 +1014,7 @@ func TestReconcileTrash_DryRunDoesNotMutate(t *testing.T) {
 	store.childRevs["s1.dir"] = 1
 	store.trash["s1.t1"] = &TrashEntry{Key: "t1", NodeID: "victim", SpaceID: "s1"}
 
-	reconciled := gc.reconcileTrash(context.Background(), "s1")
+	reconciled := gc.reconcileTrash(context.Background(), "s1", time.Now())
 	if reconciled != 1 {
 		t.Errorf("reconciled (counter) = %d, want 1 even in dry-run", reconciled)
 	}
@@ -1451,5 +1452,350 @@ func TestGCRunReapsUploadsAndCountsMetrics(t *testing.T) {
 	}
 	if d := getCounterValue(t, "kvfs_gc_corrupt_uploads_reaped_total", nil) - corruptBefore; d != 1 {
 		t.Errorf("kvfs_gc_corrupt_uploads_reaped_total delta = %v, want 1", d)
+	}
+}
+
+// --- staged-byte drop on out-of-finish session reaping ---
+
+// dropRecordingCache records Drop calls; no other UploadCache method is used
+// by the paths under test.
+type dropRecordingCache struct {
+	UploadCache
+	mu    sync.Mutex
+	drops []string
+}
+
+func (c *dropRecordingCache) Drop(sessionID string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.drops = append(c.drops, sessionID)
+	return nil
+}
+
+func (c *dropRecordingCache) dropped() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.drops...)
+}
+
+// Space teardown deletes upload sessions; the staged bodies are keyed by
+// session and must be dropped with them.
+func TestDeleteSpaceContents_DropsStagedUploadBodies(t *testing.T) {
+	store := newMockMetadataStore()
+	blob := newMockBlobStore()
+	d := testDriver(t, store, blob)
+	rec := &dropRecordingCache{}
+	d.uploadCache = rec
+
+	store.uploads["sess-a"] = &UploadSession{ID: "sess-a", SpaceID: "sp1"}
+	store.uploads["sess-b"] = &UploadSession{ID: "sess-b", SpaceID: "sp1"}
+
+	if err := d.deleteSpaceContents(testContext(), "sp1", "root-1"); err != nil {
+		t.Fatalf("deleteSpaceContents: %v", err)
+	}
+	if got := rec.dropped(); len(got) != 2 {
+		t.Fatalf("dropped %d staged bodies (%v), want 2", len(got), got)
+	}
+}
+
+// The ghost-space residue sweep deletes upload sessions too and must drop
+// their staged bodies the same way.
+func TestReapGhostSpace_DropsStagedUploadBodies(t *testing.T) {
+	store := newMockMetadataStore()
+	blob := newMockBlobStore()
+	gc := testGC(store, blob, false)
+	rec := &dropRecordingCache{}
+	gc.uploadCache = rec
+
+	store.uploads["ghost-sess"] = &UploadSession{ID: "ghost-sess", SpaceID: "ghost-sp"}
+
+	res := &GCResult{}
+	gc.reapGhostSpace(context.Background(), "ghost-sp", time.Now().Add(-time.Hour), res)
+	if got := rec.dropped(); len(got) != 1 || got[0] != "ghost-sess" {
+		t.Fatalf("dropped = %v, want [ghost-sess]", got)
+	}
+}
+
+// --- leader-confirmed children reconciliation (listing-race straddles) ---
+
+// listNodesRaceStore runs hook once inside ListNodesBySpace, after the
+// listing result is captured: the reconciler's per-folder reads then see
+// newer state than its candidate screen.
+type listNodesRaceStore struct {
+	*mockMetadataStore
+	once sync.Once
+	hook func()
+}
+
+func (s *listNodesRaceStore) ListNodesBySpace(spaceID string) ([]*NodeEntry, error) {
+	nodes, err := s.mockMetadataStore.ListNodesBySpace(spaceID)
+	s.once.Do(s.hook)
+	return nodes, err
+}
+
+func seedDir(t *testing.T, store *mockMetadataStore, spaceID, dirID string) {
+	t.Helper()
+	if err := store.PutNode(&NodeEntry{ID: dirID, SpaceID: spaceID, ParentID: "root", Name: dirID, Type: NodeTypeDir}, 0); err != nil {
+		t.Fatalf("PutNode %s: %v", dirID, err)
+	}
+	if err := store.PutChildren(spaceID, dirID, ChildMap{}, 0); err != nil {
+		t.Fatalf("PutChildren %s: %v", dirID, err)
+	}
+}
+
+func addChild(t *testing.T, store *mockMetadataStore, spaceID, parentID, name, childID string) {
+	t.Helper()
+	cm, rev, err := store.GetChildren(spaceID, parentID)
+	if err != nil {
+		t.Fatalf("GetChildren: %v", err)
+	}
+	cm[name] = childID
+	if err := store.PutChildren(spaceID, parentID, cm, rev); err != nil {
+		t.Fatalf("PutChildren: %v", err)
+	}
+}
+
+// A file created after the listing and before the parent's children read must
+// keep its folder entry: the node exists at the leader with this parent.
+func TestReconcileChildren_KeepsEntryCreatedDuringSweep(t *testing.T) {
+	store := newMockMetadataStore()
+	seedDir(t, store, "sp", "folder")
+
+	wrapped := &listNodesRaceStore{mockMetadataStore: store, hook: func() {
+		if err := store.PutNode(&NodeEntry{ID: "n-new", SpaceID: "sp", ParentID: "folder", Name: "new.txt", Type: NodeTypeFile}, 0); err != nil {
+			t.Errorf("hook PutNode: %v", err)
+		}
+		addChild(t, store, "sp", "folder", "new.txt", "n-new")
+	}}
+	log := zerolog.Nop()
+	gc := newBlobGC(wrapped, newMockBlobStore(), gcOpts(false), &log)
+
+	gc.reconcileChildren(context.Background(), "sp")
+
+	cm, _, err := store.GetChildren("sp", "folder")
+	if err != nil {
+		t.Fatalf("GetChildren: %v", err)
+	}
+	if cm["new.txt"] != "n-new" {
+		t.Fatalf("children = %v: the entry of a file created during the sweep was removed", cm)
+	}
+}
+
+// A file moved in after the listing must keep its new folder entry: the
+// leader shows its ParentID already points here.
+func TestReconcileChildren_KeepsEntryMovedInDuringSweep(t *testing.T) {
+	store := newMockMetadataStore()
+	seedDir(t, store, "sp", "dir-a")
+	seedDir(t, store, "sp", "dir-b")
+	if err := store.PutNode(&NodeEntry{ID: "n-f", SpaceID: "sp", ParentID: "dir-a", Name: "f.txt", Type: NodeTypeFile}, 0); err != nil {
+		t.Fatalf("PutNode: %v", err)
+	}
+	addChild(t, store, "sp", "dir-a", "f.txt", "n-f")
+
+	wrapped := &listNodesRaceStore{mockMetadataStore: store, hook: func() {
+		n, rev, err := store.GetNode("sp", "n-f")
+		if err != nil {
+			t.Errorf("hook GetNode: %v", err)
+			return
+		}
+		n.ParentID = "dir-b"
+		if err := store.PutNode(n, rev); err != nil {
+			t.Errorf("hook PutNode: %v", err)
+		}
+		cm, rev2, _ := store.GetChildren("sp", "dir-a")
+		delete(cm, "f.txt")
+		if err := store.PutChildren("sp", "dir-a", cm, rev2); err != nil {
+			t.Errorf("hook PutChildren a: %v", err)
+		}
+		addChild(t, store, "sp", "dir-b", "f.txt", "n-f")
+	}}
+	log := zerolog.Nop()
+	gc := newBlobGC(wrapped, newMockBlobStore(), gcOpts(false), &log)
+
+	gc.reconcileChildren(context.Background(), "sp")
+
+	cm, _, err := store.GetChildren("sp", "dir-b")
+	if err != nil {
+		t.Fatalf("GetChildren: %v", err)
+	}
+	if cm["f.txt"] != "n-f" {
+		t.Fatalf("dir-b children = %v: the entry of a file moved in during the sweep was removed", cm)
+	}
+}
+
+// --- trash reconciliation: age guard + leader confirm ---
+
+// A trash entry written moments ago belongs to a delete still in flight (the
+// entry lands before the unlink and node delete): it must survive the sweep
+// even though its node is live and reachable everywhere.
+func TestReconcileTrash_AgeGuardKeepsFreshEntries(t *testing.T) {
+	store := newMockMetadataStore()
+	seedDir(t, store, "sp", "dir-t")
+	if err := store.PutNode(&NodeEntry{ID: "n-t", SpaceID: "sp", ParentID: "dir-t", Name: "t.txt", Type: NodeTypeFile}, 0); err != nil {
+		t.Fatalf("PutNode: %v", err)
+	}
+	addChild(t, store, "sp", "dir-t", "t.txt", "n-t")
+	if err := store.PutTrash(&TrashEntry{SpaceID: "sp", Key: "tk1", NodeID: "n-t", Node: NodeEntry{ID: "n-t", Type: NodeTypeFile}, DeletionTime: time.Now().Unix()}); err != nil {
+		t.Fatalf("PutTrash: %v", err)
+	}
+	log := zerolog.Nop()
+	gc := newBlobGC(store, newMockBlobStore(), gcOpts(false), &log)
+
+	gc.reconcileTrash(context.Background(), "sp", time.Now().Add(-time.Hour))
+
+	if _, err := store.GetTrash("sp", "tk1"); err != nil {
+		t.Fatalf("fresh trash entry was removed by the sweep: %v", err)
+	}
+}
+
+// listTrashRaceStore deletes the node after the reconciler's node and
+// children snapshots but before the trash listing, the delete-in-flight
+// shape the stale snapshots cannot see.
+type listTrashRaceStore struct {
+	*mockMetadataStore
+	once sync.Once
+	hook func()
+}
+
+func (s *listTrashRaceStore) ListTrash(spaceID string) ([]*TrashEntry, error) {
+	s.once.Do(s.hook)
+	return s.mockMetadataStore.ListTrash(spaceID)
+}
+
+// A delete that lands between the reconciler's snapshots and its trash
+// listing must keep its trash entry: the leader shows the node gone.
+func TestReconcileTrash_KeepsEntryOfDeleteDuringSweep(t *testing.T) {
+	store := newMockMetadataStore()
+	seedDir(t, store, "sp", "dir-d")
+	if err := store.PutNode(&NodeEntry{ID: "n-d", SpaceID: "sp", ParentID: "dir-d", Name: "d.txt", Type: NodeTypeFile}, 0); err != nil {
+		t.Fatalf("PutNode: %v", err)
+	}
+	addChild(t, store, "sp", "dir-d", "d.txt", "n-d")
+
+	wrapped := &listTrashRaceStore{mockMetadataStore: store, hook: func() {
+		// The racing delete: trash entry (old enough to clear the age guard,
+		// as a lagging replica can present it), unlink, node delete.
+		if err := store.PutTrash(&TrashEntry{SpaceID: "sp", Key: "tk-d", NodeID: "n-d", Node: NodeEntry{ID: "n-d", Type: NodeTypeFile}, DeletionTime: time.Now().Add(-2 * time.Hour).Unix()}); err != nil {
+			t.Errorf("hook PutTrash: %v", err)
+		}
+		cm, rev, _ := store.GetChildren("sp", "dir-d")
+		delete(cm, "d.txt")
+		if err := store.PutChildren("sp", "dir-d", cm, rev); err != nil {
+			t.Errorf("hook PutChildren: %v", err)
+		}
+		if err := store.DeleteNode("sp", "n-d"); err != nil {
+			t.Errorf("hook DeleteNode: %v", err)
+		}
+	}}
+	log := zerolog.Nop()
+	gc := newBlobGC(wrapped, newMockBlobStore(), gcOpts(false), &log)
+
+	gc.reconcileTrash(context.Background(), "sp", time.Now().Add(-time.Hour))
+
+	if _, err := store.GetTrash("sp", "tk-d"); err != nil {
+		t.Fatalf("the trash entry of a delete racing the sweep was removed: %v", err)
+	}
+}
+
+// --- ghost-space reap: leader confirm + young-residue gate ---
+
+// A space the (possibly stale) listing missed but the leader still has must
+// never be reaped: pre-confirm, this wiped a live space's metadata.
+func TestReapGhostSpace_SkipsSpacePresentAtLeader(t *testing.T) {
+	store := newMockMetadataStore()
+	if err := store.PutSpace(&SpaceEntry{ID: "live-sp", Name: "live"}, 0); err != nil {
+		t.Fatalf("PutSpace: %v", err)
+	}
+	seedDir(t, store, "live-sp", "dir-l")
+	if err := store.PutNode(&NodeEntry{ID: "n-l", SpaceID: "live-sp", ParentID: "dir-l", Name: "l.txt", Type: NodeTypeFile}, 0); err != nil {
+		t.Fatalf("PutNode: %v", err)
+	}
+	log := zerolog.Nop()
+	gc := newBlobGC(store, newMockBlobStore(), gcOpts(false), &log)
+
+	res := &GCResult{}
+	gc.reapGhostSpace(context.Background(), "live-sp", time.Now().Add(-time.Hour), res)
+
+	if _, _, err := store.GetNode("live-sp", "n-l"); err != nil {
+		t.Fatalf("a live space's node was reaped on a stale ghost verdict: %v", err)
+	}
+	if res.ResidueKeysDeleted != 0 {
+		t.Fatalf("ResidueKeysDeleted = %d for a live space, want 0", res.ResidueKeysDeleted)
+	}
+}
+
+// A ghost whose residue carries fresh writes is a space mid-creation (the
+// space entry is written last): it must wait for a later sweep.
+func TestReapGhostSpace_SkipsMidCreationResidue(t *testing.T) {
+	store := newMockMetadataStore()
+	if err := store.PutNode(&NodeEntry{ID: "n-mc", SpaceID: "mc-sp", ParentID: "root", Name: "mc-root", Type: NodeTypeDir, MTime: time.Now().UnixNano()}, 0); err != nil {
+		t.Fatalf("PutNode: %v", err)
+	}
+	if err := store.PutChildren("mc-sp", "n-mc", ChildMap{}, 0); err != nil {
+		t.Fatalf("PutChildren: %v", err)
+	}
+	log := zerolog.Nop()
+	gc := newBlobGC(store, newMockBlobStore(), gcOpts(false), &log)
+
+	res := &GCResult{}
+	gc.reapGhostSpace(context.Background(), "mc-sp", time.Now().Add(-time.Hour), res)
+
+	if _, _, err := store.GetNode("mc-sp", "n-mc"); err != nil {
+		t.Fatalf("mid-creation residue was reaped: %v", err)
+	}
+}
+
+// Old residue of a leader-confirmed ghost is still fully reaped.
+func TestReapGhostSpace_ReapsOldResidue(t *testing.T) {
+	store := newMockMetadataStore()
+	if err := store.PutNode(&NodeEntry{ID: "n-old", SpaceID: "old-sp", ParentID: "root", Name: "old", Type: NodeTypeFile, MTime: time.Now().Add(-48 * time.Hour).UnixNano()}, 0); err != nil {
+		t.Fatalf("PutNode: %v", err)
+	}
+	log := zerolog.Nop()
+	gc := newBlobGC(store, newMockBlobStore(), gcOpts(false), &log)
+
+	res := &GCResult{}
+	gc.reapGhostSpace(context.Background(), "old-sp", time.Now().Add(-time.Hour), res)
+
+	if _, _, err := store.GetNode("old-sp", "n-old"); err == nil {
+		t.Fatal("old ghost residue survived the reap")
+	}
+	if res.ResidueKeysDeleted == 0 {
+		t.Fatal("ResidueKeysDeleted = 0, want the reaped node counted")
+	}
+}
+
+// A lost sweep lease must fence the reconcilers: destructive repair never
+// runs without the lock.
+func TestReconcilers_HonorSweepFence(t *testing.T) {
+	store := newMockMetadataStore()
+	seedDir(t, store, "sp", "dir-f")
+	// A genuinely dangling children entry and a genuinely stale trash entry:
+	// an unfenced reconciler would remove both.
+	addChild(t, store, "sp", "dir-f", "gone.txt", "n-gone")
+	if err := store.PutNode(&NodeEntry{ID: "n-r", SpaceID: "sp", ParentID: "dir-f", Name: "r.txt", Type: NodeTypeFile}, 0); err != nil {
+		t.Fatalf("PutNode: %v", err)
+	}
+	addChild(t, store, "sp", "dir-f", "r.txt", "n-r")
+	if err := store.PutTrash(&TrashEntry{SpaceID: "sp", Key: "tk-r", NodeID: "n-r", Node: NodeEntry{ID: "n-r", Type: NodeTypeFile}, DeletionTime: time.Now().Add(-2 * time.Hour).Unix()}); err != nil {
+		t.Fatalf("PutTrash: %v", err)
+	}
+	log := zerolog.Nop()
+	gc := newBlobGC(store, newMockBlobStore(), gcOpts(false), &log)
+
+	fenced, cancel := context.WithCancel(context.Background())
+	cancel()
+	if n := gc.reconcileChildren(fenced, "sp"); n != 0 {
+		t.Fatalf("reconcileChildren repaired %d entries after the fence", n)
+	}
+	if n := gc.reconcileTrash(fenced, "sp", time.Now().Add(-time.Hour)); n != 0 {
+		t.Fatalf("reconcileTrash repaired %d entries after the fence", n)
+	}
+	cm, _, _ := store.GetChildren("sp", "dir-f")
+	if _, ok := cm["gone.txt"]; !ok {
+		t.Fatal("a fenced reconciler still removed a children entry")
+	}
+	if _, err := store.GetTrash("sp", "tk-r"); err != nil {
+		t.Fatal("a fenced reconciler still removed a trash entry")
 	}
 }

@@ -32,6 +32,7 @@ import (
 	"github.com/rs/zerolog"
 
 	ctxpkg "github.com/opencloud-eu/reva/v2/pkg/ctx"
+	"github.com/opencloud-eu/reva/v2/pkg/errtypes"
 	tusd "github.com/tus/tusd/v2/pkg/handler"
 	"github.com/vmihailenco/msgpack/v5"
 )
@@ -377,6 +378,27 @@ func (m *mockMetadataStore) DeleteChildren(spaceID, parentID string) error {
 	delete(m.children, key)
 	delete(m.childRevs, key)
 	return nil
+}
+
+func (m *mockMetadataStore) GetNodeAuthoritative(spaceID, nodeID string) (*NodeEntry, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n, ok := m.nodes[spaceID+"."+nodeID]
+	if !ok {
+		return nil, false, nil
+	}
+	return copyNode(n), true, nil // single in-memory map: always authoritative
+}
+
+func (m *mockMetadataStore) GetSpaceAuthoritative(spaceID string) (*SpaceEntry, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s, ok := m.spaces[spaceID]
+	if !ok {
+		return nil, false, nil
+	}
+	cp := *s
+	return &cp, true, nil
 }
 
 func (m *mockMetadataStore) GetSpace(spaceID string) (*SpaceEntry, uint64, error) {
@@ -2210,10 +2232,8 @@ func TestInitiateUploadSimpleIDCarriesTUSSibling(t *testing.T) {
 	}
 }
 
-// A refused simple commit — here an If-Match loser, the shape every
-// concurrent metadata writer race produces — must reap its sibling too:
-// pre-fix only the success path reaped, and each racing loser stranded one
-// TUS session for the TTL reaper.
+// A refused simple commit (here an If-Match loser) must reap its sibling:
+// a final refusal means the session can never be used.
 func TestUploadRefusedCommitReapsSiblingSession(t *testing.T) {
 	store := newMockMetadataStore()
 	blob := newMockBlobStore()
@@ -2594,5 +2614,103 @@ func TestFinishUploadIdempotentReplay(t *testing.T) {
 	afterNode := store.nodes["space-1.existing-node"]
 	if afterNode.BlobID != "first-commit-blob" {
 		t.Errorf("node.BlobID changed to %q, expected unchanged %q", afterNode.BlobID, "first-commit-blob")
+	}
+}
+
+// A folder-target refusal is as final as an If-Match loss: the sibling TUS
+// session must be reaped, not stranded for the TTL reaper.
+func TestUploadFolderTargetRefusalReapsSiblingSession(t *testing.T) {
+	store := newMockMetadataStore()
+	d := testDriver(t, store, newMockBlobStore())
+	setupSpaceWithFile(store, "s1", "root", "n-swap", "swap.txt")
+
+	ctx := testContext()
+	result, err := d.InitiateUpload(ctx, &provider.Reference{
+		ResourceId: &provider.ResourceId{SpaceId: "s1", OpaqueId: "root"},
+		Path:       "./swap.txt",
+	}, 1, map[string]string{})
+	if err != nil {
+		t.Fatalf("InitiateUpload: %v", err)
+	}
+	tusID := result["tus"]
+
+	// The race: the target turns into a folder between initiate and commit.
+	n, rev, err := store.GetNode("s1", "n-swap")
+	if err != nil {
+		t.Fatalf("GetNode: %v", err)
+	}
+	n.Type = NodeTypeDir
+	if err := store.PutNode(n, rev); err != nil {
+		t.Fatalf("PutNode: %v", err)
+	}
+
+	_, err = d.Upload(ctx, storage.UploadRequest{
+		Ref:    &provider.Reference{Path: "/" + result["simple"]},
+		Body:   io.NopCloser(bytes.NewReader([]byte("x"))),
+		Length: 1,
+	}, nil)
+	if err == nil {
+		t.Fatal("Upload onto a folder target succeeded, want a refusal")
+	}
+	if _, serr := store.GetUpload(tusID); serr != ErrNotFound {
+		t.Errorf("sibling TUS session survived a folder-target refusal, GetUpload err = %v", serr)
+	}
+}
+
+// A lock-id refusal is Aborted and already reaps the sibling; this pins it.
+func TestUploadLockRefusalReapsSiblingSession(t *testing.T) {
+	store := newMockMetadataStore()
+	d := testDriver(t, store, newMockBlobStore())
+	setupSpaceWithFile(store, "s1", "root", "n-lk", "locked.txt")
+
+	ctx := testContext()
+	result, err := d.InitiateUpload(ctx, &provider.Reference{
+		ResourceId: &provider.ResourceId{SpaceId: "s1", OpaqueId: "root"},
+		Path:       "./locked.txt",
+	}, 1, map[string]string{})
+	if err != nil {
+		t.Fatalf("InitiateUpload: %v", err)
+	}
+	tusID := result["tus"]
+
+	// The race: the target gains a lock between initiate and commit.
+	n, rev, err := store.GetNode("s1", "n-lk")
+	if err != nil {
+		t.Fatalf("GetNode: %v", err)
+	}
+	n.Lock = &LockEntry{LockID: "lock-1"}
+	if err := store.PutNode(n, rev); err != nil {
+		t.Fatalf("PutNode: %v", err)
+	}
+
+	lockCtx := ctxpkg.ContextSetLockID(ctx, "wrong-lock")
+	_, err = d.Upload(lockCtx, storage.UploadRequest{
+		Ref:    &provider.Reference{Path: "/" + result["simple"]},
+		Body:   io.NopCloser(bytes.NewReader([]byte("x"))),
+		Length: 1,
+	}, nil)
+	if err == nil {
+		t.Fatal("Upload with a mismatching lock id succeeded, want a refusal")
+	}
+	if _, serr := store.GetUpload(tusID); serr != ErrNotFound {
+		t.Errorf("sibling TUS session survived a lock-id refusal, GetUpload err = %v", serr)
+	}
+}
+
+// A stored typed-nil user must refuse the request cleanly, never panic:
+// ContextMustGetUser returns a stored typed nil successfully.
+func TestUploadWithTypedNilUserFailsCleanly(t *testing.T) {
+	store := newMockMetadataStore()
+	d := testDriver(t, store, newMockBlobStore())
+	setupSpaceEmpty(store, "s1", "root")
+
+	nilUserCtx := ctxpkg.ContextSetUser(context.Background(), nil)
+	_, err := d.CreateStorageSpace(nilUserCtx, &provider.CreateStorageSpaceRequest{Type: "personal", Name: "x"})
+	if err == nil {
+		t.Fatal("CreateStorageSpace with a typed-nil user succeeded, want a clean refusal")
+	}
+	var ur errtypes.UserRequired
+	if !errors.As(err, &ur) {
+		t.Fatalf("error %v (%T) is not UserRequired", err, err)
 	}
 }

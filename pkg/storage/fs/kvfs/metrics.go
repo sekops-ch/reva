@@ -56,10 +56,10 @@ var (
 		Help: "Effective MaxDeleteDepth bound per kvfs instance (labeled by bucket prefix)",
 	}, []string{"prefix"})
 
-	// KVAuthoritativeReads counts leader reads confirming a direct-read miss.
-	// Outcomes are semantic per bucket: lag_caught = the leader had what the
-	// replica's view (or a stale children map) missed, confirmed_absent = the
-	// miss is real, error = the leader read or decode failed.
+	// KVAuthoritativeReads counts leader reads confirming a direct-read miss:
+	// lag_caught = the leader had what the replica's view missed,
+	// confirmed_absent = the miss is real, error = the read failed (decode
+	// failures count here only on the children/node/space confirm paths).
 	KVAuthoritativeReads = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "kvfs_kv_authoritative_reads_total",
 		Help: "Authoritative leader reads confirming a direct-read miss, by bucket and outcome (lag_caught, confirmed_absent, error).",
@@ -71,7 +71,7 @@ var (
 	KVAuthoritativeReadDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "kvfs_kv_authoritative_read_duration_seconds",
 		Help:    "Duration of authoritative leader reads in seconds, by bucket.",
-		Buckets: []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0},
+		Buckets: []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 15.0},
 	}, []string{"bucket"})
 
 	// AuthoritativeReadTimeoutGauge exports the effective leader-read bound —

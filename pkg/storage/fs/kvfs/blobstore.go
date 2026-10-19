@@ -163,18 +163,32 @@ type blobAttemptKey struct{}
 
 type blobAttemptInfo struct {
 	key     string
+	session string
 	attempt atomic.Int32
 }
 
-func withBlobAttemptLog(ctx context.Context, key string) context.Context {
-	return context.WithValue(ctx, blobAttemptKey{}, &blobAttemptInfo{key: key})
+// blobSessionKey carries the owning TUS session id, set by the caller that
+// knows it, into the attempt log.
+type blobSessionKey struct{}
+
+// WithBlobSession attributes subsequent blob uploads on this context to a TUS
+// session in the attempt log.
+func WithBlobSession(ctx context.Context, sessionID string) context.Context {
+	return context.WithValue(ctx, blobSessionKey{}, sessionID)
 }
 
-// attemptLogTransport logs every failing S3 attempt — transport error or error
-// status — with its blob key and attempt number, on the single-PUT path and on
-// every multipart part alike. minio-go retries silently and surfaces only the
-// LAST error, so the first attempt's failure (the one naming the real cause)
-// is otherwise unobservable.
+func withBlobAttemptLog(ctx context.Context, key string) context.Context {
+	info := &blobAttemptInfo{key: key}
+	if sid, _ := ctx.Value(blobSessionKey{}).(string); sid != "" {
+		info.session = sid
+	}
+	return context.WithValue(ctx, blobAttemptKey{}, info)
+}
+
+// attemptLogTransport logs every failing S3 round trip with its blob key and
+// round-trip count (a multipart initiate is round trip 1): minio-go retries
+// silently and surfaces only the LAST error, so the first failure, the one
+// naming the real cause, is otherwise unobservable.
 type attemptLogTransport struct {
 	next http.RoundTripper
 	log  *zerolog.Logger
@@ -187,29 +201,26 @@ func (t *attemptLogTransport) RoundTrip(req *http.Request) (*http.Response, erro
 	}
 	n := info.attempt.Add(1)
 	resp, err := t.next.RoundTrip(req)
-	switch {
-	case err != nil:
-		t.log.Warn().Str("blob_key", info.key).Int32("attempt", n).
-			Str("method", req.Method).Str("url", req.URL.RequestURI()).
-			Err(err).Msg("kvfs: blob upload attempt failed")
-	case resp.StatusCode >= 400:
-		t.log.Warn().Str("blob_key", info.key).Int32("attempt", n).
-			Str("method", req.Method).Str("url", req.URL.RequestURI()).
-			Int("status", resp.StatusCode).Msg("kvfs: blob upload attempt failed")
+	if err == nil && resp.StatusCode < 400 {
+		return resp, err
+	}
+	ev := t.log.Warn().Str("blob_key", info.key).Int32("round_trip", n).
+		Str("method", req.Method).Str("url", req.URL.RequestURI())
+	if info.session != "" {
+		ev = ev.Str("session_id", info.session)
+	}
+	if err != nil {
+		ev.Err(err).Msg("kvfs: blob upload attempt failed")
+	} else {
+		ev.Int("status", resp.StatusCode).Msg("kvfs: blob upload attempt failed")
 	}
 	return resp, err
 }
 
-// Upload stores data from a reader into S3 under the given key. Bodies at or
-// below the single-PUT threshold are buffered to a seekable reader first:
-// minio-go retries a failed PUT by rewinding the body, and a plain stream
-// silently "rewinds" to nothing, so the retry would announce ContentLength
-// bytes and send an empty body. The buffer makes retries resend the real
-// content and a short read from the staging layer fails loudly before S3 is
-// touched. Larger bodies stream: minio-go switches to multipart and buffers
-// each part itself, so a retried part is never empty and a short source
-// aborts the multipart upload loudly. Every failing attempt on any path is
-// logged by the client transport under this key.
+// Upload stores data into S3 under the key. Small bodies buffer first so a
+// minio-go retry resends real content (a bare stream rewinds to empty) and a
+// short staged read fails loudly before S3; larger bodies stream multipart,
+// which buffers each part itself. Failing round trips log under the key.
 func (bs *S3Blobstore) Upload(ctx context.Context, key string, reader io.Reader, size int64) error {
 	start := time.Now()
 	ctx = withBlobAttemptLog(ctx, key)

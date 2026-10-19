@@ -23,7 +23,6 @@ import (
 
 	provider "github.com/cs3org/go-cs3apis/cs3/storage/provider/v1beta1"
 
-	ctxpkg "github.com/opencloud-eu/reva/v2/pkg/ctx"
 	"github.com/opencloud-eu/reva/v2/pkg/errtypes"
 	"github.com/opencloud-eu/reva/v2/pkg/mime"
 )
@@ -76,7 +75,10 @@ func (d *kvfsDriver) createEmptyFileAuthorized(ctx context.Context, ref *provide
 }
 
 func (d *kvfsDriver) createEmptyFile(ctx context.Context, spaceID, parentID, name, mtimeStr string) error {
-	u := ctxpkg.ContextMustGetUser(ctx)
+	u, err := requireUser(ctx)
+	if err != nil {
+		return err
+	}
 	newID := uuid.New().String()
 	now := time.Now().UnixNano()
 	mtime := now

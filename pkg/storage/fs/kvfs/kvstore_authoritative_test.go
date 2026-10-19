@@ -353,3 +353,46 @@ func TestGetUploadNoLagFastPath(t *testing.T) {
 		t.Fatalf("direct-path read took %v", elapsed)
 	}
 }
+
+// GetNodeAuthoritative round-trips a live node, reads a deleted node as a
+// confirmed absence, and surfaces leader-read failures.
+func TestGetNodeAuthoritative(t *testing.T) {
+	s := newTestKVStore(t)
+	n := &NodeEntry{ID: "n9", SpaceID: "s9", ParentID: "root", Name: "f.bin"}
+	if err := s.PutNode(n, 0); err != nil {
+		t.Fatalf("PutNode: %v", err)
+	}
+
+	got, ok, err := s.GetNodeAuthoritative("s9", "n9")
+	if err != nil || !ok || got.Name != "f.bin" {
+		t.Fatalf("GetNodeAuthoritative(live) = (%+v, %v, %v), want the node", got, ok, err)
+	}
+
+	if err := s.DeleteNode("s9", "n9"); err != nil {
+		t.Fatalf("DeleteNode: %v", err)
+	}
+	if _, ok, err := s.GetNodeAuthoritative("s9", "n9"); err != nil || ok {
+		t.Fatalf("GetNodeAuthoritative(deleted) = (ok=%v, err=%v), want a confirmed absence", ok, err)
+	}
+
+	s.js = errJS{s.js}
+	if _, _, err := s.GetNodeAuthoritative("s9", "n9"); err == nil {
+		t.Fatal("GetNodeAuthoritative with a failing leader read returned nil error")
+	}
+}
+
+// GetSpaceAuthoritative mirrors the node variant for space entries.
+func TestGetSpaceAuthoritative(t *testing.T) {
+	s := newTestKVStore(t)
+	if err := s.PutSpace(&SpaceEntry{ID: "sp9", Name: "nine"}, 0); err != nil {
+		t.Fatalf("PutSpace: %v", err)
+	}
+
+	got, ok, err := s.GetSpaceAuthoritative("sp9")
+	if err != nil || !ok || got.Name != "nine" {
+		t.Fatalf("GetSpaceAuthoritative(live) = (%+v, %v, %v), want the space", got, ok, err)
+	}
+	if _, ok, err := s.GetSpaceAuthoritative("never-created"); err != nil || ok {
+		t.Fatalf("GetSpaceAuthoritative(absent) = (ok=%v, err=%v), want a confirmed absence", ok, err)
+	}
+}

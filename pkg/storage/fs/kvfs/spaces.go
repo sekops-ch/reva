@@ -81,7 +81,10 @@ func (d *kvfsDriver) findExistingPersonal(ownerID string) *SpaceEntry {
 // ID via req.Opaque (key "space_id" or "spaceid"); otherwise a fresh
 // UUID is minted.
 func (d *kvfsDriver) CreateStorageSpace(ctx context.Context, req *provider.CreateStorageSpaceRequest) (*provider.CreateStorageSpaceResponse, error) {
-	u := ctxpkg.ContextMustGetUser(ctx)
+	u, err := requireUser(ctx)
+	if err != nil {
+		return nil, err
+	}
 
 	spaceType := req.Type
 	if spaceType == "" {
@@ -404,6 +407,11 @@ func (d *kvfsDriver) deleteSpaceContents(ctx context.Context, spaceID, rootID st
 				d.blob.Delete(ctx, BlobKey(spaceID, u.BlobID))
 			}
 			d.store.DeleteUpload(u.ID)
+			// Staged bytes are keyed by session, not by space: deleting the
+			// session entry alone orphans them until the stream MaxAge.
+			if err := d.uploadCache.Drop(u.ID); err != nil {
+				d.log.Warn().Err(err).Str("session_id", u.ID).Msg("kvfs: space teardown failed to drop staged upload bytes")
+			}
 		}
 	}
 	return nil

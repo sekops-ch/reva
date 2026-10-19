@@ -250,3 +250,27 @@ func TestUploadLongBodyFailsBeforeS3(t *testing.T) {
 		t.Fatalf("long body reached S3 (%d attempts), want the failure before any PUT", st.attempts.Load())
 	}
 }
+
+// The attempt log must attribute round trips to the owning TUS session when
+// the caller supplies one, and count round trips under that name.
+func TestUploadAttemptLogCarriesSession(t *testing.T) {
+	payload := bytes.Repeat([]byte("kvfs-session-"), 90_000)
+	bs, st, buf := newStubBlobstoreWithLog(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	ctx = WithBlobSession(ctx, "sess-log-1")
+	if err := bs.Upload(ctx, "s1/blob-sess", bytes.NewReader(payload), int64(len(payload))); err != nil {
+		t.Fatalf("Upload across a killed first attempt: %v", err)
+	}
+	if got := st.attempts.Load(); got < 2 {
+		t.Fatalf("expected a retried PUT, saw %d attempt(s)", got)
+	}
+	logged := buf.String()
+	if !strings.Contains(logged, `"session_id":"sess-log-1"`) {
+		t.Fatalf("attempt log does not carry the session id; log: %q", logged)
+	}
+	if !strings.Contains(logged, `"round_trip"`) {
+		t.Fatalf("attempt log does not count round trips; log: %q", logged)
+	}
+}

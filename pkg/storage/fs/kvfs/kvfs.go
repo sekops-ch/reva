@@ -46,8 +46,9 @@ import (
 
 const defaultMaxCASRetries = 100
 
-// defaultAuthoritativeReadTimeout envelopes a JetStream leader election while
-// failing a blocked read six times faster than the shared 30 s context wait.
+// defaultAuthoritativeReadTimeout favors failing a blocked leader read fast;
+// a raft election can outlast it (nats-server randomizes 4-9 s), so
+// deployments size authoritative_read_timeout past their election window.
 const defaultAuthoritativeReadTimeout = 5 * time.Second
 
 // defaultMaxDeleteDepth bounds recursive delete traversal (trash purge,
@@ -293,6 +294,7 @@ func New(m map[string]interface{}, stream events.Stream, log *zerolog.Logger) (s
 
 	if opts.GCEnabled {
 		d.gc = newBlobGC(store, blob, opts, log)
+		d.gc.uploadCache = d.uploadCache
 
 		// Root the sweep context on a driver-owned cancellable context so a
 		// graceful Shutdown/SIGTERM aborts an in-flight sweep and releases the
@@ -678,7 +680,10 @@ func (d *kvfsDriver) CreateDir(ctx context.Context, ref *provider.Reference) err
 		return errtypes.NotFound(ref.String())
 	}
 
-	u := ctxpkg.ContextMustGetUser(ctx)
+	u, err := requireUser(ctx)
+	if err != nil {
+		return err
+	}
 
 	// Detached commit context — three NATS bucket touches (PutNode root,
 	// PutChildren root, PutChildren parent) must run to completion or
@@ -1035,6 +1040,17 @@ func (d *kvfsDriver) GetHome(ctx context.Context) (string, error) {
 func (d *kvfsDriver) checkNodeLock(ctx context.Context, node *NodeEntry) error {
 	contextLockID, _ := ctxpkg.ContextGetLockID(ctx)
 	return checkLockID(contextLockID, node)
+}
+
+// requireUser returns the context user or refuses the request: callers must
+// never dereference a missing or typed-nil identity (ContextMustGetUser
+// returns a stored typed nil without panicking).
+func requireUser(ctx context.Context) (*user.User, error) {
+	u, ok := ctxpkg.ContextGetUser(ctx)
+	if !ok || u == nil || u.Id == nil {
+		return nil, errtypes.UserRequired("kvfs: no user in context")
+	}
+	return u, nil
 }
 
 // checkLockID compares a request's lock id with node's lock, as decomposedfs does: a locked node

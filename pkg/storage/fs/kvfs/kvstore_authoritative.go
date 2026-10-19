@@ -63,10 +63,9 @@ func (s *KVStore) getLastAuthoritative(kv nats.KeyValue, key string) ([]byte, ui
 	return msg.Data, msg.Sequence, true, nil
 }
 
-// countAuthoritativeOutcome records what a leader read established: the leader
-// had what the replica's view missed (lag_caught), or the miss is real
-// (confirmed_absent). Callers decide `found` at their own semantic level —
-// key presence for nodes/uploads, NAME presence for children.
+// countAuthoritativeOutcome records what a leader read established:
+// lag_caught (the replica's view missed it) or confirmed_absent. Callers
+// decide found at their own level: key presence, or NAME presence for children.
 func countAuthoritativeOutcome(bucket string, found bool) {
 	outcome := "confirmed_absent"
 	if found {
@@ -75,12 +74,9 @@ func countAuthoritativeOutcome(bucket string, found bool) {
 	KVAuthoritativeReads.WithLabelValues(bucket, outcome).Inc()
 }
 
-// ConfirmChildAuthoritative confirms one name of a children map against the
-// stream leader. resolveRelativePath uses it when a name is absent from a
-// possibly stale map: a stale-but-present map is not a KV miss, so only the
-// leader can distinguish replica lag from true absence. The whole map value
-// still travels (one KV entry per directory) but is scanned with a streaming
-// decoder, never materialized.
+// ConfirmChildAuthoritative confirms one name of a children map at the
+// stream leader: a stale-but-present map is not a KV miss, so only the leader
+// can tell replica lag from true absence. The value is scanned, never materialized.
 func (s *KVStore) ConfirmChildAuthoritative(spaceID, parentID, name string) (string, bool, error) {
 	bucket := s.children.Bucket()
 	data, _, ok, err := s.getLastAuthoritative(s.children, childrenKey(spaceID, parentID))
@@ -98,6 +94,50 @@ func (s *KVStore) ConfirmChildAuthoritative(spaceID, parentID, name string) (str
 	}
 	countAuthoritativeOutcome(bucket, found)
 	return id, found, nil
+}
+
+// GetNodeAuthoritative reads one node at the stream leader. Destructive
+// re-checks use it: the listing that formed a removal verdict may be a
+// replica's stale view, so only the leader can confirm the premise.
+func (s *KVStore) GetNodeAuthoritative(spaceID, nodeID string) (*NodeEntry, bool, error) {
+	bucket := s.nodes.Bucket()
+	data, _, ok, err := s.getLastAuthoritative(s.nodes, nodeKey(spaceID, nodeID))
+	if err != nil {
+		return nil, false, err
+	}
+	if !ok {
+		countAuthoritativeOutcome(bucket, false)
+		return nil, false, nil
+	}
+	var n NodeEntry
+	if err := msgpack.Unmarshal(data, &n); err != nil {
+		KVAuthoritativeReads.WithLabelValues(bucket, "error").Inc()
+		return nil, false, errors.Wrapf(err, "kvfs: corrupt node %s/%s at the leader", spaceID, nodeID)
+	}
+	countAuthoritativeOutcome(bucket, true)
+	return &n, true, nil
+}
+
+// GetSpaceAuthoritative reads one space entry at the stream leader; the
+// ghost-space reap confirms a space's absence with it before touching the
+// space's keys.
+func (s *KVStore) GetSpaceAuthoritative(spaceID string) (*SpaceEntry, bool, error) {
+	bucket := s.spaces.Bucket()
+	data, _, ok, err := s.getLastAuthoritative(s.spaces, spaceID)
+	if err != nil {
+		return nil, false, err
+	}
+	if !ok {
+		countAuthoritativeOutcome(bucket, false)
+		return nil, false, nil
+	}
+	var sp SpaceEntry
+	if err := msgpack.Unmarshal(data, &sp); err != nil {
+		KVAuthoritativeReads.WithLabelValues(bucket, "error").Inc()
+		return nil, false, errors.Wrapf(err, "kvfs: corrupt space %s at the leader", spaceID)
+	}
+	countAuthoritativeOutcome(bucket, true)
+	return &sp, true, nil
 }
 
 // scanChildMap finds one name in a msgpack-encoded ChildMap with a streaming

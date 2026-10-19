@@ -269,12 +269,11 @@ func (c *natsStreamUploadCache) subject(sessionID string) string {
 func (c *natsStreamUploadCache) Size(sessionID string) (int64, error) {
 	msg, err := c.js.GetLastMsg(c.opts.StreamName, c.subject(sessionID))
 	if err != nil {
+		// Not-found is the only size-zero signal; every other failure
+		// (timeout, leader election, closed connection) must surface —
+		// GetLastMsg returns a nil msg on ALL error paths, so a nil check
+		// here would silently report an empty staging area.
 		if errors.Is(err, nats.ErrMsgNotFound) {
-			return 0, nil
-		}
-		// Some nats.go versions return a different sentinel for "no
-		// matching message". Treat 404-shaped errors as size=0.
-		if msg == nil {
 			return 0, nil
 		}
 		return 0, errors.Wrap(err, "natsStreamUploadCache: GetLastMsg")
@@ -325,22 +324,34 @@ func (c *natsStreamUploadCache) Append(sessionID string, startOffset int64, src 
 	}
 }
 
-// Reader streams the session's body in publish order. It opens an ordered
-// consumer that delivers messages by stream sequence (which equals publish
-// order on a single subject). Reads stop when the consumer reports
-// NumPending=0 or hits a quiet period (no more messages pending).
+// uploadCacheIdleTimeout caps the wait per staged message. A timeout before
+// the leader-reported size is reached closes the pipe with an error, never
+// as a short success. Package var so tests can shorten it.
+var uploadCacheIdleTimeout = 30 * time.Second
+
+// Reader streams the session's body in publish order through an ordered
+// consumer. That consumer is served by one (possibly lagging) in-memory
+// replica, so its pending count is no end-of-body signal: the Reader reads
+// until the size the stream LEADER reported at open (last message's
+// Upload-Offset + data length) and fails loudly on a short body.
 //
 // Callers (FinishUpload via blob.Upload) read the full body sequentially and
 // push to S3.
 func (c *natsStreamUploadCache) Reader(sessionID string) (io.ReadCloser, error) {
-	// Quick existence check — if the stream has nothing for this subject,
-	// return an empty reader rather than spin up a consumer.
-	if _, err := c.js.GetLastMsg(c.opts.StreamName, c.subject(sessionID)); err != nil {
+	// Leader read: the last staged message names the staged size. Nothing
+	// staged — return an empty reader rather than spin up a consumer.
+	last, err := c.js.GetLastMsg(c.opts.StreamName, c.subject(sessionID))
+	if err != nil {
 		if errors.Is(err, nats.ErrMsgNotFound) {
 			return io.NopCloser(strings.NewReader("")), nil
 		}
 		return nil, errors.Wrap(err, "natsStreamUploadCache: pre-Reader probe")
 	}
+	var lastOffset int64
+	if v := last.Header.Get("Upload-Offset"); v != "" {
+		lastOffset, _ = strconv.ParseInt(v, 10, 64)
+	}
+	expected := lastOffset + int64(len(last.Data))
 
 	pr, pw := io.Pipe()
 	subj := c.subject(sessionID)
@@ -358,15 +369,16 @@ func (c *natsStreamUploadCache) Reader(sessionID string) (io.ReadCloser, error) 
 		}
 		defer sub.Unsubscribe()
 
-		// Ordered consumer redelivers; cap the wait per message — if NATS
-		// goes quiet for 30 s we assume there are no more pending messages
-		// and finish the stream. The blob.Upload caller then closes the
-		// pipe and we're done.
-		const idleTimeout = 30 * time.Second
-		for {
-			msg, err := sub.NextMsg(idleTimeout)
+		// Bytes appended past the probe belong to a protocol-violating
+		// writer; the declared-size guards in the blobstore reject them.
+		var written int64
+		for written < expected {
+			msg, err := sub.NextMsg(uploadCacheIdleTimeout)
 			if err != nil {
 				if errors.Is(err, nats.ErrTimeout) {
+					_ = pw.CloseWithError(errors.Errorf(
+						"natsStreamUploadCache: staged body incomplete: read %d of %d bytes (session %s)",
+						written, expected, sessionID))
 					return
 				}
 				_ = pw.CloseWithError(errors.Wrap(err, "natsStreamUploadCache: NextMsg"))
@@ -376,10 +388,7 @@ func (c *natsStreamUploadCache) Reader(sessionID string) (io.ReadCloser, error) 
 				// Reader closed early (caller aborted). Stop draining.
 				return
 			}
-			meta, mErr := msg.Metadata()
-			if mErr == nil && meta != nil && meta.NumPending == 0 {
-				return
-			}
+			written += int64(len(msg.Data))
 		}
 	}()
 
